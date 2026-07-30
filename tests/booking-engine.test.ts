@@ -88,17 +88,18 @@ function makeClient(
   return { client: client as unknown as ReservioClient, getAvailability, createBooking };
 }
 
+// StateStore асинхронен: моки возвращают Promise, движок обязан их awaitить.
 function makeState(initial: StoredBooking[] = []) {
   const rows = [...initial];
   const getBooking = vi.fn(
-    (profileId: string, date: string, time: string): StoredBooking | null =>
+    async (profileId: string, date: string, time: string): Promise<StoredBooking | null> =>
       rows.find((b) => b.profileId === profileId && b.date === date && b.time === time) ?? null,
   );
-  const saveBooking = vi.fn((b: StoredBooking): void => {
+  const saveBooking = vi.fn(async (b: StoredBooking): Promise<void> => {
     rows.push(b);
   });
-  const listBookings = vi.fn((): StoredBooking[] => [...rows]);
-  const markCanceled = vi.fn((): void => {});
+  const listBookings = vi.fn(async (): Promise<StoredBooking[]> => [...rows]);
+  const markCanceled = vi.fn(async (): Promise<void> => {});
   const state = { getBooking, saveBooking, listBookings, markCanceled };
   return { state: state as unknown as StateStore, getBooking, saveBooking, rows };
 }
@@ -372,7 +373,7 @@ describe('bookSlotDrop', () => {
       createdAt: '2026-07-30T20:58:51.000+04:00',
     };
     // На старте брони нет, к моменту пробуждения — уже есть.
-    getBooking.mockImplementation(() => (clock.ms() >= WINDOW_START_MS ? rival : null));
+    getBooking.mockImplementation(async () => (clock.ms() >= WINDOW_START_MS ? rival : null));
 
     const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
 
@@ -400,7 +401,7 @@ describe('bookSlotDrop', () => {
     };
     // Первый вызов (старт) — пусто; следующий (перед POST) — уже занято.
     let calls = 0;
-    getBooking.mockImplementation(() => (++calls === 1 ? null : rival));
+    getBooking.mockImplementation(async () => (++calls === 1 ? null : rival));
 
     const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
 
@@ -428,7 +429,23 @@ describe('bookSlotDrop', () => {
     expect(createBooking).not.toHaveBeenCalled();
   });
 
-  it('падение state.getBooking → DropReport без POST (дубль хуже пропуска)', async () => {
+  it('отказ state.getBooking (rejected promise) → DropReport без POST (дубль хуже пропуска)', async () => {
+    // Сетевой store (Supabase) падает именно так — reject, а не throw.
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, {
+      availability: () => [slot(WANT_START, WANT_END)],
+    });
+    const { state, getBooking } = makeState();
+    getBooking.mockRejectedValue(new Error('PGRST301: JWT expired'));
+
+    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+
+    expect(report.ok).toBe(false);
+    expect(report.error?.detail).toContain('PGRST301');
+    expect(createBooking).not.toHaveBeenCalled();
+  });
+
+  it('синхронный throw из state.getBooking тоже не доводит до POST', async () => {
     const clock = makeClock(IN_WINDOW);
     const { client, createBooking } = makeClient(clock, {
       availability: () => [slot(WANT_START, WANT_END)],
@@ -547,9 +564,8 @@ describe('bookSlotDrop', () => {
     const clock = makeClock(IN_WINDOW);
     const { client } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
     const { state, saveBooking } = makeState();
-    saveBooking.mockImplementation(() => {
-      throw new Error('disk full');
-    });
+    // Именно reject: у сетевого store отказ приходит асинхронно, после POST.
+    saveBooking.mockRejectedValue(new Error('disk full'));
 
     const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
 

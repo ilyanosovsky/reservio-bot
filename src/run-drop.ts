@@ -7,10 +7,17 @@
  * Без --live — DRY-RUN: движок работает по-настоящему (polling, ожидание окна,
  * идемпотентность), но вместо реального POST createBooking логируется
  * "[DRY] бронировал бы X" и возвращается синтетический BookingCreated —
- * никакой реальной брони не создаётся. DRY пишет состояние в ОТДЕЛЬНЫЙ файл
- * (state.dry.db): фиктивная бронь в боевой базе заблокировала бы настоящий
- * --live прогон того же слота (AlreadyBooked без единого POST).
- * С --live — реальная бронь (POST в Reservio API) и боевой state.db.
+ * никакой реальной брони не создаётся. DRY пишет состояние под ОТДЕЛЬНЫМ id
+ * профиля (`<profile>:dry`) и в отдельный файл (state.dry.db): фиктивная бронь
+ * под боевым ключом заблокировала бы настоящий --live прогон того же слота
+ * (AlreadyBooked без единого POST).
+ * С --live — реальная бронь (POST в Reservio API).
+ *
+ * State: если заданы SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY, берётся тот же
+ * SupabaseStateStore, что и у облачного таска (src/trigger/book-drop.ts) —
+ * иначе локальный и облачный прогоны не видят броней друг друга и спокойно
+ * создают ДВА реальных бронирования на один слот. --sqlite — аварийный выход
+ * на локальный файл, когда Supabase недоступен (защиты от дубля тогда нет).
  *
  * --court переопределяет приоритет кортов профиля на один-единственный корт.
  * --force снимает проверку дня недели из правила профиля.
@@ -20,7 +27,9 @@ import { readFileSync } from 'node:fs';
 import { ReservioClient } from './reservio/client.js';
 import type { BookingCreated, ClientContact } from './reservio/types.js';
 import { loadProfiles, ruleAppliesOn, type Profile } from './core/profiles.js';
-import { SqliteStateStore } from './core/state.js';
+import type { StateStore } from './core/state.js';
+import { SqliteStateStore } from './core/state-sqlite.js';
+import { SupabaseStateStore } from './core/state-supabase.js';
 import { bookSlotDrop, type EngineDeps, type DropReport } from './core/booking-engine.js';
 import { dropDayOf, dropWatchWindow, tbilisiStamp, weekdayOf } from './core/scheduler.js';
 
@@ -52,15 +61,19 @@ const TIME = opt('--time');
 const COURT_OVERRIDE = opt('--court');
 const LIVE = flag('--live');
 const FORCE = flag('--force');
+/** Аварийный выход на локальный файл, когда Supabase настроен, но недоступен. */
+const FORCE_SQLITE = flag('--sqlite');
 
 /** Боевой и репетиционный state строго разделены — см. шапку файла. */
 const STATE_FILE = LIVE ? './state.db' : './state.dry.db';
+/** Тот же суффикс, что у облачного таска: DRY не занимает боевой ключ слота. */
+const DRY_PROFILE_SUFFIX = ':dry';
 /** Дальше этого ждать окно смысла нет (см. MAX_WAIT_TO_WINDOW_MS в движке). */
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000;
 const WEEKDAY_NAMES = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 
 if (!DATE || !TIME) {
-  console.error('Использование: npx tsx src/run-drop.ts --profile ilya --date YYYY-MM-DD --time HH:MM [--live] [--court "Padel Court 3"] [--force]');
+  console.error('Использование: npx tsx src/run-drop.ts --profile ilya --date YYYY-MM-DD --time HH:MM [--live] [--court "Padel Court 3"] [--force] [--sqlite]');
   process.exit(1);
 }
 // после проверки выше DATE/TIME гарантированно string; process.exit(1) имеет тип
@@ -89,10 +102,49 @@ async function waitForWindowStart(windowStart: Date): Promise<void> {
   }
 }
 
+/**
+ * Тот же выбор хранилища, что у облачного таска (src/trigger/book-drop.ts):
+ * при заданных SUPABASE_* локальный прогон обязан смотреть в ТУ ЖЕ таблицу.
+ * Иначе бронь, созданная раном в trigger.dev, этому прогону не видна —
+ * идемпотентность рвётся, и на слот уходит второй реальный POST.
+ */
+async function openState(profileId: string, date: string, time: string): Promise<{ state: StateStore; where: string }> {
+  const url = process.env.SUPABASE_URL?.trim() ?? '';
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() ?? '';
+
+  if (url === '' || key === '') {
+    log(`state: ${STATE_FILE} (SUPABASE_* не заданы) — брони из trigger.dev этому прогону НЕ видны`);
+    return { state: new SqliteStateStore(STATE_FILE), where: STATE_FILE };
+  }
+  if (FORCE_SQLITE) {
+    log(
+      `ВНИМАНИЕ: --sqlite при настроенном Supabase — прогон не увидит облачных броней (${STATE_FILE}). ` +
+        'Убедись, что на этот слот нет рана в trigger.dev, иначе получишь дубль',
+    );
+    return { state: new SqliteStateStore(STATE_FILE), where: STATE_FILE };
+  }
+
+  // Таймаут короче дефолтных 5 c: движок читает state прямо перед POST, уже в
+  // горячем окне — зависшее хранилище не должно стоить нам корта.
+  const state = new SupabaseStateStore({ url, serviceKey: key, timeoutMs: 1_500 });
+  try {
+    // Пробное чтение до окна: «нет таблицы» / «не тот ключ» должны всплыть
+    // сейчас, а не в секунду дропа.
+    await state.getBooking(profileId, date, time);
+  } catch (err) {
+    throw new Error(
+      `state: Supabase недоступен — ${err instanceof Error ? err.message : String(err)}. ` +
+        'Почини доступ или запусти с --sqlite (тогда идемпотентность только локальная: облачные брони прогон не увидит).',
+      { cause: err },
+    );
+  }
+  log('state: Supabase (та же таблица bookings, что у trigger.dev)');
+  return { state, where: 'Supabase (таблица bookings)' };
+}
+
 async function main(date: string, time: string): Promise<void> {
   console.log(`\n=== run-drop: режим ${LIVE ? 'LIVE (реальная бронь!)' : 'DRY-RUN (без реального POST)'} ===`);
-  console.log(`    profile=${PROFILE_ID} date=${date} time=${time}${COURT_OVERRIDE ? ` court=${COURT_OVERRIDE}` : ''}`);
-  console.log(`    state=${STATE_FILE}\n`);
+  console.log(`    profile=${PROFILE_ID} date=${date} time=${time}${COURT_OVERRIDE ? ` court=${COURT_OVERRIDE}` : ''}\n`);
 
   const profiles = loadProfiles(process.env);
   const profile = profiles.find((p) => p.id === PROFILE_ID);
@@ -111,9 +163,14 @@ async function main(date: string, time: string): Promise<void> {
     log(`ВНИМАНИЕ: ${date} (${day}) вне дней профиля (${allowed}), но задан --force — продолжаем`);
   }
 
-  const effectiveProfile: Profile = COURT_OVERRIDE
+  const withCourts: Profile = COURT_OVERRIDE
     ? { ...profile, rule: { ...profile.rule, courts: [COURT_OVERRIDE] } }
     : profile;
+  // DRY пишет state под отдельным id — иначе фиктивная бронь заняла бы боевой
+  // ключ (profile, date, time) и настоящий прогон вышел бы с AlreadyBooked.
+  const effectiveProfile: Profile = LIVE
+    ? withCourts
+    : { ...withCourts, id: `${withCourts.id}${DRY_PROFILE_SUFFIX}` };
 
   // Окно дропа считается от целевой даты (T+7), а не от «сегодня»: день
   // наблюдения T = date − 7 суток. Проверяем до открытия state — чтобы
@@ -130,7 +187,7 @@ async function main(date: string, time: string): Promise<void> {
     process.exit(2);
   }
 
-  const state = new SqliteStateStore(STATE_FILE);
+  const { state, where: stateWhere } = await openState(effectiveProfile.id, date, time);
   const realClient = new ReservioClient({ log });
 
   // DRY-RUN: подменяем createBooking заглушкой, всё остальное (polling, availability) настоящее.
@@ -167,13 +224,13 @@ async function main(date: string, time: string): Promise<void> {
   // token — guest-ключ к брони (чтение + отмена), в stdout ему не место.
   // Если он доехал до state — печатаем только факт; если нет, показываем как
   // последний след брони.
-  const stored = state.getBooking(effectiveProfile.id, date, time);
+  const stored = await state.getBooking(effectiveProfile.id, date, time);
   const tokenInState = stored?.bookingId === report.bookingId && (stored?.token ?? '') !== '';
   const printable: DropReport = report.token
-    ? { ...report, token: tokenInState ? `<сохранён в ${STATE_FILE}>` : report.token }
+    ? { ...report, token: tokenInState ? `<сохранён в ${stateWhere}>` : report.token }
     : report;
   if (report.token && !tokenInState) {
-    console.log(`⚠️  token НЕ сохранён в ${STATE_FILE} — печатаем его ниже, сохрани вручную, иначе бронь не отменить`);
+    console.log(`⚠️  token НЕ сохранён в ${stateWhere} — печатаем его ниже, сохрани вручную, иначе бронь не отменить`);
   }
 
   console.log('\nDropReport JSON:');

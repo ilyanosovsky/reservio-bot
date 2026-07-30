@@ -7,25 +7,29 @@
 
 ```
 src/
-  reservio/client.ts      # ✅ API-клиент: availability, createBooking, cancelBooking, getBooking
+  reservio/client.ts       # ✅ API-клиент: availability, createBooking, cancelBooking, getBooking
   reservio/types.ts        # ✅ типы, businessId, таблица кортов (serviceId/resourceId)
   core/scheduler.ts        # ✅ дроп-окна и датовая арифметика в Asia/Tbilisi
-  core/state.ts            # ✅ StateStore: SqliteStateStore (better-sqlite3) + MemoryStateStore
+  core/state.ts            # ✅ интерфейс StateStore (async) + MemoryStateStore
+  core/state-sqlite.ts     # ✅ SqliteStateStore — единственный импорт better-sqlite3
+  core/state-supabase.ts   # ✅ SupabaseStateStore — PostgREST на голом fetch (state облака)
   core/profiles.ts         # ✅ мультипрофили из env (contact + BookingRule)
   core/booking-engine.ts   # ✅ polling + бронь + fallback: bookSlotDrop(profile, target, deps)
-  run-drop.ts               # ✅ CLI ручного прогона дропа (dry-run по умолчанию, --live)
-  trigger/book-drop.ts     # ✅ таск trigger.dev, ТОЛЬКО ручной запуск, cron выключен
-  bot/                     # ⏳ grammY: команды, кнопки, уведомления (фаза 3)
-  index.ts                  # ⏳
-trigger.config.ts          # ✅ конфиг trigger.dev (project proj_fxjnzqesxsicrpeuepzv)
+  core/notify.ts           # ✅ Telegram: sendTelegram + formatDropReport
+  run-drop.ts              # ✅ CLI ручного прогона дропа (dry-run по умолчанию, --live)
+  trigger/book-drop.ts     # ✅ таск trigger.dev: дроп + отчёт в Telegram, cron выключен
+  bot/                     # ⏳ grammY: команды, кнопки, входящие апдейты (фаза 3)
+  index.ts                 # ⏳
+trigger.config.ts          # ✅ конфиг trigger.dev (project proj_fxjnzqesxsicrpeuepzv) + syncEnvVars
+docs/supabase-schema.sql   # ✅ DDL таблицы bookings для Supabase SQL Editor
 spike-reservio.ts          # ✅ ручная проверка протокола / бронь / отмена (фаза 1)
 spike-drop-watch.ts        # ✅ наблюдение конкретного дропа + бронь (фаза 1, до run-drop.ts)
-tests/                      # ✅ vitest: scheduler, state, profiles, reservio-client, booking-engine
+tests/                     # ✅ vitest: scheduler, state, state-supabase, profiles, client, engine, notify
 docs/PROTOCOL.md           # подтверждённый протокол Reservio API v2
 ```
 
 ✅ реализовано и покрыто тестами · ⏳ ещё не начато (следующие фазы). Статус
-актуален на ветке `feat/booking-engine` (фаза 2); сверять с `git log`/PR при
+актуален на ветке `feat/cloud-drop-telegram`; сверять с `git log`/PR при
 существенном расхождении.
 
 ## Модули и их роль
@@ -54,12 +58,24 @@ docs/PROTOCOL.md           # подтверждённый протокол Reser
 `weekdayOf(date)`/`tbilisiStamp(now)` — день недели и метка времени в +04:00.
 
 **`core/state.ts`** (`StateStore`) — интерфейс `getBooking(profileId, date, time)`
-/ `saveBooking(b)` / `listBookings(profileId?)` / `markCanceled(bookingId)`.
-Две реализации: `SqliteStateStore` (файл на диске, `better-sqlite3`, `WAL`,
-таблица `bookings` с `PRIMARY KEY (profileId, date, time)` — это и есть
-дедупликация) и `MemoryStateStore` (in-memory `Map`, используется в тестах и
-в `trigger/book-drop.ts`, где файловая ФС недоступна). Таблица `settings`
-(skip-флаги и т.п. из целевой архитектуры фазы 3) пока не реализована.
+/ `saveBooking(b)` / `listBookings(profileId?)` / `markCanceled(bookingId)`,
+**все методы асинхронные** (`Promise`): под интерфейсом может быть и сеть.
+Здесь же `MemoryStateStore` (in-memory `Map`) — и никаких нативных импортов,
+поэтому файл спокойно попадает в облачный бандл. Реализации вынесены:
+`core/state-sqlite.ts` (`SqliteStateStore`, `better-sqlite3`, `WAL`, файл на
+диске — локальные прогоны и тесты) и `core/state-supabase.ts`
+(`SupabaseStateStore`, PostgREST на голом `fetch`, без `@supabase/supabase-js`
+— общее хранилище облака и будущего бота, DDL в `docs/supabase-schema.sql`).
+Ключ дедупликации везде один: `(profileId, date, time)` — уникальный индекс.
+Таблица `settings` (skip-флаги и т.п. из целевой архитектуры фазы 3) пока не
+реализована.
+
+**`core/notify.ts`** — исходящий Telegram: `telegramFromEnv(env)` (→ `null`,
+если бот не настроен — это не ошибка), `sendTelegram(target, text)`
+(`parse_mode=HTML`, таймаут 5 c, никогда не бросает наружу и никогда не
+раскрывает botToken, который зашит в URL) и `formatDropReport(report, extra)` —
+компактное русское сообщение по `DropReport` без `token` и без контактных
+данных профиля.
 
 **`core/profiles.ts`** (`loadProfiles(env)`) — профиль = `{id, label, contact,
 telegramChatId?, rule: {times, courts, daysOfWeek?}}`. Профиль по умолчанию
@@ -100,29 +116,76 @@ msFromSeenToBooked?, timeline: {at, event}[], error?: {kind, detail?}}`,
 запрещённый проектом молчаливый провал).
 
 **`run-drop.ts`** — CLI ручного прогона одного дропа:
-`npx tsx src/run-drop.ts --profile ilya --date YYYY-MM-DD --time HH:MM [--live] [--court "Padel Court 3"] [--force]`.
+`npx tsx src/run-drop.ts --profile ilya --date YYYY-MM-DD --time HH:MM [--live] [--court "Padel Court 3"] [--force] [--sqlite]`.
 Без `--live` — dry-run: весь движок работает по-настоящему (polling, окно,
 идемпотентность), но `createBooking` подменён заглушкой, реального `POST` нет,
-а state пишется в отдельный файл `state.dry.db` (фиктивная бронь в боевом
-`state.db` заблокировала бы настоящий прогон того же слота). Дни недели из
-`rule.daysOfWeek` проверяются перед запуском (`--force` снимает проверку),
-`token` в stdout не печатается. Подробности и примеры — `Runbook.md`.
+а state пишется под id `<profile>:dry` и в отдельный файл `state.dry.db`
+(фиктивная бронь под боевым ключом заблокировала бы настоящий прогон того же
+слота). **State выбирается той же логикой, что и в облачном таске**: заданы
+`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` → `SupabaseStateStore`, иначе
+`SqliteStateStore`. Иначе локальный и облачный прогоны не видели бы броней друг
+друга и спокойно создали бы две реальные брони на один слот. `--sqlite` —
+аварийный выход на файл, когда Supabase настроен, но недоступен (защиты от
+дубля между хостами в этот момент нет, скрипт об этом громко пишет). Дни недели
+из `rule.daysOfWeek` проверяются перед запуском (`--force` снимает проверку),
+`token` в stdout не печатается — только факт, что он сохранён в state.
+Подробности и примеры — `Runbook.md`.
 
 **`trigger/book-drop.ts`** + **`trigger.config.ts`** — таск trigger.dev
 `book-slot-drop` (project `proj_fxjnzqesxsicrpeuepzv`), тот же `bookSlotDrop`,
 payload `{profileId, date, time, live, force?}`; `concurrencyLimit: 1`,
-контакт профиля и `token` в логи/output не попадают. **Только ручной запуск** (дашборд /
-CLI / `mcp__trigger__trigger_task`) — `dirs`/`maxAttempts: 1` в конфиге, никаких
-`schedules`. В облаке используется `MemoryStateStore` (файловый SQLite
-недоступен на воркерах) — состояние не переживает рестарт/следующий запуск;
-идемпотентность между отдельными запусками таска пока не гарантирована
-(TODO фазы 4 — внешняя БД, например Turso/libSQL). Cron/schedules включаются
-только в фазе 4 после явного одобрения пользователя.
+`maxAttempts: 1`, машина дефолтная, `maxDuration: 600`. **Только ручной
+запуск** (дашборд / CLI / `mcp__trigger__trigger_task`, в т.ч. отложенный через
+`options.delay`) — никаких `schedules`: cron включается только в фазе 4 после
+явного одобрения пользователя. Что таск добавляет поверх движка:
 
-**`bot/` (grammY, фаза 3, ещё не начато)** — Telegram-интерфейс: pre-drop
-сообщение в 20:45 с кнопками «Пропустить» / «Бронируем», результат в 21:0x,
-напоминание T-2ч, команды «Мои брони» / «Отменить сегодняшние». Единственный
-авторизованный `chat_id` (env `TELEGRAM_CHAT_ID`) — остальные игнорируются.
+- **выбор state**: есть `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` →
+  `SupabaseStateStore`, иначе `MemoryStateStore` и предупреждение «state НЕ
+  персистентен (Memory)». Первое обращение к Supabase делается **до** окна
+  дропа, чтобы «нет таблицы»/«не тот ключ» всплыли заранее. Любой отказ
+  хранилища переводит ран на память НАВСЕГДА (в рамках рана) и добавляет
+  предупреждение, но **не срывает бронь**: бронь важнее персистентности,
+  защита от дубля в этот момент держится на `concurrencyLimit: 1` и
+  отключённых ретраях. Таймаут запросов к Supabase здесь укорочен до 1.5 c
+  (вместо дефолтных 5 c): движок читает state прямо перед `POST`, уже в горячем
+  окне, и зависшее хранилище не имеет права съесть секунды в гонке за корт.
+- **token при деградации**: если бронь удалась, а state упал, `saveBooking`
+  ушёл в память и умрёт вместе с раном — token не сохранён нигде. В этом (и
+  только в этом) случае он остаётся в output рана, а в сообщение добавляется
+  строка «отменять только по ссылке из письма». Без этого единственный ключ к
+  брони терялся бы совсем.
+- **разделение DRY и LIVE**: при `live: false` движок получает профиль с id
+  `<profile>:dry`, поэтому фиктивная бронь `dry-…` не занимает боевой ключ
+  `(profileId, date, time)` — иначе следующий настоящий прогон того же слота
+  вышел бы с `AlreadyBooked`, не сделав ни одного `POST` (та же причина, по
+  которой `run-drop.ts` держит отдельный `state.dry.db`).
+- **отказ от заведомо провальных ранов**: если до открытия окна больше 4 минут
+  (`maxDuration` 600 c минус окно наблюдения и запас), таск падает с подсказкой,
+  на какую секунду ставить `delay`. Иначе ран был бы убит по `maxDuration`
+  прямо во сне — без брони и без отчёта.
+- **ровно одно сообщение в Telegram за ран** — успех, неудача или крах самого
+  рана (`try/catch` вокруг всего `run()` шлёт ❌ до проброса ошибки; если
+  сломается сам форматтер, уйдёт запасной короткий текст). Отправка делается до
+  трёх попыток с паузой 1.5 c: транзиентный 429/502 Telegram не должен
+  превращать инвариант в ноль сообщений. Неудача всех попыток ран не роняет, но
+  пишется в лог. Адресат — `TELEGRAM_CHAT_ID`, а если у профиля есть свой
+  `PROFILE_<K>_TELEGRAM_CHAT_ID`, то он; при мультипрофиле глобального chat_id
+  может не быть вовсе — хватает бот-токена и chat_id профиля. Контакт профиля
+  (`CLIENT_*`), `token` и значения секретов не попадают ни в лог, ни в output,
+  ни в сообщение — текст отчёта и текст любой ошибки проходят через redact.
+
+`trigger.config.ts` дополнительно: `build.external: ['better-sqlite3']`
+(нативный модуль не бандлим) и `syncEnvVars` из `@trigger.dev/build` — перед
+каждым деплоем читает локальный `.env` своим мини-парсером (без `dotenv`) и
+заливает в облако **только** allowlist из семи ключей (`CLIENT_*`,
+`SUPABASE_*`, `TELEGRAM_*`), помечая всё кроме `SUPABASE_URL` как secret.
+Значения не логируются никогда — только имена недостающих.
+
+**`bot/` (grammY, фаза 3, ещё не начато)** — входящий Telegram-интерфейс:
+pre-drop сообщение в 20:45 с кнопками «Пропустить» / «Бронируем», напоминание
+T-2ч, команды «Мои брони» / «Отменить сегодняшние». Единственный авторизованный
+`chat_id` (env `TELEGRAM_CHAT_ID`) — остальные игнорируются. Исходящий отчёт о
+дропе уже работает без бота, через `core/notify.ts`.
 
 ## Поток данных на один дроп
 
@@ -134,10 +197,11 @@ CLI / `mcp__trigger__trigger_task`) — `dirs`/`maxAttempts: 1` в конфиг�
    `POST bookings` на первый корт из `profile.rule.courts` (Court 3), при
    отказе — на следующий (Court 2).
 4. Успех (`bookingId` получен) → результат пишется в `core/state` через
-   `saveBooking`; в фазе 3 `bot/` будет отправлять по этому отчёту ровно одно
-   сообщение в Telegram (успех/частичный успех/ошибка — инвариант
-   наблюдаемости из `CLAUDE.md`). Сейчас (фаза 2) отчёт печатается в консоль
-   `run-drop.ts` как JSON.
+   `saveBooking` (в облаке — таблица `bookings` в Supabase).
+5. `DropReport` уходит наружу: `run-drop.ts` печатает его в консоль как JSON,
+   `trigger/book-drop.ts` — форматирует через `core/notify.formatDropReport` и
+   отправляет **ровно одно** сообщение в Telegram (успех/ошибка/крах рана —
+   инвариант наблюдаемости из `CLAUDE.md`).
 
 ## Дроп-модель (из `docs/PROTOCOL.md`)
 
@@ -159,11 +223,13 @@ sequenceDiagram
     participant Scheduler as core/scheduler
     participant Engine as core/booking-engine (bookSlotDrop)
     participant API as Reservio API v2
-    participant State as core/state (StateStore)
-    participant Bot as bot (Telegram, фаза 3)
+    participant State as core/state (Supabase / SQLite / Memory)
+    participant Notify as core/notify (Telegram)
 
     CLI->>Scheduler: dropWatchWindow(dropDayOf(date), "20:00")
     Scheduler-->>CLI: {start H:58:30, deadline +5 мин}
+    CLI->>State: getBooking(...) — проба хранилища до окна дропа
+    State-->>CLI: ok / ошибка → посадка на Memory + предупреждение
     CLI->>Engine: bookSlotDrop(profile, {date, time}, deps)
     Engine->>State: getBooking(profileId, date, time)
     State-->>Engine: null (брони ещё нет)
@@ -186,6 +252,6 @@ sequenceDiagram
     end
     Engine->>State: saveBooking({..., bookingId, token, state})
     Engine-->>CLI: DropReport {ok, court, bookingId, token, ...}
-    CLI->>Bot: (фаза 3) отчёт для уведомления
-    Bot-->>Bot: ровно одно сообщение в Telegram
+    CLI->>Notify: formatDropReport(report, {stateWarning?})
+    Notify-->>Notify: ровно одно сообщение в Telegram (без token и контактов)
 ```

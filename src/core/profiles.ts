@@ -163,7 +163,9 @@ function required(env: Env, name: string): string {
 function requiredEmail(env: Env, name: string): string {
   const value = required(env, name);
   if (!value.includes('@') || /\s/.test(value)) {
-    throw new Error(`Переменная окружения ${name} не похожа на email: ${value}`);
+    // Значение НЕ печатаем: email профиля — персональные данные, а текст этой
+    // ошибки уходит в лог рана, в output и в Telegram (см. trigger/book-drop.ts).
+    throw new Error(`Переменная окружения ${name} не похожа на email (значение не печатаем: персональные данные)`);
   }
   return value;
 }
