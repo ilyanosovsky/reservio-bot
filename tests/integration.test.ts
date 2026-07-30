@@ -174,7 +174,7 @@ describe('сквозной стык profiles → scheduler → engine → client
     expect('Authorization' in post.headers).toBe(false);
 
     // Стык engine ↔ state: token обязан долететь до хранилища.
-    const saved = state.getBooking('ilya', DATE, '20:00');
+    const saved = await state.getBooking('ilya', DATE, '20:00');
     expect(saved).toMatchObject({
       profileId: 'ilya',
       court: 'Padel Court 3',
@@ -245,8 +245,8 @@ describe('сквозной стык profiles → scheduler → engine → client
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('SlotTaken');
-    expect(state.getBooking('ilya', DATE, '20:00')).toBeNull();
-    expect(state.listBookings()).toHaveLength(0);
+    await expect(state.getBooking('ilya', DATE, '20:00')).resolves.toBeNull();
+    await expect(state.listBookings()).resolves.toHaveLength(0);
   });
 
   it('пара 20:00 + 21:00 — два раздельных дропа и две брони', async () => {
@@ -287,15 +287,16 @@ describe('сквозной стык profiles → scheduler → engine → client
 
     expect([r20.ok, r21.ok]).toEqual([true, true]);
     expect(r20.bookingId).not.toBe(r21.bookingId);
-    expect(state.listBookings('ilya')).toHaveLength(2);
-    expect(state.listBookings('ilya').map((b) => b.time)).toEqual(['20:00', '21:00']);
+    const stored = await state.listBookings('ilya');
+    expect(stored).toHaveLength(2);
+    expect(stored.map((b) => b.time)).toEqual(['20:00', '21:00']);
     // Каждая бронь со своим token — без него её не отменить.
-    expect(new Set(state.listBookings('ilya').map((b) => b.token)).size).toBe(2);
+    expect(new Set(stored.map((b) => b.token)).size).toBe(2);
   });
 
   it('отмена: клиент требует state="canceled", state помечает бронь', async () => {
     const state = new MemoryStateStore();
-    state.saveBooking({
+    await state.saveBooking({
       profileId: 'ilya',
       date: DATE,
       time: '20:00',
@@ -309,12 +310,12 @@ describe('сквозной стык profiles → scheduler → engine → client
     const client = new ReservioClient({ fetchFn });
 
     await client.cancelBooking('bk-real-1', 'tok-real-1');
-    state.markCanceled('bk-real-1');
+    await state.markCanceled('bk-real-1');
 
     const patch = calls.find((c) => c.method === 'PATCH')!;
     expect(patch.url).toContain('token=tok-real-1');
     expect(patch.body).toMatchObject({ data: { attributes: { state: 'canceled' } } });
-    expect(state.getBooking('ilya', DATE, '20:00')?.state).toBe('canceled');
+    expect((await state.getBooking('ilya', DATE, '20:00'))?.state).toBe('canceled');
 
     // Отменённая бронь больше не блокирует новую попытку на тот же слот.
     const [profile] = loadProfiles(ENV);
@@ -366,7 +367,7 @@ describe('сквозной стык profiles → scheduler → engine → client
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('ApiChanged');
     expect(calls.filter((c) => c.method === 'POST')).toHaveLength(1);
-    expect(state.listBookings()).toHaveLength(0);
+    await expect(state.listBookings()).resolves.toHaveLength(0);
   });
 
   it('слот виден до дедлайна, но POST отклонён → не больше одного POST на корт', async () => {

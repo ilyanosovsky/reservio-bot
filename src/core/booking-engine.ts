@@ -109,9 +109,14 @@ export async function bookSlotDrop(
     ...patch,
   });
 
-  /** Непогашенная бронь в state — стоп-сигнал: дубль хуже пропуска. */
-  const activeBooking = (): StoredBooking | null => {
-    const b = state.getBooking(profile.id, date, time);
+  /**
+   * Непогашенная бронь в state — стоп-сигнал: дубль хуже пропуска.
+   * StateStore асинхронен (в облаке это сетевой Supabase), поэтому проверка
+   * стоит десятки–сотни мс. Перед POST мы её всё равно платим: две реальные
+   * брони на слот дороже, чем эта задержка в гонке за корт.
+   */
+  const activeBooking = async (): Promise<StoredBooking | null> => {
+    const b = await state.getBooking(profile.id, date, time);
     return b && b.state !== 'canceled' ? b : null;
   };
   const alreadyBooked = (b: StoredBooking, when: string): DropReport => {
@@ -130,7 +135,7 @@ export async function bookSlotDrop(
 
     // 1. Идемпотентность. Любая непогашенная бронь блокирует POST: дубль хуже,
     //    чем пропуск — отменять руками дороже, чем добронировать.
-    const existing = activeBooking();
+    const existing = await activeBooking();
     if (existing) return alreadyBooked(existing, 'старт');
 
     let courts: CourtInfo[];
@@ -178,7 +183,7 @@ export async function bookSlotDrop(
       push(`ждём окно дропа ${waitMs} мс, старт ${tbilisiStamp(watch.start)}`);
       await sleep(waitMs);
       // Пока спали, слот мог забронировать параллельный прогон той же джобы.
-      const meanwhile = activeBooking();
+      const meanwhile = await activeBooking();
       if (meanwhile) return alreadyBooked(meanwhile, 'после ожидания окна');
     }
     push(`окно открыто, дедлайн ${tbilisiStamp(watch.deadline)}, ищем start=${wantStart}`);
@@ -231,7 +236,7 @@ export async function bookSlotDrop(
 
         // Последняя проверка перед POST: между стартом и этой секундой бронь
         // мог создать параллельный прогон (два терминала, двойной trigger).
-        const rival = activeBooking();
+        const rival = await activeBooking();
         if (rival) return alreadyBooked(rival, 'перед POST');
 
         const seenAtMs = nowMs();
@@ -280,7 +285,7 @@ export async function bookSlotDrop(
         push(`бронь ${created.bookingId} (${bookingState}) на ${court.name}, ${msFromSeenToBooked} мс от появления слота`);
 
         try {
-          state.saveBooking({
+          await state.saveBooking({
             profileId: profile.id,
             date,
             time,

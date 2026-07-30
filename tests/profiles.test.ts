@@ -89,6 +89,13 @@ describe('loadProfiles: отсутствие CLIENT_* → понятная ош�
   it('email без @ отвергается', () => {
     expect(() => loadProfiles({ ...BASE_ENV, CLIENT_EMAIL: 'not-an-email' })).toThrow(/CLIENT_EMAIL/);
   });
+
+  it('текст ошибки не цитирует само значение — оно персональное', () => {
+    // Эта ошибка уезжает в лог рана, в output и в Telegram (trigger/book-drop.ts).
+    const bad = 'player.test at example.com';
+    expect(() => loadProfiles({ ...BASE_ENV, CLIENT_EMAIL: bad })).toThrow(/CLIENT_EMAIL/);
+    expect(() => loadProfiles({ ...BASE_ENV, CLIENT_EMAIL: bad })).not.toThrow(new RegExp(bad));
+  });
 });
 
 describe('loadProfiles: дополнительные профили из конфига', () => {
