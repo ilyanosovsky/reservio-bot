@@ -1,0 +1,19 @@
+# secrets — НИКОГДА не коммитить
+.env
+.env.*
+!.env.example
+
+# deps / build
+node_modules/
+dist/
+coverage/
+
+# state
+*.db
+*.sqlite
+
+# trigger.dev local
+.trigger/
+
+# os / editor
+.DS_Store
