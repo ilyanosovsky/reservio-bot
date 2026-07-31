@@ -12,8 +12,25 @@
 // в этот момент держится только на concurrencyLimit 1 и отключённых ретраях.
 //
 // Инвариант наблюдаемости (CLAUDE.md): каждый ран отправляет РОВНО ОДНО
-// сообщение в Telegram — успех, неудача или крах самого рана. Молчаливый
+// сообщение в Telegram — успех, неудача, скип или крах самого рана. Молчаливый
 // провал — худший баг этого проекта.
+//
+// Профиль (контакт, приоритет кортов, чат для отчёта) берётся из Supabase —
+// таблицы profiles/schedule_rules, то есть ровно оттуда, куда пишет админ
+// (/add_profile, /add_rule) и откуда читает планировщик. ENV-профиль
+// (src/core/profiles.ts) остаётся запасным путём: ручные прогоны без Supabase и
+// подстраховка, если БД недоступна. Два источника правды для одного и того же
+// факта — это разъезд: профиль, заведённый в боте, не бронировался бы вовсе, а
+// отчёт о нём уходил бы владельцу.
+//
+// Перед окном ран ещё раз проверяет скип на этот день (таблица skips): между
+// планированием и дропом человек мог нажать «⏭ Пропустить» в боте. Проверок
+// две — на старте рана и повторно за несколько секунд до окна: ран стартует
+// примерно за две минуты, и всё это время кнопка «Пропустить» у человека на
+// экране. Скип — не ошибка: уходит отдельное сообщение «пропущено по команде»,
+// брони нет.
+// После успешной LIVE-брони ставится отложенный ран 'remind' (src/trigger/
+// remind.ts) на «начало слота минус 2 часа».
 //
 // Приватность: контакт профиля (CLIENT_*), guest-token и значения секретов в
 // логи/output/Telegram не попадают — output рана виден всем, у кого есть
@@ -31,6 +48,8 @@ import { SupabaseStateStore } from '../core/state-supabase.js';
 import { formatDropReport, sendTelegram, telegramFromEnv, type TelegramTarget } from '../core/notify.js';
 import { bookSlotDrop, type EngineDeps, type DropReport } from '../core/booking-engine.js';
 import { dropDayOf, dropWatchWindow, tbilisiStamp } from '../core/scheduler.js';
+import { ProfilesRepo, SchedulesRepo, SkipsRepo, type SupabaseRepoOptions } from '../core/repos.js';
+import { scheduleReminder } from './remind.js';
 
 export interface BookSlotDropPayload {
   profileId: string;
@@ -84,6 +103,19 @@ const RECOMMENDED_HEAD_START_MS = 150_000;
  * корт не украдёт: по таймауту стор деградирует на память, и POST уходит.
  */
 const DROP_STATE_TIMEOUT_MS = 1_500;
+
+/**
+ * Таймаут проверки скипа. Она делается ДО окна дропа, спешить некуда, но и
+ * висеть в ожидании Supabase нельзя: за окном стоит бронь.
+ */
+const SKIP_CHECK_TIMEOUT_MS = 3_000;
+
+/**
+ * За сколько до окна делается ПОВТОРНАЯ проверка скипа. Запас покрывает сам
+ * запрос (таймаут SKIP_CHECK_TIMEOUT_MS) — то есть в худшем случае мы вернёмся
+ * к окну ровно к его открытию, а не позже.
+ */
+const SKIP_RECHECK_LEAD_MS = 4_000;
 
 /**
  * Попытки доставки отчёта. Единственное сообщение за ран не должно теряться
@@ -221,6 +253,106 @@ function fallbackReportText(report: DropReport, why: string): string {
     .join('\n');
 }
 
+/**
+ * Скип: единственное сообщение за такой ран. Отдельный текст, а не
+ * formatDropReport, потому что «пропущено по команде» — это не ошибка дропа:
+ * расширять DropErrorKind ради него значило бы менять контракт ядра фазы 2
+ * (движок, notify, их тесты), а маркер ❌ у осознанного пропуска ещё и врал бы.
+ */
+function skippedText(payload: BookSlotDropPayload): string {
+  return [
+    '⏭ <b>Пропущено по команде</b>',
+    `${escapeHtml(payload.profileId)} · ${escapeHtml(payload.date)} ${escapeHtml(payload.time)} · ` +
+      (payload.live ? 'LIVE' : 'DRY'),
+    'На этот день стоит скип — бронь не делали.',
+  ].join('\n');
+}
+
+/**
+ * Профиль для дропа: контакт, приоритет кортов, чат.
+ *
+ * Источник правды — Supabase (profiles + schedule_rules): туда пишет админ из
+ * бота, оттуда планировщик берёт правила и туда же смотрит бот, когда решает,
+ * кому что показывать. ENV-профиль остаётся запасным: он нужен ручным прогонам
+ * без Supabase и спасает, если БД отвалилась ровно перед дропом.
+ *
+ * Возвращает предупреждения, которые обязаны попасть в единственное сообщение
+ * вечера: «профиль взят из ENV, потому что БД молчит» — это ровно тот случай,
+ * когда бронь может уйти не с тем приоритетом кортов.
+ */
+async function resolveProfile(args: {
+  profileId: string;
+  time: string;
+  supabase: SupabaseRepoOptions | null;
+  envProfile: Profile | null;
+  envProblem: string | null;
+}): Promise<{ profile: Profile; warnings: string[] }> {
+  const { profileId, time, supabase, envProfile, envProblem } = args;
+  const warnings: string[] = [];
+
+  let dbProfile = null as Awaited<ReturnType<ProfilesRepo['getById']>>;
+  let dbCourts: string[] | null = null;
+  let dbDays: number[] | null = null;
+  if (supabase !== null) {
+    try {
+      dbProfile = await new ProfilesRepo(supabase).getById(profileId);
+      if (dbProfile !== null) {
+        const rules = await new SchedulesRepo(supabase).listByProfile(profileId);
+        // Правило этого времени авторитетнее прочих; если такого нет — берём
+        // любое включённое (приоритет кортов у профиля обычно один на все часы).
+        const rule = rules.find((r) => r.enabled && r.times.includes(time)) ?? rules.find((r) => r.enabled) ?? null;
+        dbCourts = rule?.courts ?? null;
+        dbDays = rule?.daysOfWeek ?? null;
+      }
+    } catch (err) {
+      warnings.push(`профиль из Supabase не прочитан (${redactSecrets(describeError(err))}) — работаем по ENV-профилю`);
+      logger.warn(warnings[warnings.length - 1]!);
+    }
+  }
+
+  if (dbProfile === null) {
+    if (envProfile === null) {
+      throw new Error(
+        `Профиль "${profileId}" не найден ни в Supabase (таблица profiles), ни в ENV` +
+          (envProblem === null ? '' : ` (${envProblem})`) +
+          '. Заведи его через /add_profile в боте или добавь PROFILE_<K>_* в переменные окружения.',
+      );
+    }
+    logger.info(`профиль "${profileId}" взят из ENV (в Supabase его нет или БД не отвечает)`);
+    return { profile: envProfile, warnings };
+  }
+
+  // Корты: правило из БД, иначе ENV-профиль. Без кортов бронировать нечем.
+  const courts = dbCourts ?? envProfile?.rule.courts ?? null;
+  if (courts === null) {
+    throw new Error(
+      `У профиля "${profileId}" в Supabase нет ни одного включённого правила с кортами, а ENV-профиля нет — ` +
+        'бронировать нечем. Добавь правило: /add_rule в боте.',
+    );
+  }
+  if (dbCourts === null) {
+    warnings.push('корты взяты из ENV: включённого правила в Supabase нет');
+  }
+
+  const chatId = dbProfile.telegramChatId ?? envProfile?.telegramChatId;
+  const profile: Profile = {
+    id: dbProfile.id,
+    label: dbProfile.label,
+    contact: { name: dbProfile.name, email: dbProfile.email, phone: dbProfile.phone },
+    ...(chatId === undefined || chatId === null ? {} : { telegramChatId: chatId }),
+    rule: {
+      times: [time],
+      courts,
+      ...(dbCourts !== null && dbDays !== null ? { daysOfWeek: dbDays } : {}),
+      ...(dbCourts === null && envProfile?.rule.daysOfWeek !== undefined
+        ? { daysOfWeek: envProfile.rule.daysOfWeek }
+        : {}),
+    },
+  };
+  logger.info(`профиль "${profileId}" взят из Supabase, корты: ${courts.join(' → ')}`);
+  return { profile, warnings };
+}
+
 /** Ран упал ДО отчёта: сообщение собираем из payload, других данных нет. */
 function crashText(payload: BookSlotDropPayload, detail: string): string {
   return [
@@ -271,11 +403,29 @@ export const bookSlotDropTask = task({
     try {
       logger.info('book-slot-drop: старт', { profileId, date, time, live });
 
-      const profiles = loadProfiles(process.env);
-      const profile = profiles.find((p) => p.id === profileId);
-      if (!profile) {
-        throw new Error(`Профиль "${profileId}" не найден. Доступные: ${profiles.map((p) => p.id).join(', ')}`);
+      const supabaseUrl = process.env.SUPABASE_URL?.trim() ?? '';
+      const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() ?? '';
+      const supabaseOpts: SupabaseRepoOptions | null =
+        supabaseUrl !== '' && supabaseKey !== ''
+          ? { url: supabaseUrl, serviceKey: supabaseKey, timeoutMs: SKIP_CHECK_TIMEOUT_MS }
+          : null;
+
+      // ENV-профиль собираем «мягко»: для профиля, живущего только в Supabase
+      // (заведён через /add_profile), отсутствие CLIENT_*/PROFILE_<K>_* — не
+      // повод падать.
+      let envProfile: Profile | null = null;
+      let envProblem: string | null = null;
+      try {
+        const profiles = loadProfiles(process.env);
+        envProfile = profiles.find((p) => p.id === profileId) ?? null;
+        if (envProfile === null) envProblem = `в ENV есть только: ${profiles.map((p) => p.id).join(', ')}`;
+      } catch (err) {
+        envProblem = `ENV-профили не собрались: ${redactSecrets(describeError(err))}`;
       }
+
+      const resolved = await resolveProfile({ profileId, time, supabase: supabaseOpts, envProfile, envProblem });
+      const profile = resolved.profile;
+      const profileWarning = resolved.warnings.length === 0 ? undefined : resolved.warnings.join(' · ');
       // У профиля может быть свой чат (мультипрофиль) — с этого момента отчёт
       // и крах-сообщение уходят именно туда. Глобального TELEGRAM_CHAT_ID при
       // этом может не быть вовсе (у каждого профиля свой чат): бот-токена и
@@ -300,6 +450,49 @@ export const bookSlotDropTask = task({
         );
       }
 
+      // ---- скип на этот день ----
+      // Вторая линия обороны: планировщик уже проверял скип, когда ставил ран,
+      // но между планированием и дропом человек мог нажать «⏭ Пропустить».
+      // Проверяем ДО ожидания окна — ран не должен зря держать очередь — и
+      // ПОВТОРНО перед самым окном (см. ниже): между этими двумя моментами
+      // проходит около двух минут, и всё это время кнопка «Пропустить» жива.
+      // Скип живёт под настоящим id профиля: DRY-суффикс тут ни при чём,
+      // «сегодня не играем» одинаково верно и для репетиции.
+      const skips = supabaseOpts === null ? null : new SkipsRepo(supabaseOpts);
+      let skipWarning: string | undefined;
+
+      /** Единственное сообщение такого рана: осознанный пропуск, а не ошибка. */
+      const reportSkipped = async (when: string): Promise<DropReport> => {
+        logger.info(`book-slot-drop: ${date} пропущен по команде профиля "${profileId}" (${when}) — брони не будет`);
+        reported = true;
+        await deliver(target, skippedText(payload));
+        return {
+          ok: false,
+          profileId,
+          date,
+          time,
+          timeline: [{ at: tbilisiStamp(new Date()), event: `пропущено по команде (скип на этот день, ${when})` }],
+        };
+      };
+
+      /** true — скип стоит. Отказ проверки не отменяет дроп, но запоминается. */
+      const checkSkipped = async (): Promise<boolean> => {
+        if (skips === null) return false;
+        try {
+          return await skips.isSkipped(profileId, date);
+        } catch (err) {
+          // Проверку скипа сорвала сеть/схема. Отменять из-за этого дроп нельзя
+          // (пропущенный корт не вернуть), но и молчать про это нельзя: скип
+          // мог быть, и тогда бронь окажется лишней — её видно в отчёте.
+          skipWarning = `скип не проверен (${redactSecrets(describeError(err))}) — если день был помечен «пропустить», бронь всё равно могла уйти`;
+          logger.warn(skipWarning);
+          return false;
+        }
+      };
+
+      if (skips === null) logger.info('скипы не проверяются: SUPABASE_* не заданы');
+      if (await checkSkipped()) return reportSkipped('старт рана');
+
       // Ран, поставленный сильно раньше окна, был бы убит по maxDuration прямо
       // во сне — без отчёта и без брони, то есть молчаливым провалом. Лучше
       // громко отказаться сейчас. (Уже закрытое окно обрабатывает движок: он
@@ -319,8 +512,6 @@ export const bookSlotDropTask = task({
       const engineProfile: Profile = live ? profile : { ...profile, id: `${profile.id}${DRY_PROFILE_SUFFIX}` };
 
       // ---- выбор хранилища ----
-      const supabaseUrl = process.env.SUPABASE_URL?.trim() ?? '';
-      const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() ?? '';
       let memoryWarning: string | undefined;
       let resilient: ResilientStateStore | null = null;
       let state: StateStore;
@@ -375,6 +566,18 @@ export const bookSlotDropTask = task({
         log: (msg: string) => logger.info(msg),
       };
 
+      // ---- скип, часть вторая ----
+      // Ран стартует примерно за две минуты до окна: за это время человек
+      // вполне может нажать «⏭ Пропустить» в pre-drop сообщении и получить
+      // «бронировать не будем». Спим почти до окна и перечитываем skips —
+      // иначе обещание было бы ложью, а корт оплаченным.
+      const untilRecheck = watch.start.getTime() - SKIP_RECHECK_LEAD_MS - Date.now();
+      if (skips !== null && untilRecheck > 0) {
+        logger.info(`ждём ${Math.round(untilRecheck / 1000)} c и перепроверяем скип перед окном ${tbilisiStamp(watch.start)}`);
+        await sleep(untilRecheck);
+        if (await checkSkipped()) return reportSkipped('перед окном');
+      }
+
       const report = await bookSlotDrop(engineProfile, { date, time }, deps);
       logger.info('book-slot-drop: финиш', { ok: report.ok, court: report.court, error: report.error });
 
@@ -397,10 +600,16 @@ export const bookSlotDropTask = task({
             : 'token брони не выводится в логи/output — он лежит в state и в письме-подтверждении',
         );
       }
-      const messageWarning =
+      const stateLine =
         stateWarning !== undefined && tokenLost
           ? `${stateWarning} · token брони НЕ сохранён — отменять бронь только по ссылке из письма-подтверждения (сам token есть в output рана)`
           : stateWarning;
+      // Предупреждений может быть несколько (state, непроверенный скип, откуда
+      // взялся профиль) — все должны попасть в единственное сообщение вечера.
+      const warnings = [stateLine, skipWarning, profileWarning].filter(
+        (w): w is string => w !== undefined && w !== '',
+      );
+      const messageWarning = warnings.length === 0 ? undefined : warnings.join(' · ');
 
       let text: string;
       try {
@@ -412,6 +621,24 @@ export const bookSlotDropTask = task({
       reported = true;
       // Чужой текст в detail мог процитировать контакт профиля — режем его и здесь.
       await deliver(target, redactSecrets(text));
+
+      // Напоминание за 2 часа ставим ПОСЛЕ отчёта: отчёт — инвариант вечера, а
+      // напоминание приятный бонус, который не имеет права его задерживать или
+      // ронять ран. Только LIVE: в DRY бронь синтетическая, напоминать не о чем.
+      const bookingId = report.bookingId ?? '';
+      const bookedCourt = report.court ?? '';
+      if (live && report.ok && bookingId !== '' && bookedCourt !== '') {
+        try {
+          const outcome = await scheduleReminder(
+            { profileId, date, time, court: bookedCourt, bookingId },
+            target?.chatId ?? '',
+            { log: (msg) => logger.info(msg) },
+          );
+          logger.info(`remind: ${outcome}`);
+        } catch (err) {
+          logger.error(`remind: напоминание не запланировано (бронь это не отменяет): ${redactSecrets(describeError(err))}`);
+        }
+      }
 
       return tokenLost ? report : redactToken(report);
     } catch (err) {

@@ -51,6 +51,74 @@ alter table public.bookings enable row level security;
 --    ещё до всякого RLS. Строка ниже безопасна и при уже включённом RLS.
 revoke all on table public.bookings from anon, authenticated;
 
+-- ===========================================================================
+-- Ядро Telegram-бота (фаза 3). Тот же DDL лежит миграцией
+-- supabase/migrations/20260731110000_bot_core.sql — держать файлы в синхроне.
+-- Читает/пишет только src/core/repos.ts (PostgREST через fetch, service-ключ).
+-- ===========================================================================
+
+-- Профиль = человек, за которого бот бронирует. Авторизация в боте — ТОЛЬКО по
+-- telegram_chat_id (allowlist): чужой chat_id не находит профиль, и бот молчит.
+create table if not exists public.profiles (
+  id               text primary key,          -- 'ilya', 'nina', ...
+  label            text not null,             -- как звать в интерфейсе бота
+  name             text not null,             -- контакт guest-брони (Reservio)
+  email            text not null,             -- email кабинета: к нему привяжется бронь
+  phone            text not null,
+  telegram_chat_id text unique,               -- null = профиль без доступа к боту
+  is_admin         boolean not null default false,
+  created_at       text not null default to_char(now() at time zone 'Asia/Tbilisi', 'YYYY-MM-DD"T"HH24:MI:SS"+04:00"')
+);
+
+-- Правило = «во столько-то, на такие-то корты, в такие-то дни». Никаких
+-- «20:00 Court 3» в коде — только здесь (CLAUDE.md → Мультипрофили).
+create table if not exists public.schedule_rules (
+  id           uuid primary key default gen_random_uuid(),
+  profile_id   text not null references public.profiles (id) on delete cascade,
+  times        jsonb not null,  -- ["20:00","21:00"] — каждое время это отдельный дроп и отдельная бронь
+  courts       jsonb not null,  -- ["Padel Court 3","Padel Court 2"] — порядок = приоритет
+  days_of_week jsonb,           -- [1,2,3] (вс=0); null = каждый день
+  enabled      boolean not null default true,
+  created_at   text not null default to_char(now() at time zone 'Asia/Tbilisi', 'YYYY-MM-DD"T"HH24:MI:SS"+04:00"'),
+  -- jsonb принимает и число, и строку, и объект: без этих проверок правило
+  -- {"times": "20:00"} тихо доехало бы до планировщика и не забронировало ничего.
+  constraint schedule_rules_times_array  check (jsonb_typeof(times) = 'array' and jsonb_array_length(times) > 0),
+  constraint schedule_rules_courts_array check (jsonb_typeof(courts) = 'array' and jsonb_array_length(courts) > 0),
+  constraint schedule_rules_days_array   check (days_of_week is null or jsonb_typeof(days_of_week) = 'array')
+);
+
+create index if not exists schedule_rules_profile_idx on public.schedule_rules (profile_id);
+
+-- Скип целого дня: планировщик не ставит на эту дату ни одного дропа, а уже
+-- поставленная бронь-джоба проверяет скип ещё раз перед окном.
+create table if not exists public.skips (
+  profile_id text not null references public.profiles (id) on delete cascade,
+  date       text not null,  -- YYYY-MM-DD, день игры в Asia/Tbilisi
+  created_at text not null default to_char(now() at time zone 'Asia/Tbilisi', 'YYYY-MM-DD"T"HH24:MI:SS"+04:00"'),
+  -- В этот уникальный ключ целится upsert репозитория
+  -- (POST ?on_conflict=profile_id,date + Prefer: resolution=merge-duplicates).
+  constraint skips_profile_date_key unique (profile_id, date)
+);
+
+-- Глобальные флаги бота. Ключ planner_enabled='true' — единственный способ
+-- включить автоматический планировщик (фаза 4, по явному одобрению пользователя).
+create table if not exists public.settings (
+  key   text primary key,
+  value text not null
+);
+
+-- Доступ — как у bookings: только service-ключ, два независимых барьера.
+-- Здесь лежат email, телефоны и chat_id, то есть персональные данные.
+alter table public.profiles       enable row level security;
+alter table public.schedule_rules enable row level security;
+alter table public.skips          enable row level security;
+alter table public.settings       enable row level security;
+
+revoke all on table public.profiles       from anon, authenticated;
+revoke all on table public.schedule_rules from anon, authenticated;
+revoke all on table public.skips          from anon, authenticated;
+revoke all on table public.settings       from anon, authenticated;
+
 -- PostgREST кэширует схему; в Supabase кэш обновляется сам, но если сразу после
 -- Run адаптер жалуется на PGRST205 "Could not find the table" — выполнить это:
 notify pgrst, 'reload schema';

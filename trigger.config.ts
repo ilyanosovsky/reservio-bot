@@ -1,9 +1,18 @@
-// Конфиг trigger.dev: проект proj_fxjnzqesxsicrpeuepzv, единственный таск —
-// src/trigger/book-drop.ts.
+// Конфиг trigger.dev: проект proj_fxjnzqesxsicrpeuepzv. Таски подхватываются
+// из ./src/trigger по `dirs` (см. ниже): book-drop, remind, drop-observe,
+// daily-planner.
 //
-// ВАЖНО: schedules/cron здесь НЕТ и не появятся до фазы 4 и явного одобрения
-// пользователя (CLAUDE.md). Запуск только ручной: дашборд, CLI,
-// mcp__trigger__trigger_task — в том числе отложенный (`delay`), см.
+// ВАЖНО про cron. Единственный таск с расписанием — daily-planner
+// (`schedules.task`, cron '30 16 * * *' = 20:30 Тбилиси). Деплой РЕГИСТРИРУЕТ
+// это расписание, и крон начнёт тикать — но забронировать он ничего не может:
+// run() первым делом читает settings.planner_enabled из Supabase и при любом
+// значении, кроме точно 'true', молча выходит. То есть запрет CLAUDE.md
+// («никаких автоматических бронирований по cron до фазы 4») держится не
+// отсутствием крона, а флагом в БД, который выставляется руками по явному
+// одобрению пользователя (docs/wiki/Runbook.md → «Планировщик»).
+//
+// Остальные таски запускаются только вручную: дашборд, CLI,
+// mcp__trigger__trigger_task — в том числе отложенно (`delay`), см.
 // docs/wiki/Runbook.md → «Вечерний облачный прогон».
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';

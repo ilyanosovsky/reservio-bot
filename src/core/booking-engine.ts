@@ -66,8 +66,11 @@ function isFormatError(err: unknown): boolean {
  * обрыв связи, 5xx, 2xx без data.id. Запрос мог дойти и создать бронь, а
  * id/token до нас не добрались. Пробовать после такого следующий корт — значит
  * получить две реальные брони, из которых первую нечем отменить.
+ *
+ * Экспортируется ради book-now.ts: правило «после неоднозначного отказа не
+ * трогаем API повторно» обязано быть общим у дропа и у брони по запросу.
  */
-function isAmbiguousPostFailure(err: unknown): boolean {
+export function isAmbiguousPostFailure(err: unknown): boolean {
   const e = err as { status?: number; code?: string } | null;
   if (e?.code === 'invalidArgument') return false; // запрос вообще не ушёл
   if (e?.code === 'unexpectedResponse') return true; // ответ пришёл, но без id
