@@ -10,7 +10,7 @@
 
 import { InlineKeyboard } from 'grammy';
 import type { BotContext } from './context.js';
-import { PADEL_COURTS, formatDateShort } from './format.js';
+import { BOOKABLE_COURTS, formatDateShort } from './format.js';
 
 /** Дат в ряду: три коротких («06.08 (чт)») влезают, четыре уже режутся. */
 const DATES_PER_ROW = 2;
@@ -29,7 +29,7 @@ export function dateKeyboard(dates: string[], encode: (date: string) => string):
 
 export function courtKeyboard(encode: (courtIndex: number) => string): InlineKeyboard {
   const kb = new InlineKeyboard();
-  PADEL_COURTS.forEach((court, i) => {
+  BOOKABLE_COURTS.forEach((court, i) => {
     kb.text(court.name, encode(i)).row();
   });
   return kb;
