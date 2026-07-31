@@ -4,7 +4,7 @@ import type { ScheduleRuleRow } from '../src/core/repos.js';
 import type { Slot } from '../src/reservio/types.js';
 import {
   CANCEL_DEADLINE_MS,
-  PADEL_COURTS,
+  BOOKABLE_COURTS,
   activeBookings,
   bookingButtonLabel,
   cancelDeadlinePassed,
@@ -321,12 +321,14 @@ describe('маскирование персональных данных', () =>
 });
 
 describe('корты интерфейса', () => {
-  it('в меню ровно четыре падел-корта', () => {
-    expect(PADEL_COURTS.map((c) => c.name)).toEqual([
+  it('в меню все шесть кортов клуба, падел первыми (индексы 0–3 стабильны)', () => {
+    expect(BOOKABLE_COURTS.map((c) => c.name)).toEqual([
       'Padel Court 1',
       'Padel Court 2',
       'Padel Court 3',
       'Padel Court 4',
+      'Park Court 1',
+      'Park Court 2',
     ]);
   });
 
@@ -338,7 +340,8 @@ describe('корты интерфейса', () => {
 
   it('обратное преобразование терпит регистр', () => {
     expect(courtIndexOf('padel court 3')).toBe(2);
-    expect(courtIndexOf('Park Court 1')).toBe(-1);
+    expect(courtIndexOf('park court 1')).toBe(4);
+    expect(courtIndexOf('Court X')).toBe(-1);
   });
 });
 

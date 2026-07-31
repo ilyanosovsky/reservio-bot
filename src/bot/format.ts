@@ -25,8 +25,12 @@ export const CANCEL_DEADLINE_MS = 60 * 60 * 1000;
 
 export const WEEKDAYS_SHORT = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'] as const;
 
-/** Корты, которые бот предлагает в интерфейсе: четыре падел-корта клуба. */
-export const PADEL_COURTS: CourtInfo[] = COURTS.filter((c) => c.name.startsWith('Padel Court'));
+/**
+ * Корты, которые бот предлагает в интерфейсе: все шесть кортов клуба.
+ * Порядок наследует COURTS: падел-корты первыми (индексы 0–3 как раньше —
+ * старые callback_data в уже отправленных сообщениях не поедут), затем Park.
+ */
+export const BOOKABLE_COURTS: CourtInfo[] = [...COURTS];
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -36,14 +40,14 @@ export function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** Корт по индексу в PADEL_COURTS (индекс ездит в callback_data — он короткий). */
+/** Корт по индексу в BOOKABLE_COURTS (индекс ездит в callback_data — он короткий). */
 export function courtByIndex(index: number): CourtInfo | null {
-  return PADEL_COURTS[index] ?? null;
+  return BOOKABLE_COURTS[index] ?? null;
 }
 
 export function courtIndexOf(name: string): number {
   const needle = name.trim().toLowerCase();
-  return PADEL_COURTS.findIndex((c) => c.name.toLowerCase() === needle);
+  return BOOKABLE_COURTS.findIndex((c) => c.name.toLowerCase() === needle);
 }
 
 /** '2026-08-06' → '06.08 (чт)'. Кривую дату отдаём как есть — врать не надо. */
