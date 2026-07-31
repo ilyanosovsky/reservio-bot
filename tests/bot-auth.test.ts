@@ -244,6 +244,27 @@ function textUpdate(text: string, chatId: number, chatType: 'private' | 'supergr
   } as unknown as Update;
 }
 
+/** Нажатие inline-кнопки: сообщение мастера, к которому она прикреплена, уже в чате. */
+function callbackUpdate(data: string, chatId: number): Update {
+  updateId += 1;
+  return {
+    update_id: updateId,
+    callback_query: {
+      id: `cbq-${updateId}`,
+      from: { id: chatId, is_bot: false, first_name: 'Tester' },
+      chat_instance: String(chatId),
+      data,
+      message: {
+        message_id: updateId,
+        date: 1_754_000_000,
+        chat: { id: chatId, type: 'private' },
+        from: { id: BOT_INFO.id, is_bot: true, first_name: 'padel' },
+        text: 'экран мастера',
+      },
+    },
+  } as unknown as Update;
+}
+
 /** Команда: grammY ищет entity bot_command в начале текста. */
 function commandUpdate(text: string, chatId: number, chatType: 'private' | 'supergroup' = 'private'): Update {
   const update = textUpdate(text, chatId, chatType);
@@ -292,6 +313,50 @@ describe('installBot: чужому чату — полная тишина', () =
 
     expect(h.calls).toEqual([]);
     expect(h.upsert).not.toHaveBeenCalled();
+  });
+});
+
+describe('installBot: диспетчер callback-кнопок', () => {
+  // Кнопка «⬅️ Назад» первого шага проходит весь путь: parse → switch → хендлер.
+  // Без этого теста выпавший case выглядел бы нормально (спиннер гаснет), но
+  // экран не перерисовывался бы — молчаливый провал, худший баг проекта.
+
+  it('«Назад» мастера «Слоты» гасит спиннер И перерисовывает ТО ЖЕ сообщение', async () => {
+    const h = harness(profileRow());
+
+    await h.handle(callbackUpdate('sl~b', OWNER_CHAT));
+
+    expect(h.calls.map((c) => c.method)).toEqual(['answerCallbackQuery', 'editMessageText']);
+    const editCall = h.calls[1]!;
+    expect(editCall.payload['text']).toContain('Слоты');
+    expect(editCall.payload['text']).toContain('выбери дату');
+    // Новое сообщение не шлём: sendMessage в списке вызовов отсутствует.
+    expect(h.calls.some((c) => c.method === 'sendMessage')).toBe(false);
+  });
+
+  it('«Назад» мастера «Бронировать» перерисовывает своё сообщение', async () => {
+    const h = harness(profileRow());
+
+    await h.handle(callbackUpdate('bk~b', OWNER_CHAT));
+
+    expect(h.calls.map((c) => c.method)).toEqual(['answerCallbackQuery', 'editMessageText']);
+    expect(h.calls[1]!.payload['text']).toContain('Бронь');
+  });
+
+  it('неизвестная кнопка — только гашение спиннера, без сообщений в чат', async () => {
+    const h = harness(profileRow());
+
+    await h.handle(callbackUpdate('нечто~непонятное', OWNER_CHAT));
+
+    expect(h.calls.map((c) => c.method)).toEqual(['answerCallbackQuery']);
+  });
+
+  it('кнопка от чужого чата — полная тишина', async () => {
+    const h = harness(null);
+
+    await h.handle(callbackUpdate('bk~b', STRANGER_CHAT));
+
+    expect(h.calls).toEqual([]);
   });
 });
 
