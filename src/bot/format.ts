@@ -141,6 +141,60 @@ export function bookingButtonLabel(b: StoredBooking): string {
   return `${formatDateShort(b.date)} ${b.time} · ${b.court}`;
 }
 
+// ---------------------------------------------------------------------------
+// Хлебные крошки мастеров
+// ---------------------------------------------------------------------------
+
+/** Два пошаговых мастера бота: «📆 Бронировать» и «🔍 Слоты». */
+export type WizardKind = 'book' | 'slots';
+
+/** Заголовок мастера: по нему видно, в каком из двух находишься. */
+export const WIZARD_TITLE: Record<WizardKind, string> = {
+  book: '📆 <b>Бронь</b>',
+  slots: '🔍 <b>Слоты</b>',
+};
+
+const CRUMB_SEP = ' · ';
+
+/**
+ * Строка шага: заголовок · выбранная дата · выбранный корт · что делать дальше.
+ * Весь накопленный контекст обязан быть виден на КАЖДОМ шаге — иначе после
+ * «Назад» человек не понимает, куда попал, а сервер состояние мастера не хранит.
+ *
+ * Экранируются ВСЕ параметры, включая `prompt`: функция экспортирована, и первый
+ * же вызов с динамическим хвостом (например, причиной отказа Reservio с '<' или
+ * '&') отдал бы Telegram невалидный HTML — editMessageText упал бы на разборе
+ * разметки, а фолбэк ctx.reply отправил бы тот же битый текст. Сырой остаётся
+ * только WIZARD_TITLE: это наша константа, а не параметр.
+ */
+export function wizardCrumbs(
+  wizard: WizardKind,
+  picked: { date?: string; court?: string },
+  prompt: string,
+): string {
+  const parts = [WIZARD_TITLE[wizard]];
+  if (picked.date !== undefined) parts.push(escapeHtml(formatDateShort(picked.date)));
+  if (picked.court !== undefined) parts.push(escapeHtml(picked.court));
+  parts.push(escapeHtml(prompt));
+  return parts.join(CRUMB_SEP);
+}
+
+export const formatBookDatesStep = (): string => wizardCrumbs('book', {}, 'выбери дату');
+export const formatBookCourtsStep = (date: string): string => wizardCrumbs('book', { date }, 'выбери корт');
+export const formatBookTimesStep = (date: string, court: string): string =>
+  wizardCrumbs('book', { date, court }, 'выбери время');
+export const formatSlotsDatesStep = (): string => wizardCrumbs('slots', {}, 'выбери дату');
+export const formatSlotsCourtsStep = (date: string): string => wizardCrumbs('slots', { date }, 'выбери корт');
+
+/** Тупик мастера: у корта на эту дату нет свободных часов. Крошки остаются. */
+export function formatBookNoTimes(date: string, court: string): string {
+  return [
+    wizardCrumbs('book', { date, court }, 'свободных слотов нет'),
+    '',
+    'Вернись назад и выбери другой корт или дату.',
+  ].join('\n');
+}
+
 export function formatSlotsList(court: string, date: string, slots: Slot[]): string {
   const times = freeTimes(slots);
   const head = `🔍 <b>${escapeHtml(court)}</b>, ${escapeHtml(formatDateShort(date))}`;

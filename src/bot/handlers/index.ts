@@ -18,8 +18,8 @@ import { answer, edit, reply } from '../ui.js';
 import { safeErrorText } from '../errors.js';
 import { commandArgs, logOf } from './shared.js';
 import { showBookings } from './bookings.js';
-import { showSlotCourts, showSlotDates, showSlots } from './slots.js';
-import { confirmBook, doBook, showBookCourts, showBookDates, showBookTimes } from './book.js';
+import { backToSlotDates, showSlotCourts, showSlotDates, showSlots } from './slots.js';
+import { backToBookDates, confirmBook, doBook, showBookCourts, showBookDates, showBookTimes } from './book.js';
 import { confirmCancel, doCancel, showCancelList } from './cancel.js';
 import { showSkips, toggleSkip } from './skip.js';
 import { showSchedule, toggleRule } from './schedule.js';
@@ -94,6 +94,10 @@ export function registerHandlers(bot: Composer<BotContext>, deps: BotDeps): void
       if (!SELF_ANSWERING.has(cb.kind)) await answer(ctx);
 
       switch (cb.kind) {
+        case 'slots-back-dates':
+          return backToSlotDates(ctx, deps);
+        case 'book-back-dates':
+          return backToBookDates(ctx, deps);
         case 'slots-date':
           return showSlotCourts(ctx, deps, cb.date);
         case 'slots-court':
@@ -120,6 +124,15 @@ export function registerHandlers(bot: Composer<BotContext>, deps: BotDeps): void
           // Кнопка «✅ Бронируем» pre-drop сообщения: подтверждать нечего,
           // сообщение планировщика намеренно оставляем нетронутым.
           return;
+        default: {
+          // Недостижимо: тип never заставляет TypeScript отбить любой kind без
+          // case выше. Ветка нужна именно поэтому — потерянный при рефакторинге
+          // case иначе стал бы молча мёртвой кнопкой (спиннер погас, экран тот
+          // же, в логе пусто), а это худший баг проекта (CLAUDE.md).
+          const unhandled: never = cb;
+          logOf(deps)(`callback: kind без обработчика — ${JSON.stringify(unhandled)}`);
+          return;
+        }
       }
     }),
   );

@@ -177,6 +177,10 @@ export function parseAddRule(raw: string): ParseResult<AddRuleInput> {
 // ---------------------------------------------------------------------------
 
 export type Callback =
+  // Шаг 0 мастера («Назад» с выбора корта): параметров нет, даты пересчитываются
+  // от «сейчас» — иначе после полуночи вернёшься к вчерашнему списку.
+  | { kind: 'slots-back-dates' }
+  | { kind: 'book-back-dates' }
   | { kind: 'slots-date'; date: string }
   | { kind: 'slots-court'; date: string; courtIndex: number }
   | { kind: 'book-date'; date: string }
@@ -221,6 +225,16 @@ function cb(data: string): string {
   }
   return data;
 }
+
+/**
+ * «Назад» = переход на шаг с МЕНЬШИМ числом параметров, поэтому отдельные
+ * кодировщики нужны только для возврата на шаг 0 (выбор даты) — все остальные
+ * возвраты переиспользуют кодировщики самих шагов: с шага времени назад ведёт
+ * cbBookDate(date), с подтверждения — cbBookCourt(date, courtIndex). Никакого
+ * серверного состояния мастера нет: весь контекст едет в callback_data.
+ */
+export const cbSlotsBackDates = (): string => cb(`sl${SEP}b`);
+export const cbBookBackDates = (): string => cb(`bk${SEP}b`);
 
 export const cbSlotsDate = (date: string): string => cb(`sl${SEP}d${SEP}${date}`);
 export const cbSlotsCourt = (date: string, courtIndex: number): string => cb(`sl${SEP}c${SEP}${date}${SEP}${courtIndex}`);
@@ -275,6 +289,13 @@ export function parseCallbackData(data: string): Callback | null {
   if (head !== CB_PREFIXES.slots && head !== CB_PREFIXES.book) return null;
 
   const step = parts[1];
+
+  // Шаг 0 — единственный без даты, поэтому разбирается до проверки формата даты.
+  if (step === 'b') {
+    if (parts.length !== 2) return null;
+    return head === CB_PREFIXES.slots ? { kind: 'slots-back-dates' } : { kind: 'book-back-dates' };
+  }
+
   const date = parts[2];
   if (date === undefined || !DATE_RE.test(date)) return null;
 

@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { GrammyError } from 'grammy';
+import type { BotContext } from '../src/bot/context.js';
 import type { StoredBooking } from '../src/core/state.js';
 import type { ScheduleRuleRow } from '../src/core/repos.js';
 import type { Slot } from '../src/reservio/types.js';
@@ -12,11 +14,17 @@ import {
   courtIndexOf,
   escapeHtml,
   formatBookingsList,
+  formatBookCourtsStep,
+  formatBookDatesStep,
+  formatBookNoTimes,
+  formatBookTimesStep,
   formatDateShort,
   formatDays,
   formatProfilesList,
   formatRulesList,
   formatSkipsList,
+  formatSlotsCourtsStep,
+  formatSlotsDatesStep,
   formatSlotsList,
   freeTimes,
   humanizeCancelError,
@@ -26,7 +34,18 @@ import {
   skipButtonLabel,
   slotTimeLabel,
   upcomingDates,
+  wizardCrumbs,
 } from '../src/bot/format.js';
+import {
+  BACK_LABEL,
+  backKeyboard,
+  confirmKeyboard,
+  courtKeyboard,
+  dateKeyboard,
+  edit,
+  isNotModifiedError,
+  timeKeyboard,
+} from '../src/bot/ui.js';
 
 // vitest.config.ts фиксирует TZ=America/New_York — любые расчёты ниже обязаны
 // давать календарь Тбилиси (+04:00), а не хоста.
@@ -348,5 +367,181 @@ describe('корты интерфейса', () => {
 describe('escapeHtml', () => {
   it('экранирует ровно три спецсимвола Telegram', () => {
     expect(escapeHtml('<b>a & b</b>')).toBe('&lt;b&gt;a &amp; b&lt;/b&gt;');
+  });
+});
+
+describe('хлебные крошки мастеров', () => {
+  // Смысл крошек: на любом шаге видно ВЕСЬ накопленный контекст. Серверного
+  // состояния мастера нет, так что текст сообщения — единственное место, где
+  // человек может прочитать, что он уже выбрал.
+  it('шаг даты называет мастер и просит дату', () => {
+    expect(formatBookDatesStep()).toBe('📆 <b>Бронь</b> · выбери дату');
+    expect(formatSlotsDatesStep()).toBe('🔍 <b>Слоты</b> · выбери дату');
+  });
+
+  it('шаг корта показывает выбранную дату', () => {
+    expect(formatBookCourtsStep('2026-08-06')).toBe('📆 <b>Бронь</b> · 06.08 (чт) · выбери корт');
+    expect(formatSlotsCourtsStep('2026-08-06')).toBe('🔍 <b>Слоты</b> · 06.08 (чт) · выбери корт');
+  });
+
+  it('шаг времени показывает дату и корт', () => {
+    expect(formatBookTimesStep('2026-08-06', 'Park Court 1')).toBe(
+      '📆 <b>Бронь</b> · 06.08 (чт) · Park Court 1 · выбери время',
+    );
+  });
+
+  it('дата в крошках всегда через formatDateShort, а не сырым ISO', () => {
+    expect(formatBookCourtsStep('2026-08-06')).not.toContain('2026-08-06');
+    expect(formatSlotsCourtsStep('2026-08-02')).toContain('02.08 (вс)');
+  });
+
+  it('тупик «нет слотов» сохраняет контекст и зовёт назад', () => {
+    const text = formatBookNoTimes('2026-08-06', 'Padel Court 3');
+    expect(text).toContain('06.08 (чт)');
+    expect(text).toContain('Padel Court 3');
+    expect(text).toContain('свободных слотов нет');
+    expect(text).toContain('назад');
+  });
+
+  it('экранирует имя корта, но не ломает разметку заголовка', () => {
+    const text = wizardCrumbs('book', { date: '2026-08-06', court: 'Court <b>3</b>' }, 'выбери время');
+    expect(text).toContain('Court &lt;b&gt;3&lt;/b&gt;');
+    expect(text.startsWith('📆 <b>Бронь</b>')).toBe(true);
+  });
+
+  it('хвост (prompt) экранируется наравне с датой и кортом', () => {
+    // Хвост когда-нибудь станет динамическим (причина отказа Reservio). Сырой
+    // '<' отдал бы Telegram невалидный HTML: правка упала бы на разборе
+    // разметки, а фолбэк отправил бы ТОТ ЖЕ битый текст — тап без реакции.
+    const text = wizardCrumbs('slots', { date: '2026-08-06' }, 'нет слотов: <api> & retry');
+    expect(text).toContain('нет слотов: &lt;api&gt; &amp; retry');
+    expect(text).not.toContain('<api>');
+    expect(text.startsWith('🔍 <b>Слоты</b>')).toBe(true);
+  });
+
+  it('обычные подсказки шагов от экранирования не меняются', () => {
+    expect(formatBookDatesStep()).toBe('📆 <b>Бронь</b> · выбери дату');
+    expect(formatBookTimesStep('2026-08-06', 'Padel Court 3')).toBe(
+      '📆 <b>Бронь</b> · 06.08 (чт) · Padel Court 3 · выбери время',
+    );
+  });
+});
+
+describe('клавиатуры мастера: кнопка «Назад»', () => {
+  const rowsOf = (kb: { inline_keyboard: { text: string; callback_data?: string }[][] }) => kb.inline_keyboard;
+  const lastRow = (kb: { inline_keyboard: { text: string; callback_data?: string }[][] }) =>
+    kb.inline_keyboard[kb.inline_keyboard.length - 1]!;
+
+  it('первый шаг (даты) — без «Назад»: возвращаться некуда', () => {
+    const kb = dateKeyboard(['2026-08-06', '2026-08-07', '2026-08-08'], (d) => `bk~d~${d}`);
+    expect(rowsOf(kb).flat().map((b) => b.text)).not.toContain(BACK_LABEL);
+  });
+
+  it('пустых рядов в клавиатуре не остаётся', () => {
+    const kbs = [
+      dateKeyboard(['2026-08-06', '2026-08-07'], (d) => `bk~d~${d}`),
+      courtKeyboard((i) => `bk~c~2026-08-06~${i}`, 'bk~b'),
+      timeKeyboard(['20:00', '21:00', '22:00'], (t) => `bk~t~2026-08-06~2~${t}`, 'bk~d~2026-08-06'),
+    ];
+    for (const kb of kbs) {
+      expect(rowsOf(kb).every((row) => row.length > 0)).toBe(true);
+    }
+  });
+
+  it('«Назад» стоит ОТДЕЛЬНЫМ последним рядом, чтобы не ловить случайные тапы', () => {
+    const courts = courtKeyboard((i) => `bk~c~2026-08-06~${i}`, 'bk~b');
+    expect(lastRow(courts)).toEqual([{ text: BACK_LABEL, callback_data: 'bk~b' }]);
+
+    const times = timeKeyboard(['20:00', '21:00'], (t) => `bk~t~2026-08-06~2~${t}`, 'bk~d~2026-08-06');
+    expect(lastRow(times)).toEqual([{ text: BACK_LABEL, callback_data: 'bk~d~2026-08-06' }]);
+  });
+
+  it('подтверждение брони: «Назад» ниже «Бронировать» и «Отмена»', () => {
+    const kb = confirmKeyboard('bk~y~2026-08-06~2~21:00', 'close', '✅ Бронировать', 'bk~c~2026-08-06~2');
+    expect(rowsOf(kb)).toHaveLength(2);
+    expect(rowsOf(kb)[0]!.map((b) => b.text)).toEqual(['✅ Бронировать', '↩️ Отмена']);
+    expect(lastRow(kb)).toEqual([{ text: BACK_LABEL, callback_data: 'bk~c~2026-08-06~2' }]);
+  });
+
+  it('без backData клавиатуры остаются прежними (отмена брони «Назад» не показывает)', () => {
+    expect(rowsOf(confirmKeyboard('cx~y~b-1', 'close'))).toHaveLength(1);
+    expect(rowsOf(courtKeyboard((i) => `sl~c~2026-08-06~${i}`)).flat().map((b) => b.text)).not.toContain(BACK_LABEL);
+  });
+
+  it('экран-результат («Слоты») — одна кнопка возврата к выбору корта', () => {
+    expect(rowsOf(backKeyboard('sl~d~2026-08-06'))).toEqual([
+      [{ text: BACK_LABEL, callback_data: 'sl~d~2026-08-06' }],
+    ]);
+  });
+});
+
+describe('isNotModifiedError', () => {
+  // Двойной тап по «Назад» — обычное дело на мобильной сети. Telegram отвечает
+  // 400, но экран уже такой, какой просили: пользователю сообщать не о чем.
+  it('узнаёт ошибку Telegram и в description, и в message', () => {
+    expect(isNotModifiedError({ description: 'Bad Request: message is not modified' })).toBe(true);
+    expect(isNotModifiedError(new Error('400: Bad Request: message is not modified'))).toBe(true);
+  });
+
+  it('прочие ошибки не глотает — их человек обязан увидеть', () => {
+    expect(isNotModifiedError({ description: 'Bad Request: message to edit not found' })).toBe(false);
+    expect(isNotModifiedError(new Error('network error'))).toBe(false);
+    expect(isNotModifiedError(null)).toBe(false);
+    expect(isNotModifiedError('message is not modified')).toBe(false);
+  });
+});
+
+describe('edit(): что делает обёртка с ошибкой правки', () => {
+  // Проверять один предикат мало: требование «не плодить дубли экрана» держится
+  // на том, что edit() им ПОЛЬЗУЕТСЯ до фолбэка ctx.reply. Тесты ниже фиксируют
+  // именно это — переставленный catch-блок обязан их уронить.
+
+  function grammyError(description: string): GrammyError {
+    return new GrammyError(
+      "Call to 'editMessageText' failed!",
+      { ok: false, error_code: 400, description },
+      'editMessageText',
+      {},
+    );
+  }
+
+  function ctxThrowing(err: unknown): {
+    ctx: BotContext;
+    editMessageText: ReturnType<typeof vi.fn>;
+    reply: ReturnType<typeof vi.fn>;
+  } {
+    const editMessageText = vi.fn(async () => {
+      throw err;
+    });
+    const reply = vi.fn(async () => ({}));
+    return { ctx: { editMessageText, reply } as unknown as BotContext, editMessageText, reply };
+  }
+
+  it('«message is not modified» (двойной тап по «Назад») — НИ одного исходящего сообщения', async () => {
+    const { ctx, editMessageText, reply } = ctxThrowing(
+      grammyError('Bad Request: message is not modified: specified new message content and reply markup are exactly the same'),
+    );
+
+    await edit(ctx, '📆 <b>Бронь</b> · выбери дату');
+
+    expect(editMessageText).toHaveBeenCalledTimes(1);
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('прочая ошибка правки — экран всё равно показан новым сообщением', async () => {
+    const { ctx, reply } = ctxThrowing(grammyError('Bad Request: message to edit not found'));
+
+    await edit(ctx, '📆 <b>Бронь</b> · выбери дату');
+
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply.mock.calls[0]?.[0]).toBe('📆 <b>Бронь</b> · выбери дату');
+  });
+
+  it('чат недоступен (упал и фолбэк) — исключение наружу не летит', async () => {
+    const { ctx, reply } = ctxThrowing(new Error('network error'));
+    reply.mockRejectedValue(new Error('Forbidden: bot was blocked by the user'));
+
+    await expect(edit(ctx, 'текст')).resolves.toBeUndefined();
+    expect(reply).toHaveBeenCalledTimes(1);
   });
 });

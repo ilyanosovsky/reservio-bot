@@ -4,29 +4,63 @@
 //
 // Подтверждение обязательно: bookNow создаёт настоящую бронь, случайный тап по
 // кнопке не должен стоить корта.
+//
+// Мастер без серверного состояния: дата и корт едут в callback_data, поэтому
+// «Назад» — переход на шаг с меньшим числом параметров. Времена на своём шаге
+// ВСЕГДА перезапрашиваются из availability: за время раздумий слот мог уйти.
 
+import type { InlineKeyboard } from 'grammy';
 import type { BotContext, BotDeps } from '../context.js';
 import type { StoredBooking } from '../../core/state.js';
 import { contactOf } from '../context.js';
 import {
   courtByIndex,
+  formatBookCourtsStep,
+  formatBookDatesStep,
+  formatBookNoTimes,
+  formatBookTimesStep,
   formatBookingConfirm,
   formatBookingFailure,
   formatBookingSuccess,
   freeTimes,
   upcomingDates,
 } from '../format.js';
-import { CB_CLOSE, cbBookConfirm, cbBookCourt, cbBookDate, cbBookTime } from '../parse.js';
-import { UI_DAYS_AHEAD, confirmKeyboard, courtKeyboard, dateKeyboard, edit, reply, timeKeyboard } from '../ui.js';
+import { CB_CLOSE, cbBookBackDates, cbBookConfirm, cbBookCourt, cbBookDate, cbBookTime } from '../parse.js';
+import {
+  UI_DAYS_AHEAD,
+  backKeyboard,
+  confirmKeyboard,
+  courtKeyboard,
+  dateKeyboard,
+  edit,
+  reply,
+  timeKeyboard,
+} from '../ui.js';
 import { chatIdOf, logOf, nowOf } from './shared.js';
 
-export async function showBookDates(ctx: BotContext, deps: BotDeps): Promise<void> {
+/** Шаг 0. Даты считаются от «сейчас» при каждом показе — в том числе на «Назад». */
+function datesView(deps: BotDeps): { text: string; keyboard: InlineKeyboard } {
   const dates = upcomingDates(nowOf(deps), UI_DAYS_AHEAD);
-  await reply(ctx, '📆 <b>Бронирование</b>\n\nВыбери дату:', dateKeyboard(dates, cbBookDate));
+  return { text: formatBookDatesStep(), keyboard: dateKeyboard(dates, cbBookDate) };
+}
+
+export async function showBookDates(ctx: BotContext, deps: BotDeps): Promise<void> {
+  const { text, keyboard } = datesView(deps);
+  await reply(ctx, text, keyboard);
+}
+
+/** «Назад» с выбора корта: то же сообщение, а не новое. */
+export async function backToBookDates(ctx: BotContext, deps: BotDeps): Promise<void> {
+  const { text, keyboard } = datesView(deps);
+  await edit(ctx, text, keyboard);
 }
 
 export async function showBookCourts(ctx: BotContext, _deps: BotDeps, date: string): Promise<void> {
-  await edit(ctx, '📆 Выбери корт:', courtKeyboard((i) => cbBookCourt(date, i)));
+  await edit(
+    ctx,
+    formatBookCourtsStep(date),
+    courtKeyboard((i) => cbBookCourt(date, i), cbBookBackDates()),
+  );
 }
 
 export async function showBookTimes(
@@ -40,15 +74,17 @@ export async function showBookTimes(
     await edit(ctx, '⚠️ Неизвестный корт — открой «📆 Бронировать» заново.');
     return;
   }
+  // Назад — к выбору корта с той же датой.
+  const back = cbBookDate(date);
   const times = freeTimes(await deps.client.getAvailability(court.serviceId, date));
   if (times.length === 0) {
-    await edit(ctx, `📆 <b>${court.name}</b>\n\nСвободных слотов на эту дату нет.`);
+    await edit(ctx, formatBookNoTimes(date, court.name), backKeyboard(back));
     return;
   }
   await edit(
     ctx,
-    `📆 <b>${court.name}</b>\n\nВыбери время:`,
-    timeKeyboard(times, (time) => cbBookTime(date, courtIndex, time)),
+    formatBookTimesStep(date, court.name),
+    timeKeyboard(times, (time) => cbBookTime(date, courtIndex, time), back),
   );
 }
 
@@ -67,7 +103,9 @@ export async function confirmBook(
   await edit(
     ctx,
     formatBookingConfirm(date, time, court.name),
-    confirmKeyboard(cbBookConfirm(date, courtIndex, time), CB_CLOSE, '✅ Бронировать'),
+    // Назад — к выбору времени той же даты и корта: showBookTimes сходит в
+    // availability заново, устаревший список времён не всплывёт.
+    confirmKeyboard(cbBookConfirm(date, courtIndex, time), CB_CLOSE, '✅ Бронировать', cbBookCourt(date, courtIndex)),
   );
 }
 

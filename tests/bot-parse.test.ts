@@ -5,6 +5,7 @@ import {
   CALLBACK_DATA_MAX_BYTES,
   CB_CLOSE,
   CB_NOOP,
+  cbBookBackDates,
   cbBookConfirm,
   cbBookCourt,
   cbBookDate,
@@ -13,6 +14,7 @@ import {
   cbCancelPick,
   cbRuleToggle,
   cbSkip,
+  cbSlotsBackDates,
   cbSlotsCourt,
   cbSlotsDate,
   parseAddProfile,
@@ -178,6 +180,8 @@ describe('callback_data: кодирование', () => {
       cbCancelConfirm(UUID),
       cbRuleToggle(UUID),
       cbSkip('2026-08-06'),
+      cbSlotsBackDates(),
+      cbBookBackDates(),
       CB_CLOSE,
       CB_NOOP,
     ];
@@ -262,5 +266,75 @@ describe('parseCallbackData', () => {
   it('дату из callback_data проверяет по формату, а не на веру', () => {
     expect(parseCallbackData('sl~d~2026-8-6')).toBeNull();
     expect(parseCallbackData('bk~d~2026-08-06')).not.toBeNull();
+  });
+});
+
+describe('callback_data: кнопка «Назад»', () => {
+  it('возврат на шаг 0 — отдельное действие без параметров', () => {
+    expect(parseCallbackData(cbSlotsBackDates())).toEqual({ kind: 'slots-back-dates' });
+    expect(parseCallbackData(cbBookBackDates())).toEqual({ kind: 'book-back-dates' });
+  });
+
+  it('кодируется коротко и различает мастера', () => {
+    expect(cbSlotsBackDates()).toBe('sl~b');
+    expect(cbBookBackDates()).toBe('bk~b');
+  });
+
+  it('лишние поля у шага 0 — мусор, а не «и так сойдёт»', () => {
+    for (const data of ['sl~b~2026-08-06', 'bk~b~', 'bk~b~2026-08-06~1', 'cx~b']) {
+      expect(parseCallbackData(data), `данные: ${data}`).toBeNull();
+    }
+  });
+
+  it('возврат с глубоких шагов переиспользует кодировщики самих шагов', () => {
+    // время → корт (та же дата)
+    expect(parseCallbackData(cbBookDate('2026-08-06'))).toEqual({ kind: 'book-date', date: '2026-08-06' });
+    // подтверждение → время (та же дата и корт)
+    expect(parseCallbackData(cbBookCourt('2026-08-06', 4))).toEqual({
+      kind: 'book-court',
+      date: '2026-08-06',
+      courtIndex: 4,
+    });
+    // список слотов → корт (та же дата)
+    expect(parseCallbackData(cbSlotsDate('2026-08-06'))).toEqual({ kind: 'slots-date', date: '2026-08-06' });
+  });
+});
+
+describe('обратная совместимость callback_data', () => {
+  // Кнопки живут в уже отправленных сообщениях: тап по вчерашнему меню обязан
+  // работать после деплоя. Строки ниже — литералы старого формата, а не вызовы
+  // кодировщиков: иначе тест сломается вместе со схемой, ничего не заметив.
+  it('старые форматы разбираются как раньше', () => {
+    expect(parseCallbackData('sl~d~2026-08-06')).toEqual({ kind: 'slots-date', date: '2026-08-06' });
+    expect(parseCallbackData('sl~c~2026-08-06~4')).toEqual({
+      kind: 'slots-court',
+      date: '2026-08-06',
+      courtIndex: 4,
+    });
+    expect(parseCallbackData('bk~d~2026-08-06')).toEqual({ kind: 'book-date', date: '2026-08-06' });
+    expect(parseCallbackData('bk~c~2026-08-06~2')).toEqual({
+      kind: 'book-court',
+      date: '2026-08-06',
+      courtIndex: 2,
+    });
+    expect(parseCallbackData('bk~t~2026-08-06~2~20:00')).toEqual({
+      kind: 'book-time',
+      date: '2026-08-06',
+      courtIndex: 2,
+      time: '20:00',
+    });
+    expect(parseCallbackData('bk~y~2026-08-06~2~21:00')).toEqual({
+      kind: 'book-confirm',
+      date: '2026-08-06',
+      courtIndex: 2,
+      time: '21:00',
+    });
+    expect(parseCallbackData(`cx~p~${UUID}`)).toEqual({ kind: 'cancel-pick', bookingId: UUID });
+    expect(parseCallbackData(`cx~y~${UUID}`)).toEqual({ kind: 'cancel-confirm', bookingId: UUID });
+    expect(parseCallbackData(`rule~${UUID}`)).toEqual({ kind: 'rule-toggle', ruleId: UUID });
+    expect(parseCallbackData('skip:2026-08-06')).toEqual({ kind: 'skip-toggle', date: '2026-08-06' });
+    expect(parseCallbackData('keep:2026-08-06')).toEqual({ kind: 'noop' });
+    expect(parseCallbackData('noop')).toEqual({ kind: 'noop' });
+    expect(parseCallbackData('close')).toEqual({ kind: 'close' });
   });
 });
