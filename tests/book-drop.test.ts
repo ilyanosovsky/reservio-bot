@@ -25,6 +25,14 @@ vi.mock('../src/core/notify.js', async (importOriginal) => {
   return { ...actual, sendTelegram: (...args: unknown[]) => sendTelegramMock(...args) };
 });
 
+// Своя логика планирования (окно «минус 2 часа», idempotencyKey, отсутствие
+// чата) проверяется в tests/remind.test.ts. Здесь важно другое: ЗОВЁТ ли дроп
+// планировщик, с чем именно, и переживает ли его отказ.
+const scheduleReminderMock = vi.fn<(...args: unknown[]) => Promise<string>>();
+vi.mock('../src/trigger/remind.js', () => ({
+  scheduleReminder: (...args: unknown[]) => scheduleReminderMock(...args),
+}));
+
 interface Payload {
   profileId: string;
   date: string;
@@ -94,6 +102,72 @@ function supabaseDown(): void {
   );
 }
 
+type FetchMock = ReturnType<typeof vi.fn<(input: unknown, init?: unknown) => Promise<Response>>>;
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+}
+
+/**
+ * PostgREST, отвечающий по-разному на разные таблицы: скип и брони — это два
+ * отдельных запроса, и тестам нужно разводить их ответы. Возвращает мок, чтобы
+ * можно было проверить сам URL (например, под каким profile_id ищется скип).
+ */
+function supabaseRouted(
+  handlers: { skips?: () => Response; profiles?: () => Response; rules?: () => Response } = {},
+): FetchMock {
+  const fetchMock = vi.fn<(input: unknown, init?: unknown) => Promise<Response>>(async (input: unknown) => {
+    const url = String(input);
+    if (url.includes('/rest/v1/skips')) return (handlers.skips ?? ((): Response => jsonResponse([])))();
+    if (url.includes('/rest/v1/profiles')) return (handlers.profiles ?? ((): Response => jsonResponse([])))();
+    if (url.includes('/rest/v1/schedule_rules')) return (handlers.rules ?? ((): Response => jsonResponse([])))();
+    return jsonResponse([]);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+/** Строка profiles так, как её вернул бы PostgREST (ProfilesRepo.getById). */
+function profileRow(patch: Record<string, unknown> = {}): Response {
+  return jsonResponse([
+    {
+      id: 'anna',
+      label: 'Аня',
+      name: 'Anna Ivanova',
+      email: 'anna@example.com',
+      phone: '+995555123456',
+      telegram_chat_id: '5550001',
+      is_admin: false,
+      ...patch,
+    },
+  ]);
+}
+
+/** Строка schedule_rules так, как её вернул бы PostgREST (SchedulesRepo.listByProfile). */
+function ruleRow(patch: Record<string, unknown> = {}): Response {
+  return jsonResponse([
+    {
+      id: 'rule-1',
+      profile_id: 'anna',
+      times: [TIME],
+      courts: ['Padel Court 1', 'Padel Court 4'],
+      days_of_week: null,
+      enabled: true,
+      ...patch,
+    },
+  ]);
+}
+
+/** Строка скипа так, как её вернул бы PostgREST (SkipsRepo.isSkipped select=date). */
+function skipRow(date: string): Response {
+  return jsonResponse([{ date }]);
+}
+
+/** URL всех запросов к таблице скипов — для проверок «под каким id искали». */
+function skipUrls(fetchMock: FetchMock): string[] {
+  return fetchMock.mock.calls.map((c) => String(c[0])).filter((u) => u.includes('/rest/v1/skips'));
+}
+
 /** Текст первого (и по инварианту единственного) сообщения в Telegram. */
 function sentText(): string {
   expect(sendTelegramMock).toHaveBeenCalled();
@@ -110,6 +184,8 @@ beforeEach(() => {
   sendTelegramMock.mockResolvedValue(true);
   bookSlotDropMock.mockReset();
   bookSlotDropMock.mockResolvedValue(okReport());
+  scheduleReminderMock.mockReset();
+  scheduleReminderMock.mockResolvedValue('scheduled');
 });
 
 afterEach(() => {
@@ -356,5 +432,258 @@ describe('book-slot-drop: контакт профиля не утекает', ()
     const body = sentText().replace(/<\/?b>|<\/?code>/g, '');
     expect(body).not.toContain('<');
     expect(body).not.toContain('>');
+  });
+});
+
+describe('book-slot-drop: скип на этот день', () => {
+  beforeEach(() => {
+    useSupabaseEnv();
+  });
+
+  it('скип стоит — брони нет, но сообщение всё равно одно', async () => {
+    // Осознанный пропуск — не молчаливый провал: инвариант «ровно одно
+    // сообщение за ран» действует и здесь.
+    supabaseRouted({ skips: () => skipRow(DATE) });
+
+    const report = await run(payload());
+
+    expect(bookSlotDropMock).not.toHaveBeenCalled();
+    expect(report.ok).toBe(false);
+    expect(report.error).toBeUndefined(); // скип — не ошибка дропа
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+    expect(sentText()).toContain('Пропущено по команде');
+    expect(sentText()).not.toContain('❌');
+  });
+
+  it('скип проверяется ДО ожидания окна и до всякой брони', async () => {
+    supabaseRouted({ skips: () => skipRow(DATE) });
+
+    const report = await run(payload());
+
+    expect(report.timeline.map((e) => e.event).join(' ')).toContain('пропущено по команде');
+  });
+
+  it('скип живёт под настоящим id профиля — DRY-суффикс к нему не приклеивается', async () => {
+    // «Сегодня не играем» одинаково верно для LIVE и для репетиции, иначе
+    // DRY-прогон проигнорировал бы скип и разбудил человека отчётом о брони.
+    const fetchMock = supabaseRouted({ skips: () => skipRow(DATE) });
+
+    await run(payload({ live: false }));
+
+    const urls = skipUrls(fetchMock);
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain('profile_id=eq.ilya');
+    expect(urls[0]).not.toContain('dry'); // ни 'ilya:dry', ни '%3Adry'
+    expect(bookSlotDropMock).not.toHaveBeenCalled();
+  });
+
+  it('скипа нет — дроп идёт как обычно', async () => {
+    supabaseRouted();
+
+    const report = await run(payload());
+
+    expect(bookSlotDropMock).toHaveBeenCalledTimes(1);
+    expect(report.ok).toBe(true);
+  });
+
+  it('проверка скипа сорвалась — дроп НЕ отменяем, но предупреждаем', async () => {
+    // Пропущенный корт не вернуть, поэтому сеть важнее скипа. Молчать при этом
+    // нельзя: скип мог быть, и тогда бронь окажется лишней.
+    supabaseRouted({
+      skips: () => {
+        throw new Error('PostgREST 500');
+      },
+    });
+
+    const report = await run(payload());
+
+    expect(bookSlotDropMock).toHaveBeenCalledTimes(1);
+    expect(report.ok).toBe(true);
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+    expect(sentText()).toContain('скип не проверен');
+  });
+
+  it('без SUPABASE_* скипы не проверяются, но дроп идёт', async () => {
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    const report = await run(payload());
+
+    expect(report.ok).toBe(true);
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('скип, поставленный ПОСЛЕ старта рана, всё равно отменяет бронь', async () => {
+    // Ран стартует за ~2 минуты до окна, и всё это время у человека на экране
+    // живая кнопка «⏭ Пропустить». Одной проверки на старте мало: бот ответил
+    // бы «бронировать не будем», а движок в 20:58:51 всё равно сделал бы POST.
+    vi.useFakeTimers();
+    // окно слота 20:00 дня T=2026-08-07 открывается в 20:58:30 +04:00
+    vi.setSystemTime(new Date('2026-08-07T16:57:00.000Z'));
+    const FUTURE = '2026-08-14'; // dropDayOf → 2026-08-07
+    let checks = 0;
+    const fetchMock = supabaseRouted({
+      skips: () => {
+        checks += 1;
+        return checks === 1 ? jsonResponse([]) : skipRow(FUTURE);
+      },
+    });
+
+    const p = run(payload({ date: FUTURE }));
+    await vi.advanceTimersByTimeAsync(120_000);
+    const report = await p;
+
+    expect(skipUrls(fetchMock)).toHaveLength(2);
+    expect(bookSlotDropMock).not.toHaveBeenCalled();
+    expect(report.timeline.map((e) => e.event).join(' ')).toContain('перед окном');
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+    expect(sentText()).toContain('Пропущено по команде');
+  });
+
+  it('скипа не появилось — после повторной проверки дроп идёт как обычно', async () => {
+    // Проверка «не вакуумная»: второй запрос сам по себе бронь не отменяет.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-07T16:57:00.000Z'));
+    const FUTURE = '2026-08-14';
+    const fetchMock = supabaseRouted();
+
+    const p = run(payload({ date: FUTURE }));
+    await vi.advanceTimersByTimeAsync(120_000);
+    const report = await p;
+
+    expect(skipUrls(fetchMock)).toHaveLength(2);
+    expect(bookSlotDropMock).toHaveBeenCalledTimes(1);
+    expect(report.ok).toBe(true);
+  });
+});
+
+describe('book-slot-drop: профиль из Supabase, а не из ENV', () => {
+  beforeEach(() => {
+    useSupabaseEnv();
+  });
+
+  it('профиль, заведённый через /add_profile, бронируется и получает отчёт в СВОЙ чат', async () => {
+    // Планировщик берёт правила из Supabase; если бы дроп резолвил профиль
+    // только из ENV, такой профиль не бронировался бы вовсе, а сообщение о
+    // провале ушло бы владельцу (глобальный TELEGRAM_CHAT_ID).
+    supabaseRouted({ profiles: () => profileRow(), rules: () => ruleRow() });
+
+    const report = await run(payload({ profileId: 'anna' }));
+
+    expect(report.ok).toBe(true);
+    const engineProfile = bookSlotDropMock.mock.calls[0]![0] as {
+      id: string;
+      contact: { email: string };
+      rule: { courts: string[] };
+    };
+    expect(engineProfile.id).toBe('anna');
+    expect(engineProfile.contact.email).toBe('anna@example.com');
+    // корты — из правила профиля в Supabase, а не из ENV-профиля владельца
+    expect(engineProfile.rule.courts).toEqual(['Padel Court 1', 'Padel Court 4']);
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+    expect(sendTelegramMock.mock.calls[0]![0]).toEqual({ botToken: BOT_TOKEN, chatId: '5550001' });
+  });
+
+  it('чат профиля из Supabase перебивает глобальный TELEGRAM_CHAT_ID и для напоминания', async () => {
+    supabaseRouted({ profiles: () => profileRow(), rules: () => ruleRow() });
+
+    await run(payload({ profileId: 'anna' }));
+
+    expect(scheduleReminderMock).toHaveBeenCalledTimes(1);
+    expect(scheduleReminderMock.mock.calls[0]![1]).toBe('5550001');
+  });
+
+  it('профиля нет ни в Supabase, ни в ENV — громкий отчёт, а не молчание', async () => {
+    supabaseRouted();
+
+    await expect(run(payload({ profileId: 'anna' }))).rejects.toThrow(/не найден/);
+
+    expect(bookSlotDropMock).not.toHaveBeenCalled();
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+    expect(sentText()).toContain('Дроп сорвался');
+  });
+});
+
+describe('book-slot-drop: напоминание за 2 часа', () => {
+  beforeEach(() => {
+    useSupabaseEnv();
+    supabaseRouted();
+  });
+
+  it('LIVE-успех — напоминание планируется на бронь и чат профиля', async () => {
+    await run(payload());
+
+    expect(scheduleReminderMock).toHaveBeenCalledTimes(1);
+    const [booking, chatId] = scheduleReminderMock.mock.calls[0] as [Record<string, string>, string];
+    expect(booking).toMatchObject({
+      profileId: 'ilya',
+      date: DATE,
+      time: TIME,
+      court: 'Padel Court 3',
+      bookingId: 'booking-1',
+    });
+    expect(chatId).toBe('-100500');
+    // token напоминанию не нужен — и не должен путешествовать лишний раз
+    expect(JSON.stringify(booking)).not.toContain(TOKEN);
+  });
+
+  it('корт берётся из отчёта: напоминание про fallback-корт, а не про желаемый', async () => {
+    bookSlotDropMock.mockResolvedValue(okReport({ court: 'Padel Court 2' }));
+
+    await run(payload());
+
+    expect(scheduleReminderMock.mock.calls[0]![0]).toMatchObject({ court: 'Padel Court 2' });
+  });
+
+  it('DRY — напоминания нет: бронь синтетическая', async () => {
+    await run(payload({ live: false }));
+
+    expect(scheduleReminderMock).not.toHaveBeenCalled();
+  });
+
+  it('дроп не удался — напоминать не о чем', async () => {
+    bookSlotDropMock.mockResolvedValue(
+      okReport({ ok: false, token: undefined, bookingId: undefined, error: { kind: 'SlotTaken' } }),
+    );
+
+    await run(payload());
+
+    expect(scheduleReminderMock).not.toHaveBeenCalled();
+  });
+
+  it('успех без bookingId — напоминание не ставим (нечем дедуплицировать)', async () => {
+    bookSlotDropMock.mockResolvedValue(okReport({ bookingId: undefined }));
+
+    await run(payload());
+
+    expect(scheduleReminderMock).not.toHaveBeenCalled();
+  });
+
+  it('планировщик упал — бронь и отчёт этим не портятся', async () => {
+    scheduleReminderMock.mockRejectedValue(new Error('trigger.dev 503'));
+
+    const report = await run(payload());
+
+    expect(report.ok).toBe(true);
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+    expect(sentText()).toContain('✅');
+  });
+
+  it('сначала отчёт, потом напоминание', async () => {
+    // Отчёт — инвариант вечера, напоминание бонус: он не имеет права
+    // задерживать единственное сообщение или отнимать у него бюджет рана.
+    const order: string[] = [];
+    sendTelegramMock.mockImplementation(async () => {
+      order.push('telegram');
+      return true;
+    });
+    scheduleReminderMock.mockImplementation(async () => {
+      order.push('remind');
+      return 'scheduled';
+    });
+
+    await run(payload());
+
+    expect(order).toEqual(['telegram', 'remind']);
   });
 });

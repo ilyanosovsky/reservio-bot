@@ -187,6 +187,32 @@ describe('изоляция native-зависимостей', () => {
     expect(files.some((f) => f.endsWith('core/state-supabase.ts'))).toBe(true);
   });
 
+  // Точки входа, которые собираются НЕ на этой машине: таски едут на воркеры
+  // trigger.dev, бот — на хостинг из docs/wiki/Hosting.md. Ни там, ни там
+  // native-модуля нет, и оба работают только через Supabase.
+  const CLOUD_ENTRIES = [
+    'trigger/book-drop.ts',
+    'trigger/remind.ts',
+    'trigger/daily-planner.ts',
+    'trigger/drop-observe.ts',
+    'bot/index.ts',
+  ];
+
+  it.each(CLOUD_ENTRIES)('%s не тянет better-sqlite3 ни по одной цепочке импортов', (entry) => {
+    const { files, packages } = importGraph(join(srcDir, entry));
+
+    expect(packages).not.toContain('better-sqlite3');
+    expect(files.filter((f) => f.includes('state-sqlite'))).toEqual([]);
+  });
+
+  it('grammY живёт только в src/bot: облачные таски его не тянут', () => {
+    // Обратная страховка к предыдущей: бот не должен протечь в таски. Общий
+    // код между ними — только чистое ядро (state/scheduler/reservio).
+    for (const entry of CLOUD_ENTRIES.filter((e) => e.startsWith('trigger/'))) {
+      expect(importGraph(join(srcDir, entry)).packages).not.toContain('grammy');
+    }
+  });
+
   it('SqliteStateStore живёт ровно в одном файле', () => {
     // Единственная точка импорта native-модуля — иначе изоляцию выше
     // невозможно поддерживать: следующий импорт better-sqlite3 появится
