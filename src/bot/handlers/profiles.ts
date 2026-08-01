@@ -73,10 +73,18 @@ export async function addRule(ctx: BotContext, deps: BotDeps, argText: string): 
     courts: input.courts,
     daysOfWeek: input.daysOfWeek,
     enabled: sameTimes?.enabled ?? true,
+    // Режим: указан в команде — берём его; не указан — наследуем от правила,
+    // которое команда обновляет (для нового 'priority', поведение до
+    // мультикорта). Иначе повтор команды без пятого поля молча разжаловал бы
+    // 'all' обратно в 'priority'.
+    mode: input.mode ?? sameTimes?.mode ?? 'priority',
+    // Имя сценария команда не спрашивает: пустой label интерфейс сам заменит
+    // автоименем («20:00+21:00 · C3,C4»), а заданное в мастере — сохранит.
+    label: sameTimes?.label ?? '',
   };
   await deps.schedules.upsert(rule);
   logOf(deps)(`правило ${rule.id} профиля ${rule.profileId} ${sameTimes === undefined ? 'создано' : 'обновлено'}`);
-  await reply(ctx, formatRuleSaved(rule.profileId, rule.times, rule.courts, rule.daysOfWeek));
+  await reply(ctx, formatRuleSaved(rule.profileId, rule.times, rule.courts, rule.daysOfWeek, rule.mode));
 }
 
 export const ADMIN_USAGE = `${ADD_PROFILE_USAGE}\n\n${ADD_RULE_USAGE}`;

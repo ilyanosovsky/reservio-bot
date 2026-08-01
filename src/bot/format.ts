@@ -17,6 +17,10 @@ import type { Slot } from '../reservio/types.js';
 import type { StoredBooking } from '../core/state.js';
 import type { ProfileRow, ScheduleRuleRow } from '../core/repos.js';
 import { slotEndISO, slotStartISO, tbilisiDateOf, weekdayOf } from '../core/scheduler.js';
+// Направление зависимости — format.ts → parse.ts, и только оно: parse.ts про
+// format.ts не знает, поэтому цикла нет. Здесь нужен лишь числовой кодек
+// битмасок мультивыбора (имена кортов и подписи живут в этом файле).
+import { DAYS_MASK_MAX, bitsOf, maskOfBits, type RuleDraft, type RuleMode } from './parse.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -145,13 +149,14 @@ export function bookingButtonLabel(b: StoredBooking): string {
 // Хлебные крошки мастеров
 // ---------------------------------------------------------------------------
 
-/** Два пошаговых мастера бота: «📆 Бронировать» и «🔍 Слоты». */
-export type WizardKind = 'book' | 'slots';
+/** Пошаговые мастера бота: «📆 Бронировать», «🔍 Слоты» и «⏰ Расписание». */
+export type WizardKind = 'book' | 'slots' | 'schedule';
 
-/** Заголовок мастера: по нему видно, в каком из двух находишься. */
+/** Заголовок мастера: по нему видно, в каком из них находишься. */
 export const WIZARD_TITLE: Record<WizardKind, string> = {
   book: '📆 <b>Бронь</b>',
   slots: '🔍 <b>Слоты</b>',
+  schedule: '⏰ <b>Расписание</b>',
 };
 
 const CRUMB_SEP = ' · ';
@@ -305,26 +310,375 @@ export function formatDays(daysOfWeek: number[] | null): string {
     .join(', ');
 }
 
+// ---------------------------------------------------------------------------
+// Сценарии расписания: мультивыборы, сводки, экраны мастера
+// ---------------------------------------------------------------------------
+
+/** Часы, которые предлагает мастер (клуб играет с 07:00 до 23:00 включительно). */
+export const SCHEDULE_HOURS: number[] = Array.from({ length: 17 }, (_, i) => i + 7);
+
+/** Порядок кнопок дней: по-человечески пн→вс, хотя бит вс = 0. */
+export const WEEKDAY_BUTTON_ORDER: number[] = [1, 2, 3, 4, 5, 6, 0];
+
+export const RULE_MODE_LABEL: Record<RuleMode, string> = {
+  priority: 'первый доступный по приоритету',
+  all: 'бронировать все появившиеся',
+};
+
+/** Короткая подпись режима для списка сценариев. */
+export const RULE_MODE_SHORT: Record<RuleMode, string> = {
+  priority: 'по приоритету',
+  all: 'все корты',
+};
+
+export const RULE_MODE_HINT: Record<RuleMode, string> = {
+  priority: 'Бронируем ПЕРВЫЙ освободившийся корт из списка и на этом останавливаемся.',
+  all: 'Бронируем КАЖДЫЙ появившийся корт набора — лишнее отменишь руками. Клуб держит вечерние Padel 2 и 3, так что пак 20:00+21:00 ловится именно так.',
+};
+
+/**
+ * Почему бот не «ищет свободный слот», а ждёт секунду дропа. Владелец просил
+ * видеть эту логику прямо в подтверждении сценария (docs/PROTOCOL.md).
+ */
+export const DROP_EXPLAINER =
+  'Бронь ловится в момент дропа: слот часа H открывается в H:59:00 за 7 суток.';
+
+/** Час → подпись слота: 20 → '20:00'. */
+export function hourLabel(hour: number): string {
+  return `${String(hour).padStart(2, '0')}:00`;
+}
+
+/** '20:00' → 20. null — не целый час: битмаска мастера такое не кодирует. */
+export function hourOfTime(time: string): number | null {
+  if (!TIME_RE.test(time) || time.slice(3) !== '00') return null;
+  return Number(time.slice(0, 2));
+}
+
+/** Все семь дней = «каждый день» (в базе это null, а не список из семи). */
+export function daysFromMask(mask: number): number[] | null {
+  return mask === DAYS_MASK_MAX ? null : bitsOf(mask).filter((d) => d <= 6);
+}
+
+export function maskOfDays(daysOfWeek: number[] | null): number {
+  return daysOfWeek === null ? DAYS_MASK_MAX : maskOfBits(daysOfWeek.filter((d) => d >= 0 && d <= 6));
+}
+
+export function timesFromMask(mask: number): string[] {
+  return bitsOf(mask).map(hourLabel);
+}
+
+/**
+ * Времена в маску. Получасовые времена (их в клубе нет, но в базе теоретически
+ * могут лежать) битмаска не кодирует — они молча выпадут при правке сценария
+ * через мастер, поэтому такие правила правятся только командой /add_rule.
+ */
+export function maskOfTimes(times: string[]): number {
+  const hours: number[] = [];
+  for (const t of times) {
+    const h = hourOfTime(t);
+    if (h !== null) hours.push(h);
+  }
+  return maskOfBits(hours);
+}
+
+export function courtsFromMask(mask: number): string[] {
+  return bitsOf(mask)
+    .map((i) => BOOKABLE_COURTS[i]?.name)
+    .filter((name): name is string => name !== undefined);
+}
+
+export function maskOfCourts(names: string[]): number {
+  return maskOfBits(names.map(courtIndexOf).filter((i) => i >= 0));
+}
+
+/** 'Padel Court 3' → 'C3', 'Park Court 1' → 'P1'. Чужое имя оставляем как есть. */
+export function courtShort(name: string): string {
+  const m = /^(Padel|Park) Court (\d+)$/i.exec(name.trim());
+  if (m === null) return name;
+  return `${m[1]!.toLowerCase() === 'park' ? 'P' : 'C'}${m[2]}`;
+}
+
+/** Имя сценария, если человек его не задал: «20:00+21:00 · C3,C4,C1». */
+export function autoRuleLabel(times: string[], courts: string[]): string {
+  const left = times.join('+');
+  const right = courts.map(courtShort).join(',');
+  if (left === '') return right === '' ? 'сценарий' : right;
+  return right === '' ? left : `${left} · ${right}`;
+}
+
+/** Мусор в колонке mode читаем как 'priority': это поведение старых правил. */
+export function ruleModeOf(rule: Pick<ScheduleRuleRow, 'mode'>): RuleMode {
+  return rule.mode === 'all' ? 'all' : 'priority';
+}
+
+/** Заголовок сценария: label человека, иначе автоимя. */
+export function ruleTitle(rule: ScheduleRuleRow): string {
+  const label = typeof rule.label === 'string' ? rule.label.trim() : '';
+  return label === '' ? autoRuleLabel(rule.times, rule.courts) : label;
+}
+
+/** Стрелка — это приоритет; в режиме «все» корты равноправны, там запятая. */
+export function formatCourts(courts: string[], mode: RuleMode): string {
+  return courts.join(mode === 'priority' ? ' → ' : ', ');
+}
+
 export function ruleButtonLabel(rule: ScheduleRuleRow): string {
-  return `${rule.enabled ? '✅' : '⛔'} ${rule.times.join(', ')}`;
+  return `${rule.enabled ? '✅' : '⛔'} ${ruleTitle(rule)}`;
 }
 
 export function formatRulesList(rules: ScheduleRuleRow[]): string {
   if (rules.length === 0) {
-    return '⏰ <b>Расписание</b>\n\nПравил нет. Добавить может админ командой /add_rule.';
+    return [
+      WIZARD_TITLE.schedule,
+      '',
+      'Сценариев пока нет.',
+      'Нажми «➕ Новый сценарий» — мастер спросит дни, времена, корты и режим.',
+      '',
+      DROP_EXPLAINER,
+    ].join('\n');
   }
   const lines = rules.map((r) => {
-    const head = `${r.enabled ? '✅' : '⛔'} <b>${escapeHtml(r.times.join(', '))}</b>`;
-    return `${head}\n   корты: ${escapeHtml(r.courts.join(' → '))}\n   дни: ${escapeHtml(formatDays(r.daysOfWeek))}`;
+    const mode = ruleModeOf(r);
+    return [
+      `${r.enabled ? '✅' : '⛔'} <b>${escapeHtml(ruleTitle(r))}</b>`,
+      `   дни: ${escapeHtml(formatDays(r.daysOfWeek))}`,
+      `   времена: ${escapeHtml(r.times.join(', '))}`,
+      `   корты: ${escapeHtml(formatCourts(r.courts, mode))}`,
+      `   режим: ${escapeHtml(RULE_MODE_LABEL[mode])}`,
+    ].join('\n');
   });
   return [
-    '⏰ <b>Расписание</b>',
+    WIZARD_TITLE.schedule,
     '',
     ...lines,
     '',
-    'Тап по кнопке включает/выключает правило.',
+    'Тап по названию включает/выключает сценарий, ✏️ — правка, 🗑 — удаление.',
+    DROP_EXPLAINER,
   ].join('\n');
 }
+
+/** Черновик мастера из сохранённого сценария (кнопка ✏️). */
+export function draftFromRule(rule: ScheduleRuleRow): RuleDraft {
+  return {
+    days: maskOfDays(rule.daysOfWeek),
+    times: maskOfTimes(rule.times),
+    courts: maskOfCourts(rule.courts),
+    mode: ruleModeOf(rule),
+    ruleId: rule.id,
+  };
+}
+
+/** Поля сценария из черновика — ровно то, что уходит в SchedulesRepo.upsert. */
+export interface RuleFromDraft {
+  times: string[];
+  courts: string[];
+  daysOfWeek: number[] | null;
+  mode: RuleMode;
+  label: string;
+}
+
+/**
+ * Порядок кортов = порядок приоритета, а битмаска порядок не хранит: из неё
+ * корты выходят в порядке BOOKABLE_COURTS. Поэтому при правке прежний порядок
+ * восстанавливается, а новые галочки дописываются в конец — иначе «поменял день
+ * недели» молча превращало бы приоритет C3→C4→C1 в C1→C3→C4.
+ */
+export function mergeCourtOrder(selected: string[], previous: string[]): string[] {
+  const chosen = new Set(selected);
+  const kept = previous.filter((c) => chosen.has(c));
+  const keptSet = new Set(kept);
+  return [...kept, ...selected.filter((c) => !keptSet.has(c))];
+}
+
+/** Дни в сравнимый вид: null (каждый день) — это не то же самое, что список. */
+function daysKey(daysOfWeek: number[] | null): string {
+  return daysOfWeek === null ? '*' : [...daysOfWeek].sort((a, b) => a - b).join(',');
+}
+
+/**
+ * Совпадает ли сохранённый сценарий с черновиком ПО СМЫСЛУ (имя и вкл/выкл не в
+ * счёт). Нужна кнопке «💾 Сохранить»: она stateless, у нового сценария id в
+ * callback_data пустой, и повторный тап (сеть подтормозила — человек жмёт ещё
+ * раз) уходил бы во второй INSERT. Два одинаковых включённых сценария — это два
+ * pre-drop сообщения и два рана на один час, второй из которых бесполезен.
+ */
+export function sameRuleFields(
+  rule: Pick<ScheduleRuleRow, 'times' | 'courts' | 'daysOfWeek' | 'mode'>,
+  fields: RuleFromDraft,
+): boolean {
+  return (
+    rule.times.join(',') === fields.times.join(',') &&
+    rule.courts.join(',') === fields.courts.join(',') &&
+    daysKey(rule.daysOfWeek) === daysKey(fields.daysOfWeek) &&
+    ruleModeOf(rule) === fields.mode
+  );
+}
+
+export function ruleFromDraft(draft: RuleDraft, previousCourts: string[] = []): RuleFromDraft {
+  const times = timesFromMask(draft.times);
+  const courts = mergeCourtOrder(courtsFromMask(draft.courts), previousCourts);
+  return {
+    times,
+    courts,
+    daysOfWeek: daysFromMask(draft.days),
+    mode: draft.mode,
+    label: autoRuleLabel(times, courts),
+  };
+}
+
+/**
+ * Чего не хватает черновику до сохранения. null — можно сохранять. Пустой
+ * набор дней/времён/кортов это не «и так сойдёт», а сценарий, который никогда
+ * не сработает: молчаливое расписание — тот же молчаливый провал.
+ */
+export function draftProblem(draft: RuleDraft): string | null {
+  if (draft.days === 0) return 'не выбран ни один день недели';
+  if (draft.times === 0) return 'не выбрано ни одного времени';
+  if (draft.courts === 0) return 'не выбран ни один корт';
+  return null;
+}
+
+const CRUMB_NOTHING = '—';
+
+/** Крошки мастера расписаний: накопленный выбор виден на каждом шаге. */
+export function scheduleCrumbs(picked: string[], prompt: string): string {
+  return [WIZARD_TITLE.schedule, ...picked.map(escapeHtml), escapeHtml(prompt)].join(CRUMB_SEP);
+}
+
+function daysCrumb(draft: RuleDraft): string {
+  return draft.days === 0 ? CRUMB_NOTHING : formatDays(daysFromMask(draft.days));
+}
+
+function timesCrumb(draft: RuleDraft): string {
+  return draft.times === 0 ? CRUMB_NOTHING : timesFromMask(draft.times).join(', ');
+}
+
+function courtsCrumb(draft: RuleDraft): string {
+  return draft.courts === 0 ? CRUMB_NOTHING : courtsFromMask(draft.courts).map(courtShort).join(', ');
+}
+
+/** Шапка «новый сценарий» / «правка сценария» — по ней видно, что произойдёт. */
+function draftKind(draft: RuleDraft): string {
+  return draft.ruleId === null ? 'новый' : 'правка';
+}
+
+export function formatRuleDaysStep(draft: RuleDraft): string {
+  return [
+    scheduleCrumbs([draftKind(draft), 'шаг 1/5'], 'выбери дни недели'),
+    '',
+    `Отмечено: ${escapeHtml(daysCrumb(draft))}`,
+    'Дни — это дни ИГРЫ. Дроп на них случится за 7 суток.',
+  ].join('\n');
+}
+
+export function formatRuleTimesStep(draft: RuleDraft): string {
+  return [
+    scheduleCrumbs([draftKind(draft), daysCrumb(draft), 'шаг 2/5'], 'выбери времена'),
+    '',
+    `Отмечено: ${escapeHtml(timesCrumb(draft))}`,
+    'Каждое время — отдельный дроп и отдельная бронь: «два часа» это 20:00 и 21:00.',
+  ].join('\n');
+}
+
+export function formatRuleCourtsStep(draft: RuleDraft): string {
+  return [
+    scheduleCrumbs([draftKind(draft), daysCrumb(draft), timesCrumb(draft), 'шаг 3/5'], 'выбери корты'),
+    '',
+    `Отмечено: ${escapeHtml(courtsCrumb(draft))}`,
+    'Приоритет нового сценария — по списку клуба (Padel 1→4, затем Park); при правке прежний порядок сохраняется. Точный порядок задаёт /add_rule.',
+  ].join('\n');
+}
+
+export function formatRuleModeStep(draft: RuleDraft): string {
+  return [
+    scheduleCrumbs(
+      [draftKind(draft), daysCrumb(draft), timesCrumb(draft), courtsCrumb(draft), 'шаг 4/5'],
+      'выбери режим',
+    ),
+    '',
+    `▫️ <b>${escapeHtml(RULE_MODE_LABEL.priority)}</b> — ${escapeHtml(RULE_MODE_HINT.priority)}`,
+    `▫️ <b>${escapeHtml(RULE_MODE_LABEL.all)}</b> — ${escapeHtml(RULE_MODE_HINT.all)}`,
+    '',
+    `Сейчас: ${escapeHtml(RULE_MODE_LABEL[draft.mode])}`,
+  ].join('\n');
+}
+
+/**
+ * Шаг 5: полная сводка + объяснение дропа. Последний экран, где можно уйти.
+ * `previousCourts` — корты правимого сценария: сводка обязана показывать тот же
+ * порядок приоритета, который уйдёт в базу.
+ */
+export function formatRuleConfirm(draft: RuleDraft, previousCourts: string[] = []): string {
+  const rule = ruleFromDraft(draft, previousCourts);
+  const problem = draftProblem(draft);
+  const head = scheduleCrumbs([draftKind(draft), 'шаг 5/5'], 'проверь и сохрани');
+  if (problem !== null) {
+    return [head, '', `⚠️ Так сохранять нельзя: ${escapeHtml(problem)}.`, 'Вернись назад и отметь недостающее.'].join(
+      '\n',
+    );
+  }
+  return [
+    head,
+    '',
+    `<b>${escapeHtml(rule.label)}</b>`,
+    `дни: ${escapeHtml(formatDays(rule.daysOfWeek))}`,
+    `времена: ${escapeHtml(rule.times.join(', '))}`,
+    `корты: ${escapeHtml(formatCourts(rule.courts, rule.mode))}`,
+    `режим: ${escapeHtml(RULE_MODE_LABEL[rule.mode])}`,
+    '',
+    escapeHtml(DROP_EXPLAINER),
+    escapeHtml(
+      rule.mode === 'all'
+        ? 'В этом режиме бот жмёт на каждый корт набора отдельно — броней может выйти несколько.'
+        : 'Бот остановится на первом успешном корте набора.',
+    ),
+  ].join('\n');
+}
+
+export function formatRuleSavedWizard(rule: RuleFromDraft, created: boolean): string {
+  return [
+    `✅ Сценарий <b>${escapeHtml(rule.label)}</b> ${created ? 'создан' : 'обновлён'}.`,
+    `дни: ${escapeHtml(formatDays(rule.daysOfWeek))}`,
+    `времена: ${escapeHtml(rule.times.join(', '))}`,
+    `корты: ${escapeHtml(formatCourts(rule.courts, rule.mode))}`,
+    `режим: ${escapeHtml(RULE_MODE_LABEL[rule.mode])}`,
+  ].join('\n');
+}
+
+/**
+ * Правка расписания НЕ отменяет дроп, уже поставленный на сегодня: планировщик
+ * ставит ран в 20:30 со всеми параметрами прямо в payload, и в H:59 тот
+ * бронирует, даже если сценарий выключили или удалили в 20:45 (ран перечитывает
+ * только скипы). Единственный рычаг на сегодняшний вечер — «⏭ Скип».
+ */
+export const RULE_TODAY_HINT =
+  'Дроп, уже запланированный на сегодня, это не отменяет: чтобы не бронировать сегодня, нажми «⏭ Скип» на дату игры.';
+
+export function formatRuleToggled(title: string, enabled: boolean): string {
+  return enabled
+    ? `✅ Сценарий <b>${escapeHtml(title)}</b> включён.`
+    : `⛔ Сценарий <b>${escapeHtml(title)}</b> выключен.\n${escapeHtml(RULE_TODAY_HINT)}`;
+}
+
+export function formatRuleDeleteAsk(rule: ScheduleRuleRow): string {
+  return [
+    '🗑 <b>Удалить сценарий?</b>',
+    `<b>${escapeHtml(ruleTitle(rule))}</b>`,
+    `дни: ${escapeHtml(formatDays(rule.daysOfWeek))}`,
+    `времена: ${escapeHtml(rule.times.join(', '))}`,
+    `корты: ${escapeHtml(formatCourts(rule.courts, ruleModeOf(rule)))}`,
+    '',
+    'Уже созданные брони останутся — удаляется только правило на будущее.',
+    escapeHtml(RULE_TODAY_HINT),
+  ].join('\n');
+}
+
+export function formatRuleDeleted(title: string): string {
+  return `🗑 Сценарий <b>${escapeHtml(title)}</b> удалён.\n${escapeHtml(RULE_TODAY_HINT)}`;
+}
+
+/** Сценарий пропал (удалён из другого чата или кнопка из старого сообщения). */
+export const RULE_GONE_TEXT = '⚠️ Такого сценария у тебя нет — открой «⏰ Расписание» заново.';
 
 /** Кнопка дня в меню скипов: отметка показывает текущее состояние. */
 export function skipButtonLabel(date: string, skipped: boolean): string {
@@ -385,12 +739,19 @@ export function formatProfileSaved(id: string, label: string): string {
   return `✅ Профиль <code>${escapeHtml(id)}</code> (${escapeHtml(label)}) сохранён.`;
 }
 
-export function formatRuleSaved(profileId: string, times: string[], courts: string[], days: number[] | null): string {
+export function formatRuleSaved(
+  profileId: string,
+  times: string[],
+  courts: string[],
+  days: number[] | null,
+  mode: RuleMode = 'priority',
+): string {
   return [
     `✅ Правило для <code>${escapeHtml(profileId)}</code> сохранено.`,
     `Времена: ${escapeHtml(times.join(', '))}`,
-    `Корты: ${escapeHtml(courts.join(' → '))}`,
+    `Корты: ${escapeHtml(formatCourts(courts, mode))}`,
     `Дни: ${escapeHtml(formatDays(days))}`,
+    `Режим: ${escapeHtml(RULE_MODE_LABEL[mode])}`,
   ].join('\n');
 }
 

@@ -39,6 +39,8 @@ interface Payload {
   time: string;
   live: boolean;
   force?: boolean;
+  courts?: string[];
+  mode?: 'priority' | 'all';
 }
 const run = (bookSlotDropTask as unknown as { run: (p: Payload) => Promise<DropReport> }).run;
 
@@ -75,9 +77,25 @@ function okReport(patch: Partial<DropReport> = {}): DropReport {
     bookingId: 'booking-1',
     token: TOKEN,
     msFromSeenToBooked: 900,
+    results: [{ court: 'Padel Court 3', ok: true, bookingId: 'booking-1', msFromSeenToBooked: 900 }],
     timeline: [],
     ...patch,
   };
+}
+
+/** Отчёт вечерней вахты (mode 'all'): две брони и один непоявившийся корт. */
+function multiCourtReport(patch: Partial<DropReport> = {}): DropReport {
+  return okReport({
+    court: 'Padel Court 3',
+    bookingId: 'booking-c3',
+    msFromSeenToBooked: 743,
+    results: [
+      { court: 'Padel Court 3', ok: true, bookingId: 'booking-c3', msFromSeenToBooked: 743 },
+      { court: 'Padel Court 4', ok: true, bookingId: 'booking-c4', msFromSeenToBooked: 1200 },
+      { court: 'Padel Court 1', ok: false, error: 'слот не появился до дедлайна' },
+    ],
+    ...patch,
+  });
 }
 
 function useSupabaseEnv(): void {
@@ -218,6 +236,10 @@ describe('ResilientStateStore', () => {
         guard('getBooking');
         return null;
       },
+      listBookingsForSlot: async () => {
+        guard('listBookingsForSlot');
+        return [];
+      },
       saveBooking: async () => guard('saveBooking'),
       listBookings: async () => {
         guard('listBookings');
@@ -234,7 +256,7 @@ describe('ResilientStateStore', () => {
     const store = new ResilientStateStore(primary.store, (r) => degraded.push(r));
 
     await store.saveBooking(booking);
-    await expect(store.getBooking('ilya', DATE, TIME)).resolves.toBeNull();
+    await expect(store.getBooking('ilya', DATE, TIME, booking.court)).resolves.toBeNull();
 
     expect(store.warning).toBeNull();
     expect(degraded).toEqual([]);
@@ -248,14 +270,14 @@ describe('ResilientStateStore', () => {
     const degraded: string[] = [];
     const store = new ResilientStateStore(primary.store, (r) => degraded.push(r));
 
-    await expect(store.getBooking('ilya', DATE, TIME)).resolves.toBeNull();
+    await expect(store.getBooking('ilya', DATE, TIME, booking.court)).resolves.toBeNull();
     expect(store.warning).toContain('Supabase-state недоступен');
     expect(store.warning).toContain('getBooking');
     expect(degraded).toHaveLength(1);
 
     // дальше это обычное in-memory хранилище
     await store.saveBooking(booking);
-    await expect(store.getBooking('ilya', DATE, TIME)).resolves.toMatchObject({ bookingId: 'booking-1' });
+    await expect(store.getBooking('ilya', DATE, TIME, booking.court)).resolves.toMatchObject({ bookingId: 'booking-1' });
   });
 
   it('деградация необратима: починившийся primary больше не дёргаем', async () => {
@@ -264,7 +286,7 @@ describe('ResilientStateStore', () => {
     const primary = primaryStub(true);
     const store = new ResilientStateStore(primary.store, () => {});
 
-    await store.getBooking('ilya', DATE, TIME);
+    await store.getBooking('ilya', DATE, TIME, booking.court);
     primary.repair();
     primary.calls.length = 0;
 
@@ -278,7 +300,7 @@ describe('ResilientStateStore', () => {
     const degraded: string[] = [];
     const store = new ResilientStateStore(primary.store, (r) => degraded.push(r));
 
-    await store.getBooking('ilya', DATE, TIME);
+    await store.getBooking('ilya', DATE, TIME, booking.court);
     await store.saveBooking(booking);
     await store.listBookings();
     expect(degraded).toHaveLength(1);
@@ -604,6 +626,187 @@ describe('book-slot-drop: профиль из Supabase, а не из ENV', () =>
   });
 });
 
+describe('book-slot-drop: набор кортов и режим', () => {
+  /** Цель дропа, с которой позвали движок. */
+  function engineTarget(): { date: string; time: string; courts: string[]; mode: string } {
+    expect(bookSlotDropMock).toHaveBeenCalled();
+    return bookSlotDropMock.mock.calls[0]![1] as { date: string; time: string; courts: string[]; mode: string };
+  }
+
+  beforeEach(() => {
+    useSupabaseEnv();
+  });
+
+  it('courts и mode из payload уходят в движок как есть', async () => {
+    supabaseRouted();
+
+    await run(payload({ courts: ['Padel Court 4', 'Padel Court 1'], mode: 'all' }));
+
+    expect(engineTarget()).toMatchObject({
+      date: DATE,
+      time: TIME,
+      courts: ['Padel Court 4', 'Padel Court 1'],
+      mode: 'all',
+    });
+  });
+
+  it('без payload набор и режим берутся из правила профиля', async () => {
+    supabaseRouted({ profiles: () => profileRow(), rules: () => ruleRow({ mode: 'all' }) });
+
+    await run(payload({ profileId: 'anna' }));
+
+    expect(engineTarget()).toMatchObject({ courts: ['Padel Court 1', 'Padel Court 4'], mode: 'all' });
+  });
+
+  it('старое правило без mode работает как priority (обратная совместимость)', async () => {
+    supabaseRouted({ profiles: () => profileRow(), rules: () => ruleRow() });
+
+    await run(payload({ profileId: 'anna' }));
+
+    expect(engineTarget().mode).toBe('priority');
+  });
+
+  it('мусор в колонке mode не включает вахту по всем кортам', async () => {
+    // Иначе кривая строка в БД молча начала бы бронировать по три корта за вечер.
+    supabaseRouted({ profiles: () => profileRow(), rules: () => ruleRow({ mode: 'ALL!!' }) });
+
+    await run(payload({ profileId: 'anna' }));
+
+    expect(engineTarget().mode).toBe('priority');
+  });
+
+  it('mode из payload перебивает правило профиля', async () => {
+    supabaseRouted({ profiles: () => profileRow(), rules: () => ruleRow({ mode: 'all' }) });
+
+    await run(payload({ profileId: 'anna', mode: 'priority' }));
+
+    expect(engineTarget().mode).toBe('priority');
+  });
+
+  it('пустой courts в payload игнорируется — работаем по правилу', async () => {
+    supabaseRouted({ profiles: () => profileRow(), rules: () => ruleRow() });
+
+    await run(payload({ profileId: 'anna', courts: [] }));
+
+    expect(engineTarget().courts).toEqual(['Padel Court 1', 'Padel Court 4']);
+  });
+
+  it('courts в payload спасают профиль без правила в БД', async () => {
+    // Ручной ран «поймай мне вот эти корты» не должен зависеть от того, что
+    // записано в сценариях профиля.
+    supabaseRouted({ profiles: () => profileRow(), rules: () => jsonResponse([]) });
+
+    const report = await run(payload({ profileId: 'anna', courts: ['Padel Court 4'], mode: 'all' }));
+
+    expect(report.ok).toBe(true);
+    expect(engineTarget().courts).toEqual(['Padel Court 4']);
+  });
+});
+
+describe('book-slot-drop: сводка по кортам и напоминания вахты', () => {
+  beforeEach(() => {
+    useSupabaseEnv();
+    supabaseRouted();
+    bookSlotDropMock.mockResolvedValue(multiCourtReport());
+  });
+
+  it('в единственном сообщении есть построчная сводка по всему набору', async () => {
+    await run(payload({ mode: 'all' }));
+
+    const text = sentText();
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+    expect(text).toContain('Корты:');
+    expect(text).toContain('Padel Court 3 (743 мс)');
+    expect(text).toContain('Padel Court 4 (1.2 с)');
+    expect(text).toContain('Padel Court 1 — слот не появился до дедлайна');
+  });
+
+  it('сводки нет, когда корт в наборе один: строка «Корт: …» уже всё сказала', async () => {
+    bookSlotDropMock.mockResolvedValue(okReport());
+
+    await run(payload());
+
+    expect(sentText()).not.toContain('Корты:');
+  });
+
+  it('предупреждение о state остаётся последней строкой сообщения', async () => {
+    // Предупреждения читают последними и по ним принимают решения — сводка
+    // не имеет права их оттеснить.
+    supabaseDown();
+
+    await run(payload({ mode: 'all' }));
+
+    const lines = sentText().split('\n');
+    expect(lines[lines.length - 1]!.startsWith('⚠️')).toBe(true);
+    expect(lines.some((l) => l.startsWith('Корты:'))).toBe(true);
+  });
+
+  it('неоднозначный POST по одному корту виден в сообщении, даже когда ран зелёный', async () => {
+    // Регрессия: в режиме 'all' успех на соседнем корте делает отчёт ✅ и
+    // оставляет корневой error пустым, а строка корта в сводке режется по 120
+    // символов — без отдельного ⚠️ владелец не узнал бы, что где-то могла
+    // остаться фантомная бронь, и не отменил бы её до дедлайна.
+    bookSlotDropMock.mockResolvedValue(
+      multiCourtReport({
+        results: [
+          {
+            court: 'Padel Court 3',
+            ok: false,
+            ambiguous: true,
+            error:
+              'POST Padel Court 3 завершился неоднозначно (createBooking: запрос не выполнен — fetch failed ' +
+              'code=networkError): бронь могла быть создана на сервере, id/token потеряны — проверь почту профиля',
+          },
+          { court: 'Padel Court 4', ok: true, bookingId: 'booking-c4', msFromSeenToBooked: 1200 },
+        ],
+      }),
+    );
+
+    const report = await run(payload({ mode: 'all' }));
+
+    expect(report.ok).toBe(true);
+    const text = sentText();
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+    expect(text).toContain('⚠️');
+    expect(text).toContain('Padel Court 3');
+    expect(text).toContain('МОГЛА быть создана');
+    expect(text).toContain('проверь почту профиля и клуб вручную');
+  });
+
+  it('без неоднозначных отказов лишнего предупреждения нет', async () => {
+    await run(payload({ mode: 'all' }));
+
+    expect(sentText()).not.toContain('МОГЛА быть создана');
+  });
+
+  it('напоминание ставится по КАЖДОЙ успешной брони вечера', async () => {
+    await run(payload({ mode: 'all' }));
+
+    expect(scheduleReminderMock).toHaveBeenCalledTimes(2);
+    const booked = scheduleReminderMock.mock.calls.map((c) => c[0] as { court: string; bookingId: string });
+    expect(booked.map((b) => b.court)).toEqual(['Padel Court 3', 'Padel Court 4']);
+    expect(booked.map((b) => b.bookingId)).toEqual(['booking-c3', 'booking-c4']);
+    // token напоминанию не нужен — и не должен путешествовать лишний раз
+    expect(JSON.stringify(booked)).not.toContain(TOKEN);
+  });
+
+  it('упавшее напоминание по одной брони не отменяет напоминание по второй', async () => {
+    scheduleReminderMock.mockRejectedValueOnce(new Error('trigger.dev 503'));
+
+    const report = await run(payload({ mode: 'all' }));
+
+    expect(scheduleReminderMock).toHaveBeenCalledTimes(2);
+    expect(report.ok).toBe(true);
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('DRY — напоминаний нет ни по одной брони вахты', async () => {
+    await run(payload({ live: false, mode: 'all' }));
+
+    expect(scheduleReminderMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('book-slot-drop: напоминание за 2 часа', () => {
   beforeEach(() => {
     useSupabaseEnv();
@@ -628,7 +831,12 @@ describe('book-slot-drop: напоминание за 2 часа', () => {
   });
 
   it('корт берётся из отчёта: напоминание про fallback-корт, а не про желаемый', async () => {
-    bookSlotDropMock.mockResolvedValue(okReport({ court: 'Padel Court 2' }));
+    bookSlotDropMock.mockResolvedValue(
+      okReport({
+        court: 'Padel Court 2',
+        results: [{ court: 'Padel Court 2', ok: true, bookingId: 'booking-1', msFromSeenToBooked: 900 }],
+      }),
+    );
 
     await run(payload());
 
@@ -652,7 +860,9 @@ describe('book-slot-drop: напоминание за 2 часа', () => {
   });
 
   it('успех без bookingId — напоминание не ставим (нечем дедуплицировать)', async () => {
-    bookSlotDropMock.mockResolvedValue(okReport({ bookingId: undefined }));
+    bookSlotDropMock.mockResolvedValue(
+      okReport({ bookingId: undefined, results: [{ court: 'Padel Court 3', ok: true }] }),
+    );
 
     await run(payload());
 

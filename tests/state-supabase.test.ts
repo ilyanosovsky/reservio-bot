@@ -10,6 +10,8 @@ import type { StoredBooking } from '../src/core/state.js';
 
 const URL_BASE = 'https://kbwmrqoxjlydmwyxirqm.supabase.co';
 const KEY = 'sb_secret_TESTKEY_do_not_leak';
+/** Корт входит в ключ слота с 01.08.2026 (миграция мультикорта). */
+const COURT = 'Padel Court 3';
 
 function booking(overrides: Partial<StoredBooking> = {}): StoredBooking {
   return {
@@ -106,15 +108,15 @@ describe('SupabaseStateStore: конструктор', () => {
 
   it('хвостовой слэш в url не ломает эндпоинт', async () => {
     const { fn, calls } = fetchStub(jsonRes([]));
-    await makeStore(fn, `${URL_BASE}/`).getBooking('ilya', '2026-08-06', '20:00');
+    await makeStore(fn, `${URL_BASE}/`).getBooking('ilya', '2026-08-06', '20:00', COURT);
     expect(calls[0]!.url.startsWith(`${URL_BASE}/rest/v1/bookings?`)).toBe(true);
   });
 });
 
 describe('SupabaseStateStore.getBooking', () => {
-  it('шлёт GET с eq.-фильтрами по ключу слота и limit=1', async () => {
+  it('шлёт GET с eq.-фильтрами по ключу слот+корт и limit=1', async () => {
     const { fn, calls } = fetchStub(jsonRes([row()]));
-    await makeStore(fn).getBooking('ilya', '2026-08-06', '20:00');
+    await makeStore(fn).getBooking('ilya', '2026-08-06', '20:00', COURT);
 
     const call = calls[0]!;
     expect(call.method).toBe('GET');
@@ -122,6 +124,9 @@ describe('SupabaseStateStore.getBooking', () => {
     expect(call.params.get('profile_id')).toBe('eq.ilya');
     expect(call.params.get('date')).toBe('eq.2026-08-06');
     expect(call.params.get('time')).toBe('eq.20:00');
+    // Без фильтра по корту точечная проверка вернула бы чужую бронь того же
+    // часа на другом корте — и движок не стал бы бронировать этот корт.
+    expect(call.params.get('court')).toBe(`eq.${COURT}`);
     expect(call.params.get('limit')).toBe('1');
     expect(call.params.get('select')).toBe(
       'profile_id,date,time,court,booking_id,token,state,created_at',
@@ -131,7 +136,7 @@ describe('SupabaseStateStore.getBooking', () => {
 
   it('шлёт apikey и Authorization: Bearer с service-ключом', async () => {
     const { fn, calls } = fetchStub(jsonRes([]));
-    await makeStore(fn).getBooking('ilya', '2026-08-06', '20:00');
+    await makeStore(fn).getBooking('ilya', '2026-08-06', '20:00', COURT);
 
     expect(calls[0]!.headers['apikey']).toBe(KEY);
     expect(calls[0]!.headers['Authorization']).toBe(`Bearer ${KEY}`);
@@ -139,47 +144,77 @@ describe('SupabaseStateStore.getBooking', () => {
 
   it('маппит snake_case-строку в StoredBooking без потерь', async () => {
     const { fn } = fetchStub(jsonRes([row()]));
-    const got = await makeStore(fn).getBooking('ilya', '2026-08-06', '20:00');
+    const got = await makeStore(fn).getBooking('ilya', '2026-08-06', '20:00', COURT);
 
     expect(got).toEqual(booking());
     // Оффсет +04:00 обязан пережить roundtrip — на нём держится всё расписание.
     expect(got?.createdAt).toBe('2026-07-30T19:58:51+04:00');
   });
 
-  it('пустой массив -> null (слот не забронирован)', async () => {
+  it('пустой массив -> null (этот корт в этот час не забронирован)', async () => {
     const { fn } = fetchStub(jsonRes([]));
-    expect(await makeStore(fn).getBooking('ilya', '2026-08-06', '20:00')).toBeNull();
+    expect(await makeStore(fn).getBooking('ilya', '2026-08-06', '20:00', COURT)).toBeNull();
   });
 
   it('строка без token читается с пустым token, а не падает', async () => {
     const { fn } = fetchStub(jsonRes([row({ token: null })]));
-    const got = await makeStore(fn).getBooking('ilya', '2026-08-06', '20:00');
+    const got = await makeStore(fn).getBooking('ilya', '2026-08-06', '20:00', COURT);
     expect(got?.token).toBe('');
   });
 
   it('битая колонка -> ошибка про разъехавшуюся схему', async () => {
     const { fn } = fetchStub(jsonRes([row({ booking_id: 42 })]));
-    await expect(makeStore(fn).getBooking('ilya', '2026-08-06', '20:00')).rejects.toThrow(
+    await expect(makeStore(fn).getBooking('ilya', '2026-08-06', '20:00', COURT)).rejects.toThrow(
       /booking_id/,
     );
   });
 
   it('ответ не массив -> понятная ошибка, а не молчаливый null', async () => {
     const { fn } = fetchStub(jsonRes({ unexpected: true }));
-    await expect(makeStore(fn).getBooking('ilya', '2026-08-06', '20:00')).rejects.toThrow(
+    await expect(makeStore(fn).getBooking('ilya', '2026-08-06', '20:00', COURT)).rejects.toThrow(
       /массив строк/,
     );
   });
 });
 
+describe('SupabaseStateStore.listBookingsForSlot', () => {
+  it('шлёт GET по слоту БЕЗ фильтра по корту, с сортировкой по корту', async () => {
+    const { fn, calls } = fetchStub(jsonRes([row(), row({ court: 'Padel Court 4', booking_id: 'booking-2' })]));
+    const rows = await makeStore(fn).listBookingsForSlot('ilya', '2026-08-06', '20:00');
+
+    const call = calls[0]!;
+    expect(call.method).toBe('GET');
+    expect(call.params.get('profile_id')).toBe('eq.ilya');
+    expect(call.params.get('date')).toBe('eq.2026-08-06');
+    expect(call.params.get('time')).toBe('eq.20:00');
+    expect(call.params.has('court')).toBe(false);
+    expect(call.params.has('limit')).toBe(false);
+    expect(call.params.get('order')).toBe('court.asc');
+    // Две брони одного часа на РАЗНЫХ кортах — легитимный случай, а не дубль.
+    expect(rows.map((b) => b.court)).toEqual(['Padel Court 3', 'Padel Court 4']);
+  });
+
+  it('пустой слот -> пустой массив', async () => {
+    const { fn } = fetchStub(jsonRes([]));
+    expect(await makeStore(fn).listBookingsForSlot('ilya', '2026-08-06', '20:00')).toEqual([]);
+  });
+
+  it('битая колонка -> ошибка про разъехавшуюся схему, а не молчаливый пропуск', async () => {
+    const { fn } = fetchStub(jsonRes([row({ court: 42 })]));
+    await expect(makeStore(fn).listBookingsForSlot('ilya', '2026-08-06', '20:00')).rejects.toThrow(/court/);
+  });
+});
+
 describe('SupabaseStateStore.saveBooking', () => {
-  it('upsert: POST с on_conflict по ключу слота и Prefer merge-duplicates+representation', async () => {
+  it('upsert: POST с on_conflict по ключу слот+корт и Prefer merge-duplicates+representation', async () => {
     const { fn, calls } = fetchStub(jsonRes([row()], 201));
     await makeStore(fn).saveBooking(booking());
 
     const call = calls[0]!;
     expect(call.method).toBe('POST');
-    expect(call.params.get('on_conflict')).toBe('profile_id,date,time');
+    // Корт в on_conflict: без него вторая бронь того же часа на другом корте
+    // затёрла бы первую (merge-duplicates), и её нечем было бы отменить.
+    expect(call.params.get('on_conflict')).toBe('profile_id,date,time,court');
     expect(call.headers['Prefer']).toContain('resolution=merge-duplicates');
     expect(call.headers['Prefer']).toContain('return=representation');
     expect(call.headers['Content-Type']).toBe('application/json');
@@ -201,12 +236,12 @@ describe('SupabaseStateStore.saveBooking', () => {
 });
 
 describe('SupabaseStateStore.listBookings', () => {
-  it('без фильтра: без profile_id, с сортировкой по дате и времени', async () => {
+  it('без фильтра: без profile_id, с сортировкой по дате, времени и корту', async () => {
     const { fn, calls } = fetchStub(jsonRes([row(), row({ profile_id: 'nina', time: '21:00' })]));
     const all = await makeStore(fn).listBookings();
 
     expect(calls[0]!.params.has('profile_id')).toBe(false);
-    expect(calls[0]!.params.get('order')).toBe('date.asc,time.asc');
+    expect(calls[0]!.params.get('order')).toBe('date.asc,time.asc,court.asc');
     expect(all).toHaveLength(2);
     expect(all[1]!.profileId).toBe('nina');
   });
@@ -253,7 +288,7 @@ describe('SupabaseStateStore: ошибки', () => {
         404,
       ),
     );
-    await expect(makeStore(fn).getBooking('ilya', '2026-08-06', '20:00')).rejects.toThrow(
+    await expect(makeStore(fn).getBooking('ilya', '2026-08-06', '20:00', COURT)).rejects.toThrow(
       /docs\/supabase-schema\.sql/,
     );
   });
@@ -263,9 +298,16 @@ describe('SupabaseStateStore: ошибки', () => {
     await expect(makeStore(fn).saveBooking(booking())).rejects.toThrow(/docs\/supabase-schema\.sql/);
   });
 
+  it('нет уникального индекса под on_conflict (42P10) -> подсказка про миграцию мультикорта', async () => {
+    // Старая схема с ключом (profile_id,date,time): без подсказки это выглядит
+    // как «бронь не сохранилась, и непонятно почему».
+    const { fn } = fetchStub(jsonRes({ code: '42P10', message: 'no unique or exclusion constraint' }, 400));
+    await expect(makeStore(fn).saveBooking(booking())).rejects.toThrow(/20260801110000_multicourt\.sql/);
+  });
+
   it('401 -> ошибка про SUPABASE_SERVICE_ROLE_KEY, без самого ключа в тексте', async () => {
     const { fn } = fetchStub(jsonRes({ message: 'Invalid API key' }, 401));
-    const err = await rejection(makeStore(fn).getBooking('ilya', '2026-08-06', '20:00'));
+    const err = await rejection(makeStore(fn).getBooking('ilya', '2026-08-06', '20:00', COURT));
 
     expect(err).toBeInstanceOf(SupabaseStateError);
     expect(err.message).toMatch(/SUPABASE_SERVICE_ROLE_KEY/);
@@ -297,7 +339,7 @@ describe('SupabaseStateStore: ошибки', () => {
     const { fn, calls } = fetchStub(jsonRes([row()], 201), jsonRes([row()]));
     const store = makeStore(fn);
     await store.saveBooking(booking());
-    await store.getBooking('ilya', '2026-08-06', '20:00');
+    await store.getBooking('ilya', '2026-08-06', '20:00', COURT);
 
     expect(calls).toHaveLength(2);
     for (const call of calls) expect(call.url).not.toContain(KEY);
@@ -327,7 +369,7 @@ describe('SupabaseStateStore: ошибки', () => {
 
     vi.useFakeTimers();
     const store = makeStore(fn);
-    const pending = store.getBooking('ilya', '2026-08-06', '20:00');
+    const pending = store.getBooking('ilya', '2026-08-06', '20:00', COURT);
     const assertion = expect(pending).rejects.toThrow(/таймаут/);
 
     await vi.advanceTimersByTimeAsync(5_000);
@@ -347,7 +389,7 @@ describe('SupabaseStateStore: ошибки', () => {
     ) as unknown as typeof fetch;
 
     vi.useFakeTimers();
-    const pending = makeStore(fn).getBooking('ilya', '2026-08-06', '20:00');
+    const pending = makeStore(fn).getBooking('ilya', '2026-08-06', '20:00', COURT);
     await vi.advanceTimersByTimeAsync(4_000);
 
     expect(await pending).toEqual(booking());

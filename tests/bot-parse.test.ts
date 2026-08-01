@@ -5,6 +5,12 @@ import {
   CALLBACK_DATA_MAX_BYTES,
   CB_CLOSE,
   CB_NOOP,
+  COURTS_MASK_MAX,
+  DAYS_MASK_MAX,
+  EMPTY_RULE_DRAFT,
+  TIMES_MASK_MAX,
+  type RuleDraft,
+  bitsOf,
   cbBookBackDates,
   cbBookConfirm,
   cbBookCourt,
@@ -12,14 +18,23 @@ import {
   cbBookTime,
   cbCancelConfirm,
   cbCancelPick,
+  cbRuleDelete,
+  cbRuleDeleteAsk,
+  cbRuleEdit,
   cbRuleToggle,
+  cbRuleWizard,
+  cbRulesList,
   cbSkip,
   cbSlotsBackDates,
   cbSlotsCourt,
   cbSlotsDate,
+  decodeMask,
+  encodeMask,
+  maskOfBits,
   parseAddProfile,
   parseAddRule,
   parseCallbackData,
+  toggleBit,
 } from '../src/bot/parse.js';
 
 const UUID = '3f2504e0-4f89-11d3-9a0c-0305e82c3301';
@@ -109,7 +124,25 @@ describe('parseAddRule', () => {
       times: ['20:00', '21:00'],
       courts: ['Padel Court 3', 'Padel Court 2'],
       daysOfWeek: [1, 2, 3, 4, 5],
+      mode: null,
     });
+  });
+
+  it('пятое поле задаёт режим (мультикорт-вечер)', () => {
+    expect(ok(parseAddRule('ilya;20:00;Padel Court 3,Padel Court 4;1,3;all')).mode).toBe('all');
+    expect(ok(parseAddRule('ilya;20:00;Padel Court 3;;priority')).mode).toBe('priority');
+    expect(ok(parseAddRule('ilya;20:00;Padel Court 3;;A')).mode).toBe('all');
+  });
+
+  it('режим не указан — null, а не «priority»', () => {
+    // Иначе повтор команды без пятого поля молча разжаловал бы сценарий 'all'
+    // обратно в 'priority', и вечерняя вахта по набору кортов сломалась бы.
+    expect(ok(parseAddRule('ilya;20:00;Padel Court 3')).mode).toBeNull();
+    expect(ok(parseAddRule('ilya;20:00;Padel Court 3;1,3;')).mode).toBeNull();
+  });
+
+  it('неизвестный режим — ошибка, а не «и так сойдёт»', () => {
+    expect(err(parseAddRule('ilya;20:00;Padel Court 3;;оба'))).toContain('Режим');
   });
 
   it('без дней недели — daysOfWeek null (каждый день)', () => {
@@ -157,7 +190,7 @@ describe('parseAddRule', () => {
   });
 
   it('ругается на число полей и пустые списки', () => {
-    expect(err(parseAddRule('ilya;20:00'))).toContain('3–4 поля');
+    expect(err(parseAddRule('ilya;20:00'))).toContain('3–5 полей');
     expect(err(parseAddRule('ilya;;Padel Court 3'))).toContain('времена');
     expect(err(parseAddRule('ilya;20:00;'))).toContain('корты');
   });
@@ -297,6 +330,147 @@ describe('callback_data: кнопка «Назад»', () => {
     });
     // список слотов → корт (та же дата)
     expect(parseCallbackData(cbSlotsDate('2026-08-06'))).toEqual({ kind: 'slots-date', date: '2026-08-06' });
+  });
+});
+
+describe('битмаски мультивыбора', () => {
+  // Мультивыборы мастера расписаний едут в callback_data битмасками: серверного
+  // состояния мастера нет, поэтому кодек — единственное место, где выбор может
+  // потеряться. Границы (пусто/всё) проверяем явно.
+
+  it('пустой выбор — «0», а не пустая строка', () => {
+    expect(encodeMask(0)).toBe('0');
+    expect(decodeMask('0', DAYS_MASK_MAX)).toBe(0);
+    expect(bitsOf(0)).toEqual([]);
+  });
+
+  it('полный выбор каждого типа кодируется и читается обратно', () => {
+    expect(encodeMask(DAYS_MASK_MAX)).toBe('7f');
+    expect(encodeMask(COURTS_MASK_MAX)).toBe('3f');
+    expect(encodeMask(TIMES_MASK_MAX)).toBe('ffffff');
+    expect(decodeMask('7f', DAYS_MASK_MAX)).toBe(DAYS_MASK_MAX);
+    expect(decodeMask('3f', COURTS_MASK_MAX)).toBe(COURTS_MASK_MAX);
+    expect(decodeMask('ffffff', TIMES_MASK_MAX)).toBe(TIMES_MASK_MAX);
+    expect(bitsOf(DAYS_MASK_MAX)).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(bitsOf(TIMES_MASK_MAX)).toHaveLength(24);
+  });
+
+  it('roundtrip произвольного набора битов', () => {
+    for (const bits of [[0], [3, 6], [7, 20, 21, 23], [1, 2, 3, 4, 5]]) {
+      const mask = maskOfBits(bits);
+      expect(decodeMask(encodeMask(mask), TIMES_MASK_MAX)).toBe(mask);
+      expect(bitsOf(mask)).toEqual(bits);
+    }
+  });
+
+  it('галочка переключается туда и обратно', () => {
+    const once = toggleBit(0, 20);
+    expect(bitsOf(once)).toEqual([20]);
+    expect(toggleBit(once, 20)).toBe(0);
+    expect(bitsOf(toggleBit(once, 21))).toEqual([20, 21]);
+  });
+
+  it('бит вне разрешённого диапазона типа — null (чужая кнопка), а не тихий мусор', () => {
+    // 0x80 это восьмой «день недели», 0x40 — седьмой корт: таких нет.
+    expect(decodeMask('80', DAYS_MASK_MAX)).toBeNull();
+    expect(decodeMask('40', COURTS_MASK_MAX)).toBeNull();
+    expect(decodeMask('ffffff', DAYS_MASK_MAX)).toBeNull();
+  });
+
+  it('не-hex, пустое и слишком длинное — null', () => {
+    for (const raw of ['', 'zz', '0x7f', '-1', '1234567', undefined]) {
+      expect(decodeMask(raw, TIMES_MASK_MAX), `значение: ${String(raw)}`).toBeNull();
+    }
+  });
+
+  it('маска вне 24 бит до callback_data не доезжает', () => {
+    expect(() => encodeMask(1 << 24)).toThrow(RangeError);
+    expect(() => encodeMask(-1)).toThrow(RangeError);
+  });
+
+  it('maskOfBits игнорирует мусорные номера битов', () => {
+    expect(maskOfBits([0, -1, 24, 99, 3])).toBe(maskOfBits([0, 3]));
+  });
+});
+
+describe('callback_data мастера расписаний', () => {
+  const draft = (over: Partial<RuleDraft> = {}): RuleDraft => ({ ...EMPTY_RULE_DRAFT, ...over });
+
+  it('шаг мастера везёт черновик целиком и читается обратно', () => {
+    const d = draft({ days: 0b0111110, times: maskOfBits([20, 21]), courts: 0b000100, mode: 'all', ruleId: UUID });
+    for (const step of ['days', 'times', 'courts', 'mode', 'confirm', 'save'] as const) {
+      expect(parseCallbackData(cbRuleWizard(step, d))).toEqual({ kind: 'rule-wizard', step, draft: d });
+    }
+  });
+
+  it('пустой черновик нового сценария — самая короткая кнопка мастера', () => {
+    expect(cbRuleWizard('days', EMPTY_RULE_DRAFT)).toBe('rw~d~0~0~0~p~');
+    expect(parseCallbackData('rw~d~0~0~0~p~')).toEqual({
+      kind: 'rule-wizard',
+      step: 'days',
+      draft: { days: 0, times: 0, courts: 0, mode: 'priority', ruleId: null },
+    });
+  });
+
+  it('худший случай мастера укладывается в лимит Telegram', () => {
+    const worst = cbRuleWizard('courts', {
+      days: DAYS_MASK_MAX,
+      times: TIMES_MASK_MAX,
+      courts: COURTS_MASK_MAX,
+      mode: 'all',
+      ruleId: UUID,
+    });
+    expect(worst).toBe(`rw~c~7f~ffffff~3f~a~${UUID}`);
+    expect(new TextEncoder().encode(worst).length).toBeLessThanOrEqual(CALLBACK_DATA_MAX_BYTES);
+  });
+
+  it('кнопки списка сценариев короткие и различимые', () => {
+    expect(cbRulesList()).toBe('rw~l');
+    expect(parseCallbackData(cbRulesList())).toEqual({ kind: 'rules-list' });
+    expect(parseCallbackData(cbRuleEdit(UUID))).toEqual({ kind: 'rule-edit', ruleId: UUID });
+    expect(parseCallbackData(cbRuleDeleteAsk(UUID))).toEqual({ kind: 'rule-delete-ask', ruleId: UUID });
+    expect(parseCallbackData(cbRuleDelete(UUID))).toEqual({ kind: 'rule-delete', ruleId: UUID });
+    for (const data of [cbRulesList(), cbRuleEdit(UUID), cbRuleDeleteAsk(UUID), cbRuleDelete(UUID)]) {
+      expect(new TextEncoder().encode(data).length).toBeLessThanOrEqual(CALLBACK_DATA_MAX_BYTES);
+    }
+  });
+
+  it('тумблер сценария и мастер не путаются: «rule» и «rw» это разные кнопки', () => {
+    expect(parseCallbackData(cbRuleToggle(UUID))).toEqual({ kind: 'rule-toggle', ruleId: UUID });
+    expect(parseCallbackData('rw~' + UUID)).toBeNull();
+  });
+
+  it('битые данные мастера дают null', () => {
+    for (const data of [
+      'rw',
+      'rw~l~лишнее',
+      'rw~ed',
+      'rw~ed~',
+      'rw~ed~' + UUID + '~хвост',
+      'rw~ok~плохой id',
+      'rw~q~0~0~0~p~',            // нет такого шага
+      'rw~d~0~0~0~p',             // не хватает поля id
+      'rw~d~0~0~0~p~~',           // лишнее поле
+      'rw~d~80~0~0~p~',           // восьмой день недели
+      'rw~d~0~0~40~p~',           // седьмой корт
+      'rw~d~0~1000000~0~p~',      // 25-й час
+      'rw~d~0~0~0~x~',            // неизвестный режим
+      'rw~d~0~0~0~p~плохой id',
+    ]) {
+      expect(parseCallbackData(data), `данные: ${data}`).toBeNull();
+    }
+  });
+
+  it('id длиннее uuid не пролезает молча — кодировщик падает на месте', () => {
+    // Запас лимита рассчитан на uuid (36). Id длиннее ломает мастер, и лучше
+    // громким RangeError в хендлере, чем мёртвой кнопкой в проде.
+    const tooLong = draft({
+      days: DAYS_MASK_MAX,
+      times: TIMES_MASK_MAX,
+      courts: COURTS_MASK_MAX,
+      ruleId: 'x'.repeat(48),
+    });
+    expect(() => cbRuleWizard('confirm', tooLong)).toThrow(RangeError);
   });
 });
 

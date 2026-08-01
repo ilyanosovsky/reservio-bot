@@ -122,13 +122,32 @@ describe('runReminder: перечитывает state', () => {
     expect(s.texts).toHaveLength(0);
   });
 
-  it('корт берём из state, а не из устаревшего payload', async () => {
+  it('бронь на ДРУГОМ корте того же часа — не своя, молчим', async () => {
+    // Ключ state — (profileId, date, time, court): на один час легитимны
+    // несколько броней на разных кортах, и у каждой свой ран напоминания.
+    // Чужую бронь этот ран не озвучивает — иначе о ней придут два сообщения.
     const state = new MemoryStateStore();
-    await state.saveBooking(booking({ court: 'Padel Court 2' }));
+    await state.saveBooking(booking({ court: 'Padel Court 4', bookingId: 'bk-c4' }));
     const s = sender();
 
-    await runReminder({ ...payload, court: 'Padel Court 3' }, { state, send: s.send });
-    expect(s.texts[0]).toContain('Padel Court 2');
+    await expect(runReminder(payload, { state, send: s.send })).resolves.toBe('skipped-missing');
+    expect(s.texts).toHaveLength(0);
+  });
+
+  it('каждая бронь часа напоминает о себе сама: два корта — два сообщения', async () => {
+    const state = new MemoryStateStore();
+    await state.saveBooking(booking());
+    await state.saveBooking(booking({ court: 'Padel Court 4', bookingId: 'bk-c4' }));
+    const s = sender();
+
+    await expect(runReminder(payload, { state, send: s.send })).resolves.toBe('sent');
+    await expect(
+      runReminder({ ...payload, court: 'Padel Court 4', bookingId: 'bk-c4' }, { state, send: s.send }),
+    ).resolves.toBe('sent');
+
+    expect(s.texts).toHaveLength(2);
+    expect(s.texts[0]).toContain(COURT);
+    expect(s.texts[1]).toContain('Padel Court 4');
   });
 
   it('Telegram не принял — сообщаем об этом наружу (будет ретрай)', async () => {
@@ -147,12 +166,12 @@ describe('runReminder: перечитывает state', () => {
     await expect(runReminder(payload, { state, send: null })).resolves.toBe('skipped-no-chat');
   });
 
-  it('на слоте другая бронь (отменил и перебронировал) — этот ран молчит', async () => {
-    // Ключ state — (profileId, date, time), поэтому перебронь того же слота
-    // перезаписывает строку. Ранов при этом два (remind-bk-1 и remind-bk-2), а
-    // напоминание должно прийти ровно одно.
+  it('на этом корте другая бронь (отменил и перебронировал) — этот ран молчит', async () => {
+    // Ключ state — (profileId, date, time, court), поэтому перебронь ТОГО ЖЕ
+    // корта перезаписывает строку. Ранов при этом два (remind-bk-1 и
+    // remind-bk-2), а напоминание должно прийти ровно одно.
     const state = new MemoryStateStore();
-    await state.saveBooking(booking({ bookingId: 'bk-2', court: 'Padel Court 2' }));
+    await state.saveBooking(booking({ bookingId: 'bk-2' }));
     const s = sender();
 
     await expect(runReminder(payload, { state, send: s.send })).resolves.toBe('skipped-stale');

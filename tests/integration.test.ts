@@ -134,7 +134,7 @@ describe('сквозной стык profiles → scheduler → engine → client
 
     const report = await bookSlotDrop(
       profile!,
-      { date: DATE, time: '20:00' },
+      { date: DATE, time: '20:00', courts: profile!.rule.courts },
       { client, state, now: clock.now, sleep: clock.sleep },
     );
 
@@ -174,7 +174,7 @@ describe('сквозной стык profiles → scheduler → engine → client
     expect('Authorization' in post.headers).toBe(false);
 
     // Стык engine ↔ state: token обязан долететь до хранилища.
-    const saved = await state.getBooking('ilya', DATE, '20:00');
+    const saved = await state.getBooking('ilya', DATE, '20:00', 'Padel Court 3');
     expect(saved).toMatchObject({
       profileId: 'ilya',
       court: 'Padel Court 3',
@@ -191,7 +191,7 @@ describe('сквозной стык profiles → scheduler → engine → client
     const first = makeFetch({ openOn: (sid) => sid === C3.serviceId });
     const r1 = await bookSlotDrop(
       profile!,
-      { date: DATE, time: '20:00' },
+      { date: DATE, time: '20:00', courts: profile!.rule.courts },
       { client: new ReservioClient({ fetchFn: first.fetchFn }), state, ...makeClock(IN_WINDOW_20) },
     );
     expect(r1.ok).toBe(true);
@@ -200,13 +200,61 @@ describe('сквозной стык profiles → scheduler → engine → client
     const second = makeFetch({ openOn: () => true });
     const r2 = await bookSlotDrop(
       profile!,
-      { date: DATE, time: '20:00' },
+      { date: DATE, time: '20:00', courts: profile!.rule.courts },
       { client: new ReservioClient({ fetchFn: second.fetchFn }), state, ...makeClock(IN_WINDOW_20) },
     );
 
     expect(r2.ok).toBe(false);
     expect(r2.error?.kind).toBe('AlreadyBooked');
     expect(second.calls).toHaveLength(0); // ни одного запроса вообще
+  });
+
+  it('режим all: два корта одного часа — две реальные брони и две строки в state', async () => {
+    // Требование владельца: несколько броней на один (date, time) на РАЗНЫХ
+    // кортах — легитимный вечерний пак, а не дубль. Проверяем весь стык:
+    // движок → клиент → state с ключом (профиль, дата, время, корт).
+    const [profile] = loadProfiles(ENV);
+    const state = new MemoryStateStore();
+    let seq = 0;
+    const { fetchFn, calls } = makeFetch({
+      openOn: () => true,
+      onBook: () => {
+        seq += 1;
+        return jsonResponse(201, bookingBody(`bk-${seq}`, `tok-${seq}`));
+      },
+    });
+
+    const report = await bookSlotDrop(
+      profile!,
+      { date: DATE, time: '20:00', courts: ['Padel Court 3', 'Padel Court 2'], mode: 'all' },
+      { client: new ReservioClient({ fetchFn }), state, ...makeClock(IN_WINDOW_20) },
+    );
+
+    expect(report.ok).toBe(true);
+    expect(report.results.map((r) => [r.court, r.ok])).toEqual([
+      ['Padel Court 3', true],
+      ['Padel Court 2', true],
+    ]);
+    const posts = calls.filter((c) => c.method === 'POST');
+    expect(posts).toHaveLength(2);
+    expect(
+      posts.map((p) => (p.body as { data: { relationships: { event: { data: { relationships: { service: { data: { id: string } } } } } } } }).data.relationships.event.data.relationships.service.data.id),
+    ).toEqual([C3.serviceId, C2.serviceId]);
+
+    const stored = await state.listBookingsForSlot('ilya', DATE, '20:00');
+    expect(stored.map((b) => b.court).sort()).toEqual(['Padel Court 2', 'Padel Court 3']);
+    // У каждой брони свой token — без него её не отменить.
+    expect(new Set(stored.map((b) => b.token)).size).toBe(2);
+
+    // Повторный ран того же набора не делает ни одного POST: оба корта заняты нами.
+    const again = makeFetch({ openOn: () => true });
+    const r2 = await bookSlotDrop(
+      profile!,
+      { date: DATE, time: '20:00', courts: ['Padel Court 3', 'Padel Court 2'], mode: 'all' },
+      { client: new ReservioClient({ fetchFn: again.fetchFn }), state, ...makeClock(IN_WINDOW_20) },
+    );
+    expect(r2.error?.kind).toBe('AlreadyBooked');
+    expect(again.calls).toHaveLength(0);
   });
 
   it('Court 3 занят → падает на Court 2 по приоритету профиля', async () => {
@@ -216,7 +264,7 @@ describe('сквозной стык profiles → scheduler → engine → client
 
     const report = await bookSlotDrop(
       profile!,
-      { date: DATE, time: '20:00' },
+      { date: DATE, time: '20:00', courts: profile!.rule.courts },
       { client: new ReservioClient({ fetchFn }), state, ...makeClock(IN_WINDOW_20) },
     );
 
@@ -239,13 +287,13 @@ describe('сквозной стык profiles → scheduler → engine → client
 
     const report = await bookSlotDrop(
       profile!,
-      { date: DATE, time: '20:00' },
+      { date: DATE, time: '20:00', courts: profile!.rule.courts },
       { client: new ReservioClient({ fetchFn }), state, ...makeClock(IN_WINDOW_20) },
     );
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('SlotTaken');
-    await expect(state.getBooking('ilya', DATE, '20:00')).resolves.toBeNull();
+    await expect(state.getBooking('ilya', DATE, '20:00', 'Padel Court 3')).resolves.toBeNull();
     await expect(state.listBookings()).resolves.toHaveLength(0);
   });
 
@@ -281,9 +329,9 @@ describe('сквозной стык profiles → scheduler → engine → client
     const client = new ReservioClient({ fetchFn });
     const deps = { client, state, now: clock.now, sleep: clock.sleep };
 
-    const r20 = await bookSlotDrop(profile!, { date: DATE, time: '20:00' }, deps);
+    const r20 = await bookSlotDrop(profile!, { date: DATE, time: '20:00', courts: profile!.rule.courts }, deps);
     // Второй дроп на час позже — engine сам доспит до своего окна 21:58:30.
-    const r21 = await bookSlotDrop(profile!, { date: DATE, time: '21:00' }, deps);
+    const r21 = await bookSlotDrop(profile!, { date: DATE, time: '21:00', courts: profile!.rule.courts }, deps);
 
     expect([r20.ok, r21.ok]).toEqual([true, true]);
     expect(r20.bookingId).not.toBe(r21.bookingId);
@@ -315,14 +363,14 @@ describe('сквозной стык profiles → scheduler → engine → client
     const patch = calls.find((c) => c.method === 'PATCH')!;
     expect(patch.url).toContain('token=tok-real-1');
     expect(patch.body).toMatchObject({ data: { attributes: { state: 'canceled' } } });
-    expect((await state.getBooking('ilya', DATE, '20:00'))?.state).toBe('canceled');
+    expect((await state.getBooking('ilya', DATE, '20:00', 'Padel Court 3'))?.state).toBe('canceled');
 
     // Отменённая бронь больше не блокирует новую попытку на тот же слот.
     const [profile] = loadProfiles(ENV);
     const retry = makeFetch({ openOn: (sid) => sid === C3.serviceId });
     const report = await bookSlotDrop(
       profile!,
-      { date: DATE, time: '20:00' },
+      { date: DATE, time: '20:00', courts: profile!.rule.courts },
       { client: new ReservioClient({ fetchFn: retry.fetchFn }), state, ...makeClock(IN_WINDOW_20) },
     );
     expect(report.ok).toBe(true);
@@ -340,7 +388,7 @@ describe('сквозной стык profiles → scheduler → engine → client
 
     const report = await bookSlotDrop(
       profile!,
-      { date: DATE, time: '20:00' },
+      { date: DATE, time: '20:00', courts: profile!.rule.courts },
       { client: new ReservioClient({ fetchFn }), state: new MemoryStateStore(), ...makeClock(IN_WINDOW_20) },
     );
 
@@ -360,7 +408,7 @@ describe('сквозной стык profiles → scheduler → engine → client
 
     const report = await bookSlotDrop(
       profile!,
-      { date: DATE, time: '20:00' },
+      { date: DATE, time: '20:00', courts: profile!.rule.courts },
       { client: new ReservioClient({ fetchFn }), state, ...makeClock(IN_WINDOW_20) },
     );
 
@@ -381,7 +429,7 @@ describe('сквозной стык profiles → scheduler → engine → client
 
     const report = await bookSlotDrop(
       profile!,
-      { date: DATE, time: '20:00' },
+      { date: DATE, time: '20:00', courts: profile!.rule.courts },
       { client: new ReservioClient({ fetchFn }), state: new MemoryStateStore(), ...makeClock(IN_WINDOW_20) },
     );
 
@@ -409,7 +457,7 @@ describe('сквозной стык profiles → scheduler → engine → client
 
     const report = await bookSlotDrop(
       profile!,
-      { date: DATE, time: '20:00' },
+      { date: DATE, time: '20:00', courts: profile!.rule.courts },
       { client: new ReservioClient({ fetchFn }), state: new MemoryStateStore(), ...makeClock(IN_WINDOW_20) },
     );
 
