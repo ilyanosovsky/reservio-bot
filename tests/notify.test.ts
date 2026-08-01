@@ -179,6 +179,8 @@ function baseReport(patch: Partial<DropReport> = {}): DropReport {
     profileId: 'ilya',
     date: '2026-08-06',
     time: '20:00',
+    // Сводку по кортам собирает таск (src/trigger/book-drop.ts), не notify.
+    results: [],
     timeline: [],
     ...patch,
   };

@@ -102,7 +102,9 @@ export async function runReminder(payload: RemindPayload, deps: RemindDeps): Pro
     return 'skipped-no-state';
   }
 
-  const booking = await deps.state.getBooking(profileId, date, time);
+  // Корт в ключе: на один час бывает несколько броней на разных кортах, и
+  // напоминание обязано смотреть на СВОЮ (payload.court), а не на соседнюю.
+  const booking = await deps.state.getBooking(profileId, date, time, payload.court);
   if (!booking) {
     log(`remind: брони ${profileId} ${date} ${time} нет в state — молча выходим`);
     return 'skipped-missing';
@@ -111,9 +113,10 @@ export async function runReminder(payload: RemindPayload, deps: RemindDeps): Pro
     log(`remind: бронь ${booking.bookingId} отменена — напоминание не отправляем`);
     return 'skipped-canceled';
   }
-  // Ключ state — (profileId, date, time), поэтому «отменил и перебронировал тот
-  // же слот» перезаписывает строку: старый ран увидел бы живую чужую бронь и
-  // прислал бы второй одинаковый текст. Напоминает только ран своей брони.
+  // Ключ state — (profileId, date, time, court), поэтому «отменил и
+  // перебронировал тот же корт» перезаписывает строку: старый ран увидел бы
+  // живую чужую бронь и прислал бы второй одинаковый текст. Напоминает только
+  // ран своей брони.
   if (payload.bookingId !== '' && booking.bookingId !== payload.bookingId) {
     log(`remind: на ${date} ${time} теперь другая бронь (${booking.bookingId}) — напоминание этого рана неактуально`);
     return 'skipped-stale';

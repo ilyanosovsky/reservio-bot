@@ -18,11 +18,18 @@
 //      src/bot/handlers — пишет skip) и «Бронируем» (callback_data 'noop' —
 //      ровно CB_NOOP из src/bot/parse.ts, бот гасит спиннер и ничего не делает,
 //      это просто подтверждение без побочных эффектов);
-//   4) на каждое время правила планирует src/trigger/book-drop.ts через
+//   4) на каждый (профиль, час) планирует src/trigger/book-drop.ts через
 //      tasks.trigger('book-slot-drop', ..., { delay, idempotencyKey,
 //      concurrencyKey }) — delay = H:57:00 дня T (+04:00), idempotencyKey =
-//      'drop-{profileId}-{date}-{time}' — повторный ран планировщика не создаёт
-//      дубль дропа. Ключ идемпотентности обязан быть ГЛОБАЛЬНЫМ: голая строка,
+//      'drop-{profileId}-{date}-{time}-{ruleIds}' — повторный ран планировщика
+//      не создаёт дубль дропа. Несколько сценариев профиля на ОДИН час
+//      схлопываются в ОДИН ран (mergePlannedDrops): у book-slot-drop
+//      concurrencyLimit 1 на concurrencyKey=profileId, поэтому два рана на один
+//      час выстроились бы в затылок — второй пришёл бы в уже закрытое окно, не
+//      сделал бы ни одного опроса и прислал бы второй ❌-отчёт за вечер.
+//      В payload уезжают courts и mode ИМЕННО ЭТИХ правил: выбор сценария
+//      делается здесь, а не повторно в book-drop.ts по времени.
+//      Ключ идемпотентности обязан быть ГЛОБАЛЬНЫМ: голая строка,
 //      переданная из тела таска, скоупится ран-айди родителя (см. makeTriggerDrop).
 //      concurrencyKey = profileId: у book-slot-drop concurrencyLimit 1, и без
 //      ключа дроп второго профиля ждал бы, пока первый досидит своё пятиминутное
@@ -73,12 +80,20 @@ export interface PlannerRule {
   courts: string[];
   daysOfWeek: number[] | null;
   enabled: boolean;
+  /**
+   * 'priority' — первый доступный корт по приоритету; 'all' — вечерняя вахта,
+   * бронируем КАЖДЫЙ появившийся корт набора. Планировщик обязан знать режим:
+   * он уезжает в payload дропа (см. runDailyPlanner) — иначе book-drop.ts
+   * доставал бы его из БД сам и на профиле с НЕСКОЛЬКИМИ сценариями мог взять
+   * чужой (там выбор идёт по времени: первое включённое правило с этим часом).
+   */
+  mode: 'priority' | 'all';
 }
 
 export interface PlannerTriggerOptions {
   /** Момент отправки рана дропа: H:57:00 дня T. */
   delay: Date;
-  /** 'drop-{profileId}-{date}-{time}'; глобальный скоуп обеспечивает makeTriggerDrop. */
+  /** 'drop-{profileId}-{date}-{time}-{ruleIds}'; глобальный скоуп обеспечивает makeTriggerDrop. */
   idempotencyKey: string;
   /**
    * Ключ очереди — profileId. У book-slot-drop concurrencyLimit 1: без
@@ -126,9 +141,77 @@ export function dropTriggerDelay(dayT: string, time: string): Date {
   return new Date(hourStart.getTime() + TRIGGER_LEAD_MINUTES * 60_000);
 }
 
-/** Ключ идемпотентности триггера дропа: повторный ран планировщика не плодит дубль. */
-export function dropIdempotencyKey(profileId: string, date: string, time: string): string {
-  return `drop-${profileId}-${date}-${time}`;
+/**
+ * Ключ идемпотентности триггера дропа: повторный ран планировщика не плодит дубль.
+ *
+ * ruleId в ключе обязателен с 01.08.2026. Сценарии профиля живут в БД и могут
+ * меняться в течение дня, а ключ обязан оставаться стабильным между ранами
+ * планировщика (ruleId — uuid из БД), так что защита от дубля не слабеет.
+ * Для схлопнутых сценариев сюда приезжает их общий идентификатор
+ * (`ruleIds.join('+')`, см. mergePlannedDrops): на один (профиль, дату, час)
+ * приходится ровно один ран — двум ранам на один час всё равно не дал бы
+ * работать concurrencyLimit 1 у book-slot-drop.
+ */
+export function dropIdempotencyKey(profileId: string, date: string, time: string, ruleId: string): string {
+  return `drop-${profileId}-${date}-${time}-${ruleId}`;
+}
+
+/** Заявка на дроп от ОДНОГО сценария — вход mergePlannedDrops. */
+export interface DropRequest {
+  profileId: string;
+  time: string;
+  courts: string[];
+  mode: 'priority' | 'all';
+  ruleId: string;
+}
+
+/** Итоговый план одного рана book-slot-drop: (профиль, час) + объединённый набор. */
+export interface PlannedDrop extends Omit<DropRequest, 'ruleId'> {
+  /** Сценарии, схлопнутые в этот дроп, в порядке появления. */
+  ruleIds: string[];
+}
+
+/**
+ * Схлопывает заявки, попавшие на один и тот же (профиль, час), в ОДИН дроп.
+ *
+ * Почему это обязательно: у book-slot-drop `queue.concurrencyLimit = 1`, а
+ * concurrencyKey = profileId. Два рана профиля на один час выстроились бы в
+ * очередь, и второй стартовал бы только после того, как первый досидит своё
+ * пятиминутное окно, — то есть пришёл бы в уже закрытое окно, не сделал бы ни
+ * одного getAvailability (корты второго сценария не сторожил бы НИКТО) и
+ * прислал бы второй, бессмысленный ❌-отчёт за вечер. Инвариант CLAUDE.md —
+ * «каждый вечер ровно одно сообщение».
+ *
+ * Набор кортов — объединение в порядке появления (в 'priority' это порядок
+ * приоритета: корты первого сценария остаются впереди). Режим — 'all', если его
+ * просил хотя бы один сценарий: лишнюю бронь владелец отменит руками, а
+ * пропущенный корт не вернуть (CLAUDE.md → стратегия вечера).
+ */
+export function mergePlannedDrops(requests: readonly DropRequest[]): PlannedDrop[] {
+  const byKey = new Map<string, PlannedDrop>();
+  for (const req of requests) {
+    // Разделитель — пробел: он не встречается ни в id профиля
+    // (^[a-z0-9][a-z0-9_-]{1,31}$), ни в HH:MM, поэтому ключи разных пар
+    // (профиль, час) склеиться не могут.
+    const key = `${req.profileId} ${req.time}`;
+    const merged = byKey.get(key);
+    if (merged === undefined) {
+      byKey.set(key, {
+        profileId: req.profileId,
+        time: req.time,
+        courts: [...req.courts],
+        mode: req.mode,
+        ruleIds: [req.ruleId],
+      });
+      continue;
+    }
+    for (const court of req.courts) {
+      if (!merged.courts.includes(court)) merged.courts.push(court);
+    }
+    if (req.mode === 'all') merged.mode = 'all';
+    if (!merged.ruleIds.includes(req.ruleId)) merged.ruleIds.push(req.ruleId);
+  }
+  return [...byKey.values()];
 }
 
 /**
@@ -185,12 +268,22 @@ export function formatPreDropMessage(input: {
   date: string;
   times: string[];
   courts: string[];
+  /** Не задан — 'priority' (старые вызыватели и правила без режима). */
+  mode?: 'priority' | 'all';
 }): string {
   const { label, date, times, courts } = input;
+  const mode = input.mode ?? 'priority';
+  // Строку про корты пишем по режиму: в 'all' стрелка «→» врала бы про
+  // приоритет, тогда как вечером бот берёт КАЖДЫЙ появившийся корт набора.
+  const courtsLine =
+    mode === 'all'
+      ? `Корты (ловим все): ${courts.map(esc).join(', ')}`
+      : `Корты (приоритет): ${courts.map(esc).join(' → ')}`;
   return [
     `📅 <b>План на ${esc(date)}</b> — ${esc(label)}`,
     `Времена: ${times.map(esc).join(', ')}`,
-    `Корты (приоритет): ${courts.map(esc).join(' → ')}`,
+    courtsLine,
+    ...(mode === 'all' ? ['Лишние брони на разных кортах отменишь вручную (не позже чем за час до игры).'] : []),
     'Бронируем сегодня вечером, в момент дропа. Если игра не нужна — жми «Пропустить».',
   ].join('\n');
 }
@@ -239,6 +332,9 @@ export async function runDailyPlanner(deps: PlannerDeps, now: Date): Promise<Pla
   const eligible = selectEligibleRules(rules, profilesById, date, skippedProfileIds);
   logger.info(`daily-planner: дата ${date}, правил ${rules.length}, план на ${eligible.length} профиль(ей)`);
 
+  /** Заявки на дропы: копятся по всем сценариям и схлопываются ПОСЛЕ цикла. */
+  const requests: DropRequest[] = [];
+
   for (const { rule, profile } of eligible) {
     try {
       const { planned, past } = splitTimesByDrop(rule.times, dayT, now);
@@ -255,7 +351,13 @@ export async function runDailyPlanner(deps: PlannerDeps, now: Date): Promise<Pla
       }
 
       // В сообщении — только то, что реально будет забронировано.
-      const text = formatPreDropMessage({ label: profile.label, date, times: planned, courts: rule.courts });
+      const text = formatPreDropMessage({
+        label: profile.label,
+        date,
+        times: planned,
+        courts: rule.courts,
+        mode: rule.mode,
+      });
       const sent = await deps.sendPreDrop(profile, text, date);
       if (sent) {
         summary.messagesSent += 1;
@@ -264,18 +366,59 @@ export async function runDailyPlanner(deps: PlannerDeps, now: Date): Promise<Pla
       }
 
       for (const time of planned) {
-        const delay = dropTriggerDelay(dayT, time);
-        const idempotencyKey = dropIdempotencyKey(rule.profileId, date, time);
-        await deps.triggerDrop(
-          { profileId: rule.profileId, date, time, live: true, force: true },
-          { delay, idempotencyKey, concurrencyKey: rule.profileId },
-        );
-        summary.dropsTriggered += 1;
+        requests.push({
+          profileId: rule.profileId,
+          time,
+          courts: rule.courts,
+          mode: rule.mode,
+          ruleId: rule.id,
+        });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error(`daily-planner: профиль "${rule.profileId}" — ${message}`);
       summary.errors.push(`${rule.profileId}: ${message}`);
+    }
+  }
+
+  // Дропы ставим ПОСЛЕ разбора всех сценариев: несколько сценариев профиля на
+  // один час обязаны уехать ОДНИМ раном (см. mergePlannedDrops) — иначе второй
+  // ран простоит в очереди до конца окна и ничего не забронирует.
+  const drops = mergePlannedDrops(requests);
+  if (drops.length < requests.length) {
+    logger.info(`daily-planner: сценарии на общий час схлопнуты — дропов ${drops.length} вместо ${requests.length}`);
+  }
+
+  /** Профили, у которых триггер уже сорвался: их оставшиеся дропы не пытаем. */
+  const brokenProfiles = new Set<string>();
+  for (const drop of drops) {
+    if (brokenProfiles.has(drop.profileId)) continue;
+    try {
+      const delay = dropTriggerDelay(dayT, drop.time);
+      const idempotencyKey = dropIdempotencyKey(drop.profileId, date, drop.time, drop.ruleIds.join('+'));
+      // courts/mode передаём ЯВНО: план вечера принимается здесь, и дроп
+      // обязан отработать именно те сценарии, которые сюда попали. Если их не
+      // слать, book-drop.ts достаёт правило из БД сам — по времени, беря
+      // первое включённое подходящее, — и на профиле с несколькими
+      // сценариями это может оказаться чужой набор кортов и чужой режим.
+      await deps.triggerDrop(
+        {
+          profileId: drop.profileId,
+          date,
+          time: drop.time,
+          live: true,
+          force: true,
+          courts: drop.courts,
+          mode: drop.mode,
+        },
+        { delay, idempotencyKey, concurrencyKey: drop.profileId },
+      );
+      summary.dropsTriggered += 1;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error(`daily-planner: профиль "${drop.profileId}" — ${message}`);
+      summary.errors.push(`${drop.profileId}: ${message}`);
+      brokenProfiles.add(drop.profileId);
     }
   }
 

@@ -19,7 +19,7 @@ const URL_BASE = 'https://kbwmrqoxjlydmwyxirqm.supabase.co';
 const KEY = 'sb_secret_TESTKEY_do_not_leak';
 
 const PROFILE_SELECT = 'id,label,name,email,phone,telegram_chat_id,is_admin';
-const RULE_SELECT = 'id,profile_id,times,courts,days_of_week,enabled';
+const RULE_SELECT = 'id,profile_id,times,courts,days_of_week,enabled,mode,label';
 
 function profileRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -55,6 +55,8 @@ function ruleRow(overrides: Record<string, unknown> = {}): Record<string, unknow
     courts: ['Padel Court 3', 'Padel Court 2'],
     days_of_week: null,
     enabled: true,
+    mode: 'priority',
+    label: 'вечер',
     ...overrides,
   };
 }
@@ -278,7 +280,31 @@ describe('SchedulesRepo', () => {
       courts: ['Padel Court 3', 'Padel Court 2'],
       daysOfWeek: null,
       enabled: true,
+      mode: 'priority',
+      label: 'вечер',
     });
+  });
+
+  it('mode=all читается как есть (вечерняя вахта по набору кортов)', async () => {
+    const { fn } = fetchStub(jsonRes([ruleRow({ mode: 'all', courts: ['Padel Court 3', 'Padel Court 4'] })]));
+    const [rule] = await new SchedulesRepo(opts(fn)).listByProfile('ilya');
+    expect(rule!.mode).toBe('all');
+  });
+
+  it('мусор в mode -> priority: непонятная строка не должна бронировать все корты', async () => {
+    // «Наименьшие права» по последствиям: лишняя бронь на чужом корте дороже
+    // пропущенного корта, поэтому неизвестный режим = старое поведение.
+    for (const bad of ['ALL', 'вахта', '', null, 42]) {
+      const { fn } = fetchStub(jsonRes([ruleRow({ mode: bad })]));
+      const [rule] = await new SchedulesRepo(opts(fn)).listByProfile('ilya');
+      expect(rule!.mode).toBe('priority');
+    }
+  });
+
+  it('label не строка -> пустая строка (имя сценария бот сгенерирует сам)', async () => {
+    const { fn } = fetchStub(jsonRes([ruleRow({ label: null })]));
+    const [rule] = await new SchedulesRepo(opts(fn)).listByProfile('ilya');
+    expect(rule!.label).toBe('');
   });
 
   it('days_of_week [1,3] читается как числа', async () => {
@@ -341,6 +367,8 @@ describe('SchedulesRepo', () => {
       courts: ['Padel Court 1'],
       daysOfWeek: [2, 4],
       enabled: true,
+      mode: 'all',
+      label: '19:00 · C1',
     });
 
     const call = calls[0]!;
@@ -352,6 +380,8 @@ describe('SchedulesRepo', () => {
       courts: ['Padel Court 1'],
       days_of_week: [2, 4],
       enabled: true,
+      mode: 'all',
+      label: '19:00 · C1',
     });
     expect(Object.keys(call.body as object)).not.toContain('id');
   });
@@ -365,6 +395,8 @@ describe('SchedulesRepo', () => {
       courts: ['Padel Court 3', 'Padel Court 2'],
       daysOfWeek: null,
       enabled: true,
+      mode: 'priority',
+      label: 'вечер',
     });
 
     expect(calls[0]!.params.get('on_conflict')).toBe('id');
@@ -479,6 +511,13 @@ describe('репозитории: ошибки', () => {
     await expect(new ProfilesRepo(opts(fn)).upsert(profile())).rejects.toThrow(/20260731110000_bot_core\.sql/);
   });
 
+  it('нет колонки (42703, mode/label) -> подсказка про миграцию мультикорта', async () => {
+    const { fn } = fetchStub(jsonRes({ code: '42703', message: 'column schedule_rules.mode does not exist' }, 400));
+    await expect(new SchedulesRepo(opts(fn)).listEnabled()).rejects.toThrow(
+      /20260801110000_multicourt\.sql/,
+    );
+  });
+
   it('нет уникального индекса под on_conflict (42P10) -> подсказка про миграцию', async () => {
     const { fn } = fetchStub(jsonRes({ code: '42P10', message: 'no unique or exclusion constraint' }, 400));
     await expect(new SkipsRepo(opts(fn)).add('ilya', '2026-08-06')).rejects.toThrow(
@@ -510,6 +549,8 @@ describe('репозитории: ошибки', () => {
         courts: ['Padel Court 3'],
         daysOfWeek: null,
         enabled: true,
+        mode: 'priority',
+        label: '',
       }),
     ).rejects.toThrow(/HTTP 400 23514 — violates check constraint/);
   });

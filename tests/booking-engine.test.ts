@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { bookSlotDrop } from '../src/core/booking-engine.js';
-import type { EngineDeps } from '../src/core/booking-engine.js';
+import type { DropTarget, EngineDeps } from '../src/core/booking-engine.js';
 import type { Profile } from '../src/core/profiles.js';
 import type { StateStore, StoredBooking } from '../src/core/state.js';
 import type { ReservioClient } from '../src/reservio/client.js';
@@ -19,6 +19,7 @@ const DEADLINE_MS = Date.parse('2026-07-30T21:03:30+04:00');
 
 const C3 = courtByName('Padel Court 3');
 const C2 = courtByName('Padel Court 2');
+const C4 = courtByName('Padel Court 4');
 
 // Виртуальные задержки сети — чтобы msFromSeenToBooked был отличим от нуля.
 const LATENCY_GET = 120;
@@ -30,6 +31,15 @@ const profile: Profile = {
   contact: { name: 'Test Player', email: 'player@example.test', phone: '+995555000000' },
   rule: { times: ['20:00', '21:00'], courts: ['Padel Court 3', 'Padel Court 2'] },
 };
+
+/**
+ * Цель дропа. Набор кортов приходит от вызывающего (правило профиля, payload
+ * таска, --courts у CLI), движок сам в профиль за ним не лезет.
+ * По умолчанию — режим 'priority' (поведение фазы 2).
+ */
+function target(patch: Partial<DropTarget> = {}): DropTarget {
+  return { date: DATE, time: TIME, courts: [...profile.rule.courts], ...patch };
+}
 
 function makeClock(startISO: string) {
   let t = Date.parse(startISO);
@@ -89,19 +99,26 @@ function makeClient(
 }
 
 // StateStore асинхронен: моки возвращают Promise, движок обязан их awaitить.
+// Ключ брони — (профиль, дата, время, КОРТ): на один час бывает несколько
+// броней на разных кортах, поэтому точечное чтение и чтение всего часа разведены.
 function makeState(initial: StoredBooking[] = []) {
   const rows = [...initial];
+  const ofSlot = (profileId: string, date: string, time: string): StoredBooking[] =>
+    rows.filter((b) => b.profileId === profileId && b.date === date && b.time === time);
   const getBooking = vi.fn(
-    async (profileId: string, date: string, time: string): Promise<StoredBooking | null> =>
-      rows.find((b) => b.profileId === profileId && b.date === date && b.time === time) ?? null,
+    async (profileId: string, date: string, time: string, court: string): Promise<StoredBooking | null> =>
+      ofSlot(profileId, date, time).find((b) => b.court === court) ?? null,
+  );
+  const listBookingsForSlot = vi.fn(
+    async (profileId: string, date: string, time: string): Promise<StoredBooking[]> => ofSlot(profileId, date, time),
   );
   const saveBooking = vi.fn(async (b: StoredBooking): Promise<void> => {
     rows.push(b);
   });
   const listBookings = vi.fn(async (): Promise<StoredBooking[]> => [...rows]);
   const markCanceled = vi.fn(async (): Promise<void> => {});
-  const state = { getBooking, saveBooking, listBookings, markCanceled };
-  return { state: state as unknown as StateStore, getBooking, saveBooking, rows };
+  const state = { getBooking, listBookingsForSlot, saveBooking, listBookings, markCanceled };
+  return { state: state as unknown as StateStore, getBooking, listBookingsForSlot, saveBooking, rows };
 }
 
 function deps(clock: Clock, client: ReservioClient, state: StateStore, log?: (m: string) => void): EngineDeps {
@@ -118,7 +135,7 @@ describe('bookSlotDrop', () => {
     const { state, saveBooking } = makeState();
     const logs: string[] = [];
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state, (m) => logs.push(m)));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state, (m) => logs.push(m)));
 
     expect(report.ok).toBe(true);
     expect(report.court).toBe('Padel Court 3');
@@ -168,7 +185,7 @@ describe('bookSlotDrop', () => {
     });
     const { state, saveBooking } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(true);
     expect(report.court).toBe('Padel Court 2');
@@ -189,7 +206,7 @@ describe('bookSlotDrop', () => {
     });
     const { state } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(true);
     expect(report.court).toBe('Padel Court 2');
@@ -206,7 +223,7 @@ describe('bookSlotDrop', () => {
     });
     const { state, saveBooking } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('SlotTaken');
@@ -237,7 +254,7 @@ describe('bookSlotDrop', () => {
     });
     const { state, saveBooking } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('Timeout');
@@ -255,7 +272,7 @@ describe('bookSlotDrop', () => {
     });
     const { state } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('Timeout');
@@ -269,7 +286,7 @@ describe('bookSlotDrop', () => {
     });
     const { state } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('Timeout');
@@ -294,7 +311,7 @@ describe('bookSlotDrop', () => {
     });
     const { state } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(true);
     expect(clock.sleeps).toEqual([2000, 4000, 2000]);
@@ -318,7 +335,7 @@ describe('bookSlotDrop', () => {
       },
     ]);
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('AlreadyBooked');
@@ -348,7 +365,7 @@ describe('bookSlotDrop', () => {
       },
     ]);
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(true);
     expect(createBooking).toHaveBeenCalledTimes(1);
@@ -361,7 +378,7 @@ describe('bookSlotDrop', () => {
     const { client, createBooking } = makeClient(clock, {
       availability: () => [slot(WANT_START, WANT_END)],
     });
-    const { state, getBooking } = makeState();
+    const { state, listBookingsForSlot } = makeState();
     const rival: StoredBooking = {
       profileId: 'ilya',
       date: DATE,
@@ -373,9 +390,9 @@ describe('bookSlotDrop', () => {
       createdAt: '2026-07-30T20:58:51.000+04:00',
     };
     // На старте брони нет, к моменту пробуждения — уже есть.
-    getBooking.mockImplementation(async () => (clock.ms() >= WINDOW_START_MS ? rival : null));
+    listBookingsForSlot.mockImplementation(async () => (clock.ms() >= WINDOW_START_MS ? [rival] : []));
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('AlreadyBooked');
@@ -388,7 +405,7 @@ describe('bookSlotDrop', () => {
     const { client, createBooking, getAvailability } = makeClient(clock, {
       availability: () => [slot(WANT_START, WANT_END)],
     });
-    const { state, getBooking } = makeState();
+    const { state, listBookingsForSlot } = makeState();
     const rival: StoredBooking = {
       profileId: 'ilya',
       date: DATE,
@@ -401,9 +418,9 @@ describe('bookSlotDrop', () => {
     };
     // Первый вызов (старт) — пусто; следующий (перед POST) — уже занято.
     let calls = 0;
-    getBooking.mockImplementation(async () => (++calls === 1 ? null : rival));
+    listBookingsForSlot.mockImplementation(async () => (++calls === 1 ? [] : [rival]));
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('AlreadyBooked');
@@ -417,9 +434,9 @@ describe('bookSlotDrop', () => {
     const { state } = makeState();
 
     for (const bad of [
-      { date: '2026-8-6', time: '20:00' },
-      { date: DATE, time: '8:00' },
-      { date: '2026-02-30', time: '20:00' },
+      target({ date: '2026-8-6' }),
+      target({ time: '8:00' }),
+      target({ date: '2026-02-30' }),
     ]) {
       const report = await bookSlotDrop(profile, bad, deps(clock, client, state));
       expect(report.ok).toBe(false);
@@ -429,33 +446,33 @@ describe('bookSlotDrop', () => {
     expect(createBooking).not.toHaveBeenCalled();
   });
 
-  it('отказ state.getBooking (rejected promise) → DropReport без POST (дубль хуже пропуска)', async () => {
+  it('отказ чтения state (rejected promise) → DropReport без POST (дубль хуже пропуска)', async () => {
     // Сетевой store (Supabase) падает именно так — reject, а не throw.
     const clock = makeClock(IN_WINDOW);
     const { client, createBooking } = makeClient(clock, {
       availability: () => [slot(WANT_START, WANT_END)],
     });
-    const { state, getBooking } = makeState();
-    getBooking.mockRejectedValue(new Error('PGRST301: JWT expired'));
+    const { state, listBookingsForSlot } = makeState();
+    listBookingsForSlot.mockRejectedValue(new Error('PGRST301: JWT expired'));
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.detail).toContain('PGRST301');
     expect(createBooking).not.toHaveBeenCalled();
   });
 
-  it('синхронный throw из state.getBooking тоже не доводит до POST', async () => {
+  it('синхронный throw из чтения state тоже не доводит до POST', async () => {
     const clock = makeClock(IN_WINDOW);
     const { client, createBooking } = makeClient(clock, {
       availability: () => [slot(WANT_START, WANT_END)],
     });
-    const { state, getBooking } = makeState();
-    getBooking.mockImplementation(() => {
+    const { state, listBookingsForSlot } = makeState();
+    listBookingsForSlot.mockImplementation(() => {
       throw new Error('SQLITE_BUSY: database is locked');
     });
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.detail).toContain('SQLITE_BUSY');
@@ -473,7 +490,7 @@ describe('bookSlotDrop', () => {
     });
     const { state } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(true);
     // 20:50:00 → 20:58:30 = 510 секунд ожидания одним сном.
@@ -492,7 +509,7 @@ describe('bookSlotDrop', () => {
     });
     const { state } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: '00:00' }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target({ time: '00:00' }), deps(clock, client, state));
 
     expect(report.ok).toBe(true);
     // 29.07 23:50 → 30.07 00:58:30 = 68.5 минут ожидания.
@@ -507,7 +524,7 @@ describe('bookSlotDrop', () => {
     });
     const { state } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('Timeout');
@@ -522,7 +539,7 @@ describe('bookSlotDrop', () => {
     const { client, getAvailability } = makeClient(clock, { availability: () => [] });
     const { state } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: '2026-08-09', time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target({ date: '2026-08-09' }), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('Timeout');
@@ -538,7 +555,7 @@ describe('bookSlotDrop', () => {
     });
     const { state } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('ApiChanged');
@@ -553,11 +570,13 @@ describe('bookSlotDrop', () => {
     });
     const { state, saveBooking } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('ApiChanged');
     expect(saveBooking).not.toHaveBeenCalled();
+    // 2xx без id — тоже неоднозначный исход: бронь на сервере могла остаться.
+    expect(report.results[0]).toMatchObject({ court: 'Padel Court 3', ok: false, ambiguous: true });
   });
 
   it('падение state.saveBooking не отменяет успех: token остаётся в отчёте', async () => {
@@ -567,7 +586,7 @@ describe('bookSlotDrop', () => {
     // Именно reject: у сетевого store отказ приходит асинхронно, после POST.
     saveBooking.mockRejectedValue(new Error('disk full'));
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(true);
     expect(report.token).toBe(`tok-${C3.serviceId.slice(0, 4)}`);
@@ -582,18 +601,17 @@ describe('bookSlotDrop', () => {
     });
     const { state } = makeState();
 
-    await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(createBooking.mock.calls[0]![0]).toMatchObject({ start: WANT_START, end: apiEnd });
   });
 
-  it('неизвестный корт в профиле → отчёт, а не исключение', async () => {
+  it('неизвестный корт в наборе → отчёт, а не исключение', async () => {
     const clock = makeClock(IN_WINDOW);
     const { client, getAvailability } = makeClient(clock, { availability: () => [] });
     const { state } = makeState();
-    const broken: Profile = { ...profile, rule: { ...profile.rule, courts: ['Padel Court 42'] } };
 
-    const report = await bookSlotDrop(broken, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target({ courts: ['Padel Court 42'] }), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('ApiChanged');
@@ -605,12 +623,301 @@ describe('bookSlotDrop', () => {
     const { client, createBooking } = makeClient(clock, { availability: () => [] });
     const { state } = makeState();
 
-    const report = await bookSlotDrop(profile, { date: DATE, time: TIME }, deps(clock, client, state));
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('Timeout');
     expect(createBooking).not.toHaveBeenCalled();
     expect(clock.ms()).toBeGreaterThanOrEqual(DEADLINE_MS);
     expect(new Set(clock.sleeps)).toEqual(new Set([2000]));
+  });
+
+  it('results заполняется и в режиме priority: по строке на каждый корт набора', async () => {
+    // Сводка по кортам — единственный способ увидеть, что происходило с
+    // остальным набором: корневые поля отчёта знают только про победителя.
+    const clock = makeClock(IN_WINDOW);
+    const { client } = makeClient(clock, {
+      availability: (serviceId) => (serviceId === C2.serviceId ? [slot(WANT_START, WANT_END)] : []),
+    });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
+
+    expect(report.ok).toBe(true);
+    expect(report.results.map((r) => [r.court, r.ok])).toEqual([
+      ['Padel Court 3', false],
+      ['Padel Court 2', true],
+    ]);
+    expect(report.results[0]!.error).toContain('не появился');
+    expect(report.results[1]!.bookingId).toBe(report.bookingId);
+  });
+});
+
+// Вечерняя вахта: клуб держит C2/C3 на 20:00–22:00 и в дроп выпускает то один
+// корт, то другой, поэтому вечером бронируется КАЖДЫЙ появившийся корт набора.
+// Лишнюю бронь владелец отменяет руками; упущенный корт вернуть нельзя.
+describe('bookSlotDrop: режим all', () => {
+  const ALL = { courts: ['Padel Court 3', 'Padel Court 4'], mode: 'all' as const };
+  const allTarget = (patch: Partial<DropTarget> = {}): DropTarget => target({ ...ALL, ...patch });
+
+  const existingOn = (court: string, bookingId: string): StoredBooking => ({
+    profileId: 'ilya',
+    date: DATE,
+    time: TIME,
+    court,
+    bookingId,
+    token: `tok-${bookingId}`,
+    state: 'confirmed',
+    createdAt: '2026-07-30T20:58:51.000+04:00',
+  });
+
+  it('оба корта появились → две брони, оба results ok', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
+    const { state, saveBooking } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(true);
+    expect(createBooking).toHaveBeenCalledTimes(2);
+    expect(createBooking.mock.calls.map((c) => c[0].serviceId)).toEqual([C3.serviceId, C4.serviceId]);
+    expect(report.results.map((r) => [r.court, r.ok])).toEqual([
+      ['Padel Court 3', true],
+      ['Padel Court 4', true],
+    ]);
+    expect(new Set(report.results.map((r) => r.bookingId)).size).toBe(2);
+    expect(report.results.every((r) => r.msFromSeenToBooked === LATENCY_POST)).toBe(true);
+    // Корневые поля — первая бронь (совместимость с фазой 2).
+    expect(report.court).toBe('Padel Court 3');
+    expect(report.bookingId).toBe(`bk-${C3.serviceId.slice(0, 4)}`);
+    expect(report.token).toBe(`tok-${C3.serviceId.slice(0, 4)}`);
+    // Обе брони с token: без него бронь не отменить.
+    expect(saveBooking).toHaveBeenCalledTimes(2);
+    expect(saveBooking.mock.calls.map((c) => c[0].court)).toEqual(['Padel Court 3', 'Padel Court 4']);
+    expect(saveBooking.mock.calls.every((c) => c[0].token !== '')).toBe(true);
+  });
+
+  it('появился только один корт → одна бронь, второй помечен в results', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, {
+      availability: (serviceId) => (serviceId === C4.serviceId ? [slot(WANT_START, WANT_END)] : []),
+    });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    // Успех рана = хотя бы одна бронь.
+    expect(report.ok).toBe(true);
+    expect(report.court).toBe('Padel Court 4');
+    expect(createBooking).toHaveBeenCalledTimes(1);
+    expect(createBooking.mock.calls[0]![0].serviceId).toBe(C4.serviceId);
+    const [c3, c4] = report.results;
+    expect(c3).toMatchObject({ court: 'Padel Court 3', ok: false });
+    expect(c3!.error).toContain('не появился');
+    expect(c4).toMatchObject({ court: 'Padel Court 4', ok: true });
+    // Вахта по незабронированному корту идёт до самого дедлайна.
+    expect(clock.ms()).toBeGreaterThanOrEqual(DEADLINE_MS);
+  });
+
+  it('старая бронь не задваивается в отчёте, если state читался и до, и после ожидания окна', async () => {
+    // Ран, поставленный до открытия окна, проверяет state дважды (старт и после
+    // сна) и оба раза видит ту же бронь на C3. В отчёт владельцу корт обязан
+    // попасть ОДИН раз, иначе сообщение выглядит как две разные брони.
+    const clock = makeClock('2026-07-30T20:57:00+04:00'); // до окна: движок уснёт
+    const { client, createBooking } = makeClient(clock, { availability: () => [] }); // C4 так и не вышел
+    const { state } = makeState([existingOn('Padel Court 3', 'bk-existing')]);
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(clock.sleeps.length).toBeGreaterThan(0); // окно действительно ждали
+    expect(createBooking).not.toHaveBeenCalled();
+    expect(report.error?.kind).toBe('AlreadyBooked');
+    const detail = report.error?.detail ?? '';
+    expect(detail.match(/bk-existing/g)).toHaveLength(1);
+    // В results тоже ровно одна строка на корт.
+    expect(report.results.map((r) => r.court)).toEqual(['Padel Court 3', 'Padel Court 4']);
+  });
+
+  it('по-кортовая идемпотентность: C3 уже в state → POST только на C4', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
+    const { state } = makeState([existingOn('Padel Court 3', 'bk-existing')]);
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(true);
+    expect(createBooking).toHaveBeenCalledTimes(1);
+    expect(createBooking.mock.calls[0]![0].serviceId).toBe(C4.serviceId);
+    expect(report.results[0]).toMatchObject({ court: 'Padel Court 3', ok: false, bookingId: 'bk-existing' });
+    expect(report.results[0]!.error).toContain('уже была в state');
+    expect(report.results[1]).toMatchObject({ court: 'Padel Court 4', ok: true });
+  });
+
+  it('отменённая бронь корта не блокирует его повторную бронь', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
+    const { state } = makeState([{ ...existingOn('Padel Court 3', 'bk-old'), state: 'canceled' }]);
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(true);
+    expect(createBooking).toHaveBeenCalledTimes(2);
+  });
+
+  it('все корты набора уже забронированы → AlreadyBooked без единого запроса', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, getAvailability, createBooking } = makeClient(clock, {
+      availability: () => [slot(WANT_START, WANT_END)],
+    });
+    const { state } = makeState([
+      existingOn('Padel Court 3', 'bk-c3'),
+      existingOn('Padel Court 4', 'bk-c4'),
+    ]);
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(false);
+    expect(report.error?.kind).toBe('AlreadyBooked');
+    expect(report.bookingId).toBe('bk-c3');
+    expect(getAvailability).not.toHaveBeenCalled();
+    expect(createBooking).not.toHaveBeenCalled();
+    expect(report.results.every((r) => !r.ok && r.bookingId !== undefined)).toBe(true);
+  });
+
+  it('неоднозначный отказ POST на C3 НЕ блокирует C4', async () => {
+    // Корты набора — разные service и разные ресурсы: потерянный ответ по
+    // одному не может превратить бронь на другом в дубль. Упустить из-за этого
+    // второй корт — прямой убыток, поэтому вахта продолжается.
+    const clock = makeClock(IN_WINDOW);
+    const timeoutErr = Object.assign(new Error('createBooking: запрос не выполнен — таймаут'), {
+      code: 'networkError',
+    });
+    const { client, createBooking } = makeClient(clock, {
+      availability: () => [slot(WANT_START, WANT_END)],
+      booking: (serviceId) =>
+        serviceId === C3.serviceId ? { error: timeoutErr } : { bookingId: 'bk-c4', token: 'tok-c4', state: 'confirmed' },
+    });
+    const { state, saveBooking } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(true);
+    expect(report.court).toBe('Padel Court 4');
+    expect(createBooking).toHaveBeenCalledTimes(2);
+    expect(report.results[0]!.error).toContain('неоднозначно');
+    expect(report.results[0]!.error).toContain('могла быть создана');
+    // Ран зелёный (бронь на C4 есть), корневой error занят быть не может —
+    // поэтому фантомная бронь помечается флагом, по которому таск собирает ⚠️.
+    expect(report.results[0]!.ambiguous).toBe(true);
+    expect(report.error).toBeUndefined();
+    expect(report.results[1]).toMatchObject({ court: 'Padel Court 4', ok: true, bookingId: 'bk-c4' });
+    expect(report.results[1]!.ambiguous).toBeUndefined();
+    // В state попадает только подтверждённая бронь.
+    expect(saveBooking).toHaveBeenCalledTimes(1);
+  });
+
+  it('неоднозначный отказ единственного появившегося корта → Timeout с предупреждением', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const timeoutErr = Object.assign(new Error('createBooking: запрос не выполнен — таймаут'), {
+      code: 'networkError',
+    });
+    const { client } = makeClient(clock, {
+      availability: (serviceId) => (serviceId === C3.serviceId ? [slot(WANT_START, WANT_END)] : []),
+      booking: () => ({ error: timeoutErr }),
+    });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(false);
+    expect(report.error?.kind).toBe('Timeout');
+    expect(report.error?.detail).toContain('могла быть создана');
+    expect(report.court).toBe('Padel Court 3');
+  });
+
+  it('POST отклонён на обоих кортах → SlotTaken и РОВНО по одному POST на корт', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking, getAvailability } = makeClient(clock, {
+      availability: () => [slot(WANT_START, WANT_END)],
+      booking: () => ({ error: apiError(409, 'slot already booked') }),
+    });
+    const { state, saveBooking } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(false);
+    expect(report.error?.kind).toBe('SlotTaken');
+    expect(createBooking).toHaveBeenCalledTimes(2);
+    expect(createBooking.mock.calls.map((c) => c[0].serviceId)).toEqual([C3.serviceId, C4.serviceId]);
+    // Попыток больше нет — дальше не поллим.
+    expect(getAvailability).toHaveBeenCalledTimes(2);
+    expect(clock.ms()).toBeLessThan(DEADLINE_MS);
+    expect(saveBooking).not.toHaveBeenCalled();
+    expect(report.results.every((r) => (r.error ?? '').includes('POST отклонён'))).toBe(true);
+  });
+
+  it('отказ POST на C3 не мешает забронировать C4 в том же цикле', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, {
+      availability: () => [slot(WANT_START, WANT_END)],
+      booking: (serviceId) =>
+        serviceId === C3.serviceId
+          ? { error: apiError(409, 'slot already booked') }
+          : { bookingId: 'bk-c4', token: 'tok-c4', state: 'confirmed' },
+    });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(true);
+    expect(report.bookingId).toBe('bk-c4');
+    expect(clock.sleeps).toEqual([]); // оба корта в одном цикле, без пауз
+  });
+
+  it('бронь корта, появившаяся между availability и POST, закрывает только свой корт', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
+    const { state, getBooking } = makeState();
+    const rival = existingOn('Padel Court 3', 'bk-rival');
+    // Точечная проверка перед POST: на C3 бронь уже есть, на C4 — нет.
+    getBooking.mockImplementation(async (_p: string, _d: string, _t: string, court: string) =>
+      court === 'Padel Court 3' ? rival : null,
+    );
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(true);
+    expect(createBooking).toHaveBeenCalledTimes(1);
+    expect(createBooking.mock.calls[0]![0].serviceId).toBe(C4.serviceId);
+    expect(report.results[0]).toMatchObject({ court: 'Padel Court 3', bookingId: 'bk-rival', ok: false });
+  });
+
+  it('дубль корта в наборе не превращается во второй POST', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(
+      profile,
+      allTarget({ courts: ['Padel Court 3', 'Padel Court 3'] }),
+      deps(clock, client, state),
+    );
+
+    expect(createBooking).toHaveBeenCalledTimes(1);
+    expect(report.results).toHaveLength(1);
+  });
+
+  it('ни один корт не появился → Timeout и оба корта помечены', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, { availability: () => [] });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(false);
+    expect(report.error?.kind).toBe('Timeout');
+    expect(createBooking).not.toHaveBeenCalled();
+    expect(report.results.map((r) => r.court)).toEqual(['Padel Court 3', 'Padel Court 4']);
+    expect(report.results.every((r) => !r.ok && (r.error ?? '').includes('не появился'))).toBe(true);
   });
 });

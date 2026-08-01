@@ -22,7 +22,15 @@ import { backToSlotDates, showSlotCourts, showSlotDates, showSlots } from './slo
 import { backToBookDates, confirmBook, doBook, showBookCourts, showBookDates, showBookTimes } from './book.js';
 import { confirmCancel, doCancel, showCancelList } from './cancel.js';
 import { showSkips, toggleSkip } from './skip.js';
-import { showSchedule, toggleRule } from './schedule.js';
+import {
+  askDeleteRule,
+  deleteRule,
+  editRule,
+  ruleWizardStep,
+  showRulesList,
+  showSchedule,
+  toggleRule,
+} from './schedule.js';
 import { addProfile, addRule, showProfiles } from './profiles.js';
 
 type Handler = (ctx: BotContext) => Promise<void>;
@@ -49,7 +57,7 @@ function guard(deps: BotDeps, fn: Handler): Handler {
 }
 
 /** Кнопки, которые сами показывают всплывающий ответ (toast) с итогом действия. */
-const SELF_ANSWERING = new Set(['skip-toggle', 'rule-toggle']);
+const SELF_ANSWERING = new Set(['skip-toggle', 'rule-toggle', 'rule-wizard', 'rule-delete']);
 
 export function registerHandlers(bot: Composer<BotContext>, deps: BotDeps): void {
   const admin = adminOnly({ debug: logOf(deps) });
@@ -118,6 +126,16 @@ export function registerHandlers(bot: Composer<BotContext>, deps: BotDeps): void
           return toggleSkip(ctx, deps, cb.date);
         case 'rule-toggle':
           return toggleRule(ctx, deps, cb.ruleId);
+        case 'rules-list':
+          return showRulesList(ctx, deps);
+        case 'rule-edit':
+          return editRule(ctx, deps, cb.ruleId);
+        case 'rule-delete-ask':
+          return askDeleteRule(ctx, deps, cb.ruleId);
+        case 'rule-delete':
+          return deleteRule(ctx, deps, cb.ruleId);
+        case 'rule-wizard':
+          return ruleWizardStep(ctx, deps, cb.step, cb.draft);
         case 'close':
           return edit(ctx, '↩️ Отменено.');
         case 'noop':

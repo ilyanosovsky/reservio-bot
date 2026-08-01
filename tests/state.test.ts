@@ -3,6 +3,7 @@
 // Контракт асинхронный — сетевая реализация (Supabase) иначе не выражается.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import Database from 'better-sqlite3';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -10,12 +11,16 @@ import { fileURLToPath } from 'node:url';
 import { MemoryStateStore, type StateStore, type StoredBooking } from '../src/core/state.js';
 import { SqliteStateStore } from '../src/core/state-sqlite.js';
 
+const COURT_1 = 'Padel Court 1';
+const COURT_3 = 'Padel Court 3';
+const COURT_4 = 'Padel Court 4';
+
 function booking(overrides: Partial<StoredBooking> = {}): StoredBooking {
   return {
     profileId: 'ilya',
     date: '2026-08-06',
     time: '20:00',
-    court: 'Padel Court 3',
+    court: COURT_3,
     bookingId: 'booking-1',
     token: 'token-1',
     state: 'confirmed',
@@ -33,35 +38,81 @@ function runStateStoreContract(makeStore: () => StateStore) {
   });
 
   it('getBooking по несуществующему слоту возвращает null', async () => {
-    await expect(store.getBooking('ilya', '2026-08-06', '20:00')).resolves.toBeNull();
+    await expect(store.getBooking('ilya', '2026-08-06', '20:00', COURT_3)).resolves.toBeNull();
   });
 
   it('roundtrip: saveBooking затем getBooking возвращает те же поля', async () => {
     const b = booking();
     await store.saveBooking(b);
-    await expect(store.getBooking(b.profileId, b.date, b.time)).resolves.toEqual(b);
+    await expect(store.getBooking(b.profileId, b.date, b.time, b.court)).resolves.toEqual(b);
   });
 
   it('markCanceled меняет state сохранённой брони на canceled', async () => {
     const b = booking({ state: 'confirmed' });
     await store.saveBooking(b);
     await store.markCanceled(b.bookingId);
-    expect((await store.getBooking(b.profileId, b.date, b.time))?.state).toBe('canceled');
+    expect((await store.getBooking(b.profileId, b.date, b.time, b.court))?.state).toBe('canceled');
   });
 
   it('markCanceled по несуществующему bookingId ничего не ломает', async () => {
     await expect(store.markCanceled('nope')).resolves.toBeUndefined();
   });
 
-  it('уникальность profileId+date+time: повторный save перезаписывает, не дублирует', async () => {
+  it('уникальность profileId+date+time+court: повторный save перезаписывает, не дублирует', async () => {
     const b1 = booking({ bookingId: 'booking-1', token: 'token-1', state: 'confirmed' });
     await store.saveBooking(b1);
     const b2 = booking({ bookingId: 'booking-2', token: 'token-2', state: 'confirmed' });
     await store.saveBooking(b2);
 
-    // Тот же слот -> только вторая запись, не дубль.
-    expect((await store.getBooking(b1.profileId, b1.date, b1.time))?.bookingId).toBe('booking-2');
+    // Тот же слот и тот же корт -> только вторая запись, не дубль.
+    expect((await store.getBooking(b1.profileId, b1.date, b1.time, b1.court))?.bookingId).toBe('booking-2');
     await expect(store.listBookings(b1.profileId)).resolves.toHaveLength(1);
+  });
+
+  it('один час на РАЗНЫХ кортах — две независимые брони, а не перезапись', async () => {
+    // Требование владельца: клуб держит вечерние корты под свои группы, бот
+    // ловит набор кортов и бронирует каждый появившийся. Старый ключ
+    // (profileId,date,time) затирал первую бронь второй — и её нечем отменить.
+    const c3 = booking({ court: COURT_3, bookingId: 'b-c3', token: 'token-c3' });
+    const c4 = booking({ court: COURT_4, bookingId: 'b-c4', token: 'token-c4' });
+    await store.saveBooking(c3);
+    await store.saveBooking(c4);
+
+    await expect(store.getBooking('ilya', '2026-08-06', '20:00', COURT_3)).resolves.toEqual(c3);
+    await expect(store.getBooking('ilya', '2026-08-06', '20:00', COURT_4)).resolves.toEqual(c4);
+    await expect(store.listBookings('ilya')).resolves.toHaveLength(2);
+  });
+
+  it('getBooking по другому корту того же часа возвращает null', async () => {
+    await store.saveBooking(booking({ court: COURT_3 }));
+    await expect(store.getBooking('ilya', '2026-08-06', '20:00', COURT_4)).resolves.toBeNull();
+  });
+
+  it('listBookingsForSlot отдаёт все корты часа, отсортированные по корту', async () => {
+    await store.saveBooking(booking({ court: COURT_4, bookingId: 'b-c4' }));
+    await store.saveBooking(booking({ court: COURT_3, bookingId: 'b-c3' }));
+    // соседний час и чужой профиль в выборку попасть не должны
+    await store.saveBooking(booking({ time: '21:00', court: COURT_3, bookingId: 'b-21' }));
+    await store.saveBooking(booking({ profileId: 'nina', court: COURT_1, bookingId: 'b-nina' }));
+
+    const rows = await store.listBookingsForSlot('ilya', '2026-08-06', '20:00');
+    expect(rows.map((b) => b.court)).toEqual([COURT_3, COURT_4]);
+    expect(rows.map((b) => b.bookingId)).toEqual(['b-c3', 'b-c4']);
+  });
+
+  it('listBookingsForSlot показывает и отменённые брони (решает вызыватель)', async () => {
+    const b = booking();
+    await store.saveBooking(b);
+    await store.markCanceled(b.bookingId);
+
+    const rows = await store.listBookingsForSlot('ilya', '2026-08-06', '20:00');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.state).toBe('canceled');
+  });
+
+  it('listBookingsForSlot по пустому часу возвращает пустой массив', async () => {
+    await store.saveBooking(booking({ time: '21:00' }));
+    await expect(store.listBookingsForSlot('ilya', '2026-08-06', '20:00')).resolves.toEqual([]);
   });
 
   it('listBookings без фильтра возвращает брони всех профилей', async () => {
@@ -93,10 +144,18 @@ function runStateStoreContract(makeStore: () => StateStore) {
     // иначе баг «поправили объект из getBooking» проявится только в облаке.
     const b = booking();
     await store.saveBooking(b);
-    const got = (await store.getBooking(b.profileId, b.date, b.time))!;
+    const got = (await store.getBooking(b.profileId, b.date, b.time, b.court))!;
     got.state = 'canceled';
     got.token = 'подменён';
-    expect(await store.getBooking(b.profileId, b.date, b.time)).toEqual(b);
+    expect(await store.getBooking(b.profileId, b.date, b.time, b.court)).toEqual(b);
+  });
+
+  it('мутация записи из listBookingsForSlot тоже не меняет хранилище', async () => {
+    const b = booking();
+    await store.saveBooking(b);
+    const [got] = await store.listBookingsForSlot(b.profileId, b.date, b.time);
+    got!.token = 'подменён';
+    expect(await store.listBookingsForSlot(b.profileId, b.date, b.time)).toEqual([b]);
   });
 }
 
@@ -124,13 +183,63 @@ describe('SqliteStateStore', () => {
     await first.saveBooking(booking());
 
     const reopened = new SqliteStateStore(dbPath);
-    await expect(reopened.getBooking('ilya', '2026-08-06', '20:00')).resolves.toEqual(booking());
+    await expect(reopened.getBooking('ilya', '2026-08-06', '20:00', COURT_3)).resolves.toEqual(booking());
+  });
+
+  it('файл старой схемы (PRIMARY KEY без корта) мигрирует: данные целы, второй корт влезает', async () => {
+    // До 01.08.2026 таблица несла PRIMARY KEY (profileId, date, time). Его
+    // неявный индекс в SQLite не удаляется, поэтому вторая бронь того же часа
+    // на другом корте падала бы на UNIQUE-конфликте — лечится пересборкой.
+    // Отдельный файл: dbPath уже создан общим контрактом (beforeEach выше).
+    const legacyPath = join(dir, 'legacy.db');
+    const legacy = new Database(legacyPath);
+    legacy.exec(`
+      CREATE TABLE bookings (
+        profileId TEXT NOT NULL,
+        date TEXT NOT NULL,
+        time TEXT NOT NULL,
+        court TEXT NOT NULL,
+        bookingId TEXT NOT NULL,
+        token TEXT NOT NULL,
+        state TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        PRIMARY KEY (profileId, date, time)
+      );
+      CREATE UNIQUE INDEX idx_bookings_slot ON bookings (profileId, date, time);
+      INSERT INTO bookings VALUES
+        ('ilya','2026-08-06','20:00','Padel Court 3','booking-1','token-1','confirmed','2026-07-30T19:58:51+04:00');
+    `);
+    legacy.close();
+
+    const store = new SqliteStateStore(legacyPath);
+    // старая бронь на месте, ничего не потеряно
+    await expect(store.getBooking('ilya', '2026-08-06', '20:00', COURT_3)).resolves.toEqual(booking());
+    // и теперь тот же час на другом корте сохраняется, а не конфликтует
+    const c4 = booking({ court: COURT_4, bookingId: 'b-c4', token: 'token-c4' });
+    await store.saveBooking(c4);
+    await expect(store.listBookingsForSlot('ilya', '2026-08-06', '20:00')).resolves.toEqual([booking(), c4]);
+  });
+
+  it('повторное открытие мигрированного файла не ломает данные', async () => {
+    const first = new SqliteStateStore(dbPath);
+    await first.saveBooking(booking());
+    await first.saveBooking(booking({ court: COURT_4, bookingId: 'b-c4' }));
+
+    const reopened = new SqliteStateStore(dbPath);
+    await expect(reopened.listBookingsForSlot('ilya', '2026-08-06', '20:00')).resolves.toHaveLength(2);
   });
 });
 
-/** Код без комментариев: упоминание пакета в пояснении — не зависимость. */
+/**
+ * Код без комментариев: упоминание пакета в пояснении — не зависимость.
+ *
+ * Строчные комментарии вырезаются ПЕРВЫМИ и только потом блочные: в пояснениях
+ * встречается «src/trigger/*», и при обратном порядке этот `/*` открывал бы
+ * фиктивный блочный комментарий до ближайшего `*` + `/` в файле — вместе с
+ * настоящими import'ами, которые тест как раз и должен видеть.
+ */
 function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  return src.replace(/^\s*\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
 }
 
 /**

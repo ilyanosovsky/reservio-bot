@@ -7,7 +7,7 @@
  * где идёт гонка за секунды.
  *
  * Общее с движком (и специально сохранённое): один POST на вызов, никаких
- * ретраев, идемпотентность по (profileId, date, time) через StateStore,
+ * ретраев, идемпотентность по (profileId, date, time, court) через StateStore,
  * успех — ТОЛЬКО по bookingId от API.
  *
  * Модуль хост-агностичен: ни env, ни trigger.dev SDK, ни Telegram. Планирование
@@ -119,11 +119,13 @@ export async function bookNow(
     return { ok: false, reason: `Неверные дата/время: ${detail(err)}` };
   }
 
-  // 2. Идемпотентность. Недоступный state — тоже отказ: без него нельзя
-  //    утверждать, что брони ещё нет, а дубль отменять руками дороже.
+  // 2. Идемпотентность — ТОЛЬКО по этому корту: бронь того же часа на ДРУГОМ
+  //    корте легитимна (клуб то отдаёт, то держит вечерние корты, см. state.ts).
+  //    Недоступный state — отказ: без него нельзя утверждать, что брони ещё
+  //    нет, а дубль отменять руками дороже.
   let existing: StoredBooking | null;
   try {
-    existing = await state.getBooking(profile.id, date, time);
+    existing = await state.getBooking(profile.id, date, time, court.name);
   } catch (err) {
     return {
       ok: false,
@@ -133,7 +135,9 @@ export async function bookNow(
   if (existing && existing.state !== 'canceled') {
     return {
       ok: false,
-      reason: `На ${date} ${time} уже есть бронь: ${existing.court} (${existing.bookingId}). Сначала отмени её.`,
+      reason:
+        `На ${date} ${time} уже есть бронь на ${existing.court} (${existing.bookingId}). Сначала отмени её. ` +
+        'Другой корт на это же время — можно.',
     };
   }
 

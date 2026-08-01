@@ -108,7 +108,7 @@ describe('bookNow: успешная бронь', () => {
     expect(h.createCalls[0]).toEqual({ serviceId: courtByName(COURT).serviceId, start: START, end: END });
 
     // token обязан доехать до state: без него бронь не отменить (PROTOCOL.md)
-    await expect(h.state.getBooking(PROFILE.id, DATE, TIME)).resolves.toMatchObject({
+    await expect(h.state.getBooking(PROFILE.id, DATE, TIME, COURT)).resolves.toMatchObject({
       bookingId: 'bk-1',
       token: 'guest-token-1',
       state: 'confirmed',
@@ -130,6 +130,22 @@ describe('bookNow: успешная бронь', () => {
 
     expect(h.reminders).toHaveLength(1);
     expect(h.reminders[0]).toMatchObject({ bookingId: 'bk-1', date: DATE, time: TIME, court: COURT });
+  });
+
+  it('бронь того же часа на ДРУГОМ корте не мешает: это легитимный вечерний пак', async () => {
+    // Клуб то отдаёт, то держит вечерние корты, поэтому владелец сознательно
+    // берёт 20:00 на нескольких кортах и лишнее отменяет руками. Блокировать
+    // такую бронь по (профиль, дата, время) — значит запретить нужный сценарий.
+    const h = harness();
+    await h.state.saveBooking(stored({ court: 'Padel Court 4', bookingId: 'other-court-1' }));
+
+    const res = await bookNow(PROFILE, TARGET, h.deps);
+
+    expect(res.ok).toBe(true);
+    expect(h.createCalls).toHaveLength(1);
+    expect(h.createCalls[0]?.serviceId).toBe(courtByName(COURT).serviceId);
+    // Обе брони живут рядом: ключ state включает корт.
+    await expect(h.state.listBookingsForSlot(PROFILE.id, DATE, TIME)).resolves.toHaveLength(2);
   });
 
   it('отменённая бронь на этот слот не мешает забронировать заново', async () => {
@@ -164,6 +180,7 @@ describe('bookNow: POST не делается', () => {
     expect(res.ok).toBe(false);
     if (res.ok) return;
     expect(res.reason).toContain('уже есть бронь');
+    expect(res.reason).toContain(COURT); // отказ именно по этому корту
     expect(res.reason).toContain('old-1');
     expect(h.createCalls).toHaveLength(0);
     // до availability дело тоже не доходит: проверка состояния идёт первой
@@ -230,7 +247,7 @@ describe('bookNow: отказы POST', () => {
     if (res.ok) return;
     expect(res.reason).toContain('Reservio отклонил бронь');
     expect(h.createCalls).toHaveLength(1); // ровно одна попытка
-    await expect(h.state.getBooking(PROFILE.id, DATE, TIME)).resolves.toBeNull();
+    await expect(h.state.getBooking(PROFILE.id, DATE, TIME, COURT)).resolves.toBeNull();
   });
 
   it('неоднозначный отказ (5xx) — предупреждаем, что бронь могла создаться', async () => {
@@ -304,7 +321,7 @@ describe('bookNow: бронь важнее обвязки', () => {
     expect(res.booking.bookingId).toBe('bk-1');
     expect(logs.join('\n')).toContain('напоминание');
     // бронь при этом сохранена
-    await expect(h.state.getBooking(PROFILE.id, DATE, TIME)).resolves.toMatchObject({ bookingId: 'bk-1' });
+    await expect(h.state.getBooking(PROFILE.id, DATE, TIME, COURT)).resolves.toMatchObject({ bookingId: 'bk-1' });
   });
 
   it('scheduleReminder не задан — просто не зовём', async () => {

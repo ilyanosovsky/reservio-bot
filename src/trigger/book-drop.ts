@@ -46,7 +46,7 @@ import { loadProfiles, ruleAppliesOn, type Profile } from '../core/profiles.js';
 import { MemoryStateStore, type StateStore, type StoredBooking } from '../core/state.js';
 import { SupabaseStateStore } from '../core/state-supabase.js';
 import { formatDropReport, sendTelegram, telegramFromEnv, type TelegramTarget } from '../core/notify.js';
-import { bookSlotDrop, type EngineDeps, type DropReport } from '../core/booking-engine.js';
+import { bookSlotDrop, type EngineDeps, type DropCourtResult, type DropMode, type DropReport } from '../core/booking-engine.js';
 import { dropDayOf, dropWatchWindow, tbilisiStamp } from '../core/scheduler.js';
 import { ProfilesRepo, SchedulesRepo, SkipsRepo, type SupabaseRepoOptions } from '../core/repos.js';
 import { scheduleReminder } from './remind.js';
@@ -58,6 +58,17 @@ export interface BookSlotDropPayload {
   live: boolean; // false = DRY-RUN (без реального POST), true = реальная бронь
   /** true — игнорировать ограничение rule.daysOfWeek профиля. */
   force?: boolean;
+  /**
+   * Набор кортов на этот дроп. Не задан — берётся из schedule_rule профиля
+   * (так шлёт планировщик и так работают все старые раны).
+   */
+  courts?: string[];
+  /**
+   * 'priority' — первый доступный корт по приоритету (старое поведение);
+   * 'all' — бронировать КАЖДЫЙ появившийся корт набора (вечерняя вахта).
+   * Не задан — режим из schedule_rule профиля, иначе 'priority'.
+   */
+  mode?: DropMode;
 }
 
 /**
@@ -198,8 +209,12 @@ export class ResilientStateStore implements StateStore {
     return fn(this.memory);
   }
 
-  getBooking(profileId: string, date: string, time: string): Promise<StoredBooking | null> {
-    return this.call('getBooking', (s) => s.getBooking(profileId, date, time));
+  getBooking(profileId: string, date: string, time: string, court: string): Promise<StoredBooking | null> {
+    return this.call('getBooking', (s) => s.getBooking(profileId, date, time, court));
+  }
+
+  listBookingsForSlot(profileId: string, date: string, time: string): Promise<StoredBooking[]> {
+    return this.call('listBookingsForSlot', (s) => s.listBookingsForSlot(profileId, date, time));
   }
 
   saveBooking(b: StoredBooking): Promise<void> {
@@ -254,6 +269,94 @@ function fallbackReportText(report: DropReport, why: string): string {
 }
 
 /**
+ * Все брони, реально созданные ЭТИМ раном (в режиме 'all' их бывает несколько).
+ *
+ * Корневые court/bookingId отчёта — это лишь ПЕРВАЯ из них, поэтому источник
+ * правды здесь results. Фолбэк на корень оставлен для отчётов, собранных без
+ * results (старый формат, ручная сборка): пропустить напоминание по существующей
+ * брони хуже, чем лишний раз перестраховаться.
+ */
+function successfulBookings(report: DropReport): Array<{ court: string; bookingId: string }> {
+  const fromResults = (report.results ?? [])
+    .filter((r) => r.ok && (r.bookingId ?? '') !== '' && (r.court ?? '') !== '')
+    .map((r) => ({ court: r.court, bookingId: r.bookingId! }));
+  if (fromResults.length > 0) return fromResults;
+  const court = report.court ?? '';
+  const bookingId = report.bookingId ?? '';
+  return report.ok && court !== '' && bookingId !== '' ? [{ court, bookingId }] : [];
+}
+
+/** '743 мс' / '1.2 с' — человеку важен порядок величины, а не точность до миллисекунды. */
+function formatSpeed(ms: number): string {
+  return ms < 1000 ? `${ms} мс` : `${(ms / 1000).toFixed(1)} с`;
+}
+
+/** Кусок чужого текста в сводке: длинная ошибка Reservio не должна вытеснить остальные корты. */
+const COURT_ERROR_LIMIT = 120;
+
+/**
+ * Сводка по набору кортов: «✅ Padel Court 3 (743 мс), Padel Court 4 (1.2 с) ·
+ * ❌ Padel Court 1 — слот не появился». Нужна вечерней вахте (mode 'all'), где
+ * за один дроп бывает несколько броней и несколько промахов сразу — из
+ * корневых полей отчёта этого не видно.
+ *
+ * Для одного корта не выводится: строка «Корт: …» в отчёте уже всё сказала.
+ */
+function courtsSummary(report: DropReport): string | null {
+  const results: DropCourtResult[] = report.results ?? [];
+  if (results.length < 2) return null;
+  const booked = results
+    .filter((r) => r.ok)
+    .map((r) => escapeHtml(r.court) + (r.msFromSeenToBooked === undefined ? '' : ` (${formatSpeed(r.msFromSeenToBooked)})`));
+  const missed = results
+    .filter((r) => !r.ok)
+    .map((r) => `${escapeHtml(r.court)} — ${escapeHtml(clampCourtError(r.error))}`);
+  const parts: string[] = [];
+  if (booked.length > 0) parts.push(`✅ ${booked.join(', ')}`);
+  if (missed.length > 0) parts.push(`❌ ${missed.join('; ')}`);
+  return parts.length === 0 ? null : `Корты: ${parts.join(' · ')}`;
+}
+
+function clampCourtError(error: string | undefined): string {
+  const text = error ?? 'брони нет';
+  return text.length <= COURT_ERROR_LIMIT ? text : `${text.slice(0, COURT_ERROR_LIMIT)}…`;
+}
+
+/**
+ * Предупреждение о неоднозначном отказе POST — бронь на этих кортах МОГЛА быть
+ * создана, а id/token до нас не доехали.
+ *
+ * Отдельной строкой (⚠️), а не только внутри сводки по кортам: в режиме 'all'
+ * успех на соседнем корте делает отчёт зелёным (formatDropReport печатает
+ * «Причина/Детали» только при ok=false), а строка корта в сводке обрезается по
+ * COURT_ERROR_LIMIT — то есть самое важное («сходи проверь») до человека не
+ * доезжало бы вовсе. Фантомную бронь надо успеть отменить за час до слота.
+ */
+function ambiguousWarning(report: DropReport): string | undefined {
+  const courts = (report.results ?? []).filter((r) => r.ambiguous === true).map((r) => r.court);
+  if (courts.length === 0) return undefined;
+  return (
+    `POST по ${courts.join(', ')} завершился неоднозначно — бронь МОГЛА быть создана на сервере, ` +
+    'id/token потеряны: проверь почту профиля и клуб вручную (лишнее отменяется не позже чем за час до слота)'
+  );
+}
+
+/**
+ * Вставляет сводку по кортам в готовый текст отчёта — перед строкой
+ * предупреждений (⚠️), чтобы предупреждения оставались последними: их читают
+ * последними и по ним принимают решения.
+ */
+function withCourtsSummary(text: string, report: DropReport): string {
+  const summary = courtsSummary(report);
+  if (summary === null) return text;
+  const lines = text.split('\n');
+  const warningAt = lines.findIndex((line) => line.startsWith('⚠️'));
+  if (warningAt < 0) return [...lines, summary].join('\n');
+  lines.splice(warningAt, 0, summary);
+  return lines.join('\n');
+}
+
+/**
  * Скип: единственное сообщение за такой ран. Отдельный текст, а не
  * formatDropReport, потому что «пропущено по команде» — это не ошибка дропа:
  * расширять DropErrorKind ради него значило бы менять контракт ядра фазы 2
@@ -268,17 +371,31 @@ function skippedText(payload: BookSlotDropPayload): string {
   ].join('\n');
 }
 
+/** Имена кортов из payload: мусор (не массив, пустые строки) отбрасываем целиком. */
+function normalizeCourts(raw: unknown): string[] | null {
+  if (!Array.isArray(raw)) return null;
+  const courts = raw.filter((c): c is string => typeof c === 'string').map((c) => c.trim()).filter((c) => c !== '');
+  return courts.length === 0 ? null : courts;
+}
+
+/** Режим из payload/БД. Всё, что не 'all'/'priority', — как будто не задано. */
+function normalizeMode(raw: unknown): DropMode | null {
+  return raw === 'all' || raw === 'priority' ? raw : null;
+}
+
 /**
- * Профиль для дропа: контакт, приоритет кортов, чат.
+ * Профиль для дропа: контакт, набор кортов, режим, чат.
  *
  * Источник правды — Supabase (profiles + schedule_rules): туда пишет админ из
  * бота, оттуда планировщик берёт правила и туда же смотрит бот, когда решает,
  * кому что показывать. ENV-профиль остаётся запасным: он нужен ручным прогонам
  * без Supabase и спасает, если БД отвалилась ровно перед дропом.
+ * Явный `courtsOverride` из payload бьёт оба источника: ручной ран «поймай мне
+ * вот эти корты» не должен зависеть от того, что записано в правиле.
  *
  * Возвращает предупреждения, которые обязаны попасть в единственное сообщение
  * вечера: «профиль взят из ENV, потому что БД молчит» — это ровно тот случай,
- * когда бронь может уйти не с тем приоритетом кортов.
+ * когда бронь может уйти не с тем набором кортов.
  */
 async function resolveProfile(args: {
   profileId: string;
@@ -286,23 +403,29 @@ async function resolveProfile(args: {
   supabase: SupabaseRepoOptions | null;
   envProfile: Profile | null;
   envProblem: string | null;
-}): Promise<{ profile: Profile; warnings: string[] }> {
-  const { profileId, time, supabase, envProfile, envProblem } = args;
+  /** Набор кортов из payload; null — берём из правила/ENV. */
+  courtsOverride: string[] | null;
+}): Promise<{ profile: Profile; mode: DropMode | null; warnings: string[] }> {
+  const { profileId, time, supabase, envProfile, envProblem, courtsOverride } = args;
   const warnings: string[] = [];
 
   let dbProfile = null as Awaited<ReturnType<ProfilesRepo['getById']>>;
   let dbCourts: string[] | null = null;
   let dbDays: number[] | null = null;
+  let dbMode: DropMode | null = null;
   if (supabase !== null) {
     try {
       dbProfile = await new ProfilesRepo(supabase).getById(profileId);
       if (dbProfile !== null) {
         const rules = await new SchedulesRepo(supabase).listByProfile(profileId);
         // Правило этого времени авторитетнее прочих; если такого нет — берём
-        // любое включённое (приоритет кортов у профиля обычно один на все часы).
+        // любое включённое (набор кортов у профиля обычно один на все часы).
         const rule = rules.find((r) => r.enabled && r.times.includes(time)) ?? rules.find((r) => r.enabled) ?? null;
         dbCourts = rule?.courts ?? null;
         dbDays = rule?.daysOfWeek ?? null;
+        // mode валидируем и здесь (репозиторий это уже делает): мусор в колонке
+        // не должен включать вахту по всем кортам там, где её не просили.
+        dbMode = normalizeMode(rule?.mode);
       }
     } catch (err) {
       warnings.push(`профиль из Supabase не прочитан (${redactSecrets(describeError(err))}) — работаем по ENV-профилю`);
@@ -319,18 +442,20 @@ async function resolveProfile(args: {
       );
     }
     logger.info(`профиль "${profileId}" взят из ENV (в Supabase его нет или БД не отвечает)`);
-    return { profile: envProfile, warnings };
+    const profile: Profile =
+      courtsOverride === null ? envProfile : { ...envProfile, rule: { ...envProfile.rule, courts: courtsOverride } };
+    return { profile, mode: null, warnings };
   }
 
-  // Корты: правило из БД, иначе ENV-профиль. Без кортов бронировать нечем.
-  const courts = dbCourts ?? envProfile?.rule.courts ?? null;
+  // Корты: payload → правило из БД → ENV-профиль. Без кортов бронировать нечем.
+  const courts = courtsOverride ?? dbCourts ?? envProfile?.rule.courts ?? null;
   if (courts === null) {
     throw new Error(
       `У профиля "${profileId}" в Supabase нет ни одного включённого правила с кортами, а ENV-профиля нет — ` +
-        'бронировать нечем. Добавь правило: /add_rule в боте.',
+        'бронировать нечем. Добавь сценарий: «⏰ Расписание» в боте (или /add_rule).',
     );
   }
-  if (dbCourts === null) {
+  if (courtsOverride === null && dbCourts === null) {
     warnings.push('корты взяты из ENV: включённого правила в Supabase нет');
   }
 
@@ -349,8 +474,8 @@ async function resolveProfile(args: {
         : {}),
     },
   };
-  logger.info(`профиль "${profileId}" взят из Supabase, корты: ${courts.join(' → ')}`);
-  return { profile, warnings };
+  logger.info(`профиль "${profileId}" взят из Supabase, корты: ${courts.join(', ')}`);
+  return { profile, mode: dbMode, warnings };
 }
 
 /** Ран упал ДО отчёта: сообщение собираем из payload, других данных нет. */
@@ -423,9 +548,22 @@ export const bookSlotDropTask = task({
         envProblem = `ENV-профили не собрались: ${redactSecrets(describeError(err))}`;
       }
 
-      const resolved = await resolveProfile({ profileId, time, supabase: supabaseOpts, envProfile, envProblem });
+      const resolved = await resolveProfile({
+        profileId,
+        time,
+        supabase: supabaseOpts,
+        envProfile,
+        envProblem,
+        courtsOverride: normalizeCourts(payload.courts),
+      });
       const profile = resolved.profile;
       const profileWarning = resolved.warnings.length === 0 ? undefined : resolved.warnings.join(' · ');
+      // Режим: payload → правило профиля → 'priority'. Явный payload нужен
+      // ручным прогонам вахты, правило — плановым (его ставит мастер расписаний).
+      const mode: DropMode = normalizeMode(payload.mode) ?? resolved.mode ?? 'priority';
+      logger.info(
+        `book-slot-drop: набор кортов ${profile.rule.courts.join(', ')}, режим ${mode === 'all' ? 'все появившиеся' : 'первый по приоритету'}`,
+      );
       // У профиля может быть свой чат (мультипрофиль) — с этого момента отчёт
       // и крах-сообщение уходят именно туда. Глобального TELEGRAM_CHAT_ID при
       // этом может не быть вовсе (у каждого профиля свой чат): бот-токена и
@@ -471,6 +609,8 @@ export const bookSlotDropTask = task({
           profileId,
           date,
           time,
+          // Ни один корт не трогали — по кортам сообщать нечего.
+          results: [],
           timeline: [{ at: tbilisiStamp(new Date()), event: `пропущено по команде (скип на этот день, ${when})` }],
         };
       };
@@ -522,8 +662,9 @@ export const bookSlotDropTask = task({
         );
         state = resilient;
         // Первое обращение делаем сами и заранее: «нет таблицы» или «не тот
-        // ключ» должны всплыть до окна дропа, а не в секунду POST.
-        await state.getBooking(engineProfile.id, date, time);
+        // ключ» должны всплыть до окна дропа, а не в секунду POST. Читаем весь
+        // слот: пробе не нужен конкретный корт.
+        await state.listBookingsForSlot(engineProfile.id, date, time);
         if (resilient.warning === null) logger.info('state: Supabase доступен');
       } else {
         state = new MemoryStateStore();
@@ -578,8 +719,13 @@ export const bookSlotDropTask = task({
         if (await checkSkipped()) return reportSkipped('перед окном');
       }
 
-      const report = await bookSlotDrop(engineProfile, { date, time }, deps);
-      logger.info('book-slot-drop: финиш', { ok: report.ok, court: report.court, error: report.error });
+      const report = await bookSlotDrop(engineProfile, { date, time, courts: engineProfile.rule.courts, mode }, deps);
+      logger.info('book-slot-drop: финиш', {
+        ok: report.ok,
+        court: report.court,
+        courts: (report.results ?? []).map((r) => `${r.court}:${r.ok ? 'ok' : 'нет'}`).join(' '),
+        error: report.error,
+      });
 
       // Предупреждение о state актуально уже после дропа: деградация могла
       // случиться и в середине polling.
@@ -604,16 +750,21 @@ export const bookSlotDropTask = task({
         stateWarning !== undefined && tokenLost
           ? `${stateWarning} · token брони НЕ сохранён — отменять бронь только по ссылке из письма-подтверждения (сам token есть в output рана)`
           : stateWarning;
-      // Предупреждений может быть несколько (state, непроверенный скип, откуда
-      // взялся профиль) — все должны попасть в единственное сообщение вечера.
-      const warnings = [stateLine, skipWarning, profileWarning].filter(
+      // Предупреждений может быть несколько (неоднозначный POST, state,
+      // непроверенный скип, откуда взялся профиль) — все должны попасть в
+      // единственное сообщение вечера. Неоднозначный POST идёт первым: он
+      // единственный требует немедленного действия человека.
+      const warnings = [ambiguousWarning(report), stateLine, skipWarning, profileWarning].filter(
         (w): w is string => w !== undefined && w !== '',
       );
       const messageWarning = warnings.length === 0 ? undefined : warnings.join(' · ');
 
       let text: string;
       try {
-        text = formatDropReport(report, messageWarning === undefined ? {} : { stateWarning: messageWarning });
+        text = withCourtsSummary(
+          formatDropReport(report, messageWarning === undefined ? {} : { stateWarning: messageWarning }),
+          report,
+        );
       } catch (err) {
         // Форматтер не имеет права стоить нам единственного сообщения за ран.
         text = fallbackReportText(report, redactSecrets(describeError(err)));
@@ -625,18 +776,23 @@ export const bookSlotDropTask = task({
       // Напоминание за 2 часа ставим ПОСЛЕ отчёта: отчёт — инвариант вечера, а
       // напоминание приятный бонус, который не имеет права его задерживать или
       // ронять ран. Только LIVE: в DRY бронь синтетическая, напоминать не о чем.
-      const bookingId = report.bookingId ?? '';
-      const bookedCourt = report.court ?? '';
-      if (live && report.ok && bookingId !== '' && bookedCourt !== '') {
-        try {
-          const outcome = await scheduleReminder(
-            { profileId, date, time, court: bookedCourt, bookingId },
-            target?.chatId ?? '',
-            { log: (msg) => logger.info(msg) },
-          );
-          logger.info(`remind: ${outcome}`);
-        } catch (err) {
-          logger.error(`remind: напоминание не запланировано (бронь это не отменяет): ${redactSecrets(describeError(err))}`);
+      // В режиме 'all' броней за ран бывает несколько — напоминание ставится по
+      // КАЖДОЙ: у них разные корты, а idempotencyKey напоминания идёт по
+      // bookingId, так что дублей это не создаёт.
+      if (live && report.ok) {
+        for (const booked of successfulBookings(report)) {
+          try {
+            const outcome = await scheduleReminder(
+              { profileId, date, time, court: booked.court, bookingId: booked.bookingId },
+              target?.chatId ?? '',
+              { log: (msg) => logger.info(msg) },
+            );
+            logger.info(`remind (${booked.court}): ${outcome}`);
+          } catch (err) {
+            logger.error(
+              `remind (${booked.court}): напоминание не запланировано (бронь это не отменяет): ${redactSecrets(describeError(err))}`,
+            );
+          }
         }
       }
 

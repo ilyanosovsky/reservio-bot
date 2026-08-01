@@ -7,11 +7,20 @@ import type { Slot } from '../src/reservio/types.js';
 import {
   CANCEL_DEADLINE_MS,
   BOOKABLE_COURTS,
+  DROP_EXPLAINER,
+  RULE_MODE_LABEL,
+  SCHEDULE_HOURS,
   activeBookings,
+  autoRuleLabel,
   bookingButtonLabel,
   cancelDeadlinePassed,
   courtByIndex,
   courtIndexOf,
+  courtShort,
+  courtsFromMask,
+  daysFromMask,
+  draftFromRule,
+  draftProblem,
   escapeHtml,
   formatBookingsList,
   formatBookCourtsStep,
@@ -21,31 +30,51 @@ import {
   formatDateShort,
   formatDays,
   formatProfilesList,
+  formatRuleConfirm,
+  formatRuleCourtsStep,
+  formatRuleDaysStep,
+  formatRuleDeleteAsk,
+  formatRuleModeStep,
+  formatRuleSaved,
+  formatRuleTimesStep,
   formatRulesList,
   formatSkipsList,
   formatSlotsCourtsStep,
   formatSlotsDatesStep,
   formatSlotsList,
   freeTimes,
+  hourLabel,
+  hourOfTime,
   humanizeCancelError,
   maskEmail,
+  maskOfCourts,
+  maskOfDays,
+  maskOfTimes,
   maskTail,
+  mergeCourtOrder,
   ruleButtonLabel,
+  ruleFromDraft,
+  ruleTitle,
   skipButtonLabel,
   slotTimeLabel,
+  timesFromMask,
   upcomingDates,
   wizardCrumbs,
 } from '../src/bot/format.js';
 import {
   BACK_LABEL,
+  CHECK_OFF,
+  CHECK_ON,
   backKeyboard,
   confirmKeyboard,
   courtKeyboard,
   dateKeyboard,
   edit,
   isNotModifiedError,
+  multiSelectKeyboard,
   timeKeyboard,
 } from '../src/bot/ui.js';
+import { DAYS_MASK_MAX, EMPTY_RULE_DRAFT, type RuleDraft, maskOfBits } from '../src/bot/parse.js';
 
 // vitest.config.ts фиксирует TZ=America/New_York — любые расчёты ниже обязаны
 // давать календарь Тбилиси (+04:00), а не хоста.
@@ -271,23 +300,254 @@ describe('formatDays / правила', () => {
     courts: ['Padel Court 3', 'Padel Court 2'],
     daysOfWeek: null,
     enabled: true,
+    mode: 'priority',
+    label: '',
     ...over,
   });
 
-  it('подпись кнопки показывает состояние правила', () => {
-    expect(ruleButtonLabel(rule())).toBe('✅ 20:00, 21:00');
-    expect(ruleButtonLabel(rule({ enabled: false }))).toBe('⛔ 20:00, 21:00');
+  it('подпись кнопки показывает состояние сценария и его имя', () => {
+    expect(ruleButtonLabel(rule())).toBe('✅ 20:00+21:00 · C3,C2');
+    expect(ruleButtonLabel(rule({ enabled: false }))).toBe('⛔ 20:00+21:00 · C3,C2');
+    expect(ruleButtonLabel(rule({ label: 'Вечер' }))).toBe('✅ Вечер');
   });
 
-  it('список правил печатает времена, корты и дни', () => {
+  it('список сценариев печатает времена, корты, дни и режим', () => {
     const text = formatRulesList([rule({ daysOfWeek: [2, 4] })]);
     expect(text).toContain('20:00, 21:00');
     expect(text).toContain('Padel Court 3 → Padel Court 2');
     expect(text).toContain('вт, чт');
+    expect(text).toContain(RULE_MODE_LABEL.priority);
   });
 
-  it('пустое расписание отправляет к админу', () => {
-    expect(formatRulesList([])).toContain('/add_rule');
+  it('в режиме «все» корты перечисляются без стрелки приоритета', () => {
+    const text = formatRulesList([rule({ mode: 'all', courts: ['Padel Court 3', 'Padel Court 4'] })]);
+    expect(text).toContain('Padel Court 3, Padel Court 4');
+    expect(text).not.toContain('→');
+    expect(text).toContain(RULE_MODE_LABEL.all);
+  });
+
+  it('пустое расписание зовёт в мастер и объясняет дроп', () => {
+    const text = formatRulesList([]);
+    expect(text).toContain('Новый сценарий');
+    expect(text).toContain(DROP_EXPLAINER);
+  });
+
+  it('имя сценария: заданное человеком важнее автоимени', () => {
+    expect(ruleTitle(rule({ label: '  Вечерний пак  ' }))).toBe('Вечерний пак');
+    expect(ruleTitle(rule({ label: '   ' }))).toBe('20:00+21:00 · C3,C2');
+  });
+});
+
+describe('мастер расписаний: битмаски ↔ домен', () => {
+  it('часы туда и обратно', () => {
+    expect(hourLabel(7)).toBe('07:00');
+    expect(hourLabel(21)).toBe('21:00');
+    expect(hourOfTime('21:00')).toBe(21);
+    expect(hourOfTime('07:00')).toBe(7);
+  });
+
+  it('получасовые времена битмаска не кодирует (в клубе слот — целый час)', () => {
+    expect(hourOfTime('20:30')).toBeNull();
+    expect(hourOfTime('вечером')).toBeNull();
+    expect(maskOfTimes(['20:00', '20:30', '21:00'])).toBe(maskOfBits([20, 21]));
+  });
+
+  it('мастер предлагает часы клуба 07:00–23:00', () => {
+    expect(SCHEDULE_HOURS[0]).toBe(7);
+    expect(SCHEDULE_HOURS[SCHEDULE_HOURS.length - 1]).toBe(23);
+    expect(SCHEDULE_HOURS).toHaveLength(17);
+  });
+
+  it('все семь дней — это «каждый день» (в базе null), а не список из семи', () => {
+    expect(daysFromMask(DAYS_MASK_MAX)).toBeNull();
+    expect(maskOfDays(null)).toBe(DAYS_MASK_MAX);
+    expect(daysFromMask(maskOfDays([1, 3, 5]))).toEqual([1, 3, 5]);
+    expect(daysFromMask(0)).toEqual([]);
+  });
+
+  it('корты ездят индексами BOOKABLE_COURTS', () => {
+    expect(courtsFromMask(maskOfCourts(['Padel Court 3', 'Park Court 1']))).toEqual([
+      'Padel Court 3',
+      'Park Court 1',
+    ]);
+    expect(maskOfCourts(['Корт которого нет'])).toBe(0);
+    expect(courtsFromMask(0)).toEqual([]);
+    expect(timesFromMask(maskOfBits([20, 21]))).toEqual(['20:00', '21:00']);
+  });
+
+  it('короткие имена кортов для автоимени сценария', () => {
+    expect(courtShort('Padel Court 3')).toBe('C3');
+    expect(courtShort('Park Court 2')).toBe('P2');
+    expect(courtShort('Нечто')).toBe('Нечто');
+    expect(autoRuleLabel(['20:00', '21:00'], ['Padel Court 3', 'Padel Court 4', 'Padel Court 1'])).toBe(
+      '20:00+21:00 · C3,C4,C1',
+    );
+  });
+
+  it('сценарий → черновик → сценарий переживает круг без потерь', () => {
+    const source: ScheduleRuleRow = {
+      id: 'r-9',
+      profileId: 'ilya',
+      times: ['20:00', '21:00'],
+      courts: ['Padel Court 3', 'Padel Court 4', 'Padel Court 1'],
+      daysOfWeek: [1, 3, 5],
+      enabled: true,
+      mode: 'all',
+      label: 'Вечер',
+    };
+    const draft = draftFromRule(source);
+    expect(draft.ruleId).toBe('r-9');
+    expect(draft.mode).toBe('all');
+    // Битмаска порядок не хранит: без прежнего порядка корты выходят по
+    // индексам BOOKABLE_COURTS.
+    expect(ruleFromDraft(draft).courts).toEqual(['Padel Court 1', 'Padel Court 3', 'Padel Court 4']);
+
+    const back = ruleFromDraft(draft, source.courts);
+    expect(back.times).toEqual(source.times);
+    expect(back.courts).toEqual(source.courts);
+    expect(back.daysOfWeek).toEqual([1, 3, 5]);
+    expect(back.mode).toBe('all');
+  });
+
+  it('правка сценария не переставляет приоритет кортов', () => {
+    // «Поменял день недели» не должно молча превращать C3→C4→C1 в C1→C3→C4:
+    // порядок кортов это и есть порядок приоритета.
+    const previous = ['Padel Court 3', 'Padel Court 4', 'Padel Court 1'];
+    expect(mergeCourtOrder(['Padel Court 1', 'Padel Court 3', 'Padel Court 4'], previous)).toEqual(previous);
+  });
+
+  it('снятая галочка уходит, новая дописывается в конец приоритета', () => {
+    const previous = ['Padel Court 3', 'Padel Court 4'];
+    expect(mergeCourtOrder(['Padel Court 3', 'Park Court 1'], previous)).toEqual([
+      'Padel Court 3',
+      'Park Court 1',
+    ]);
+    expect(mergeCourtOrder([], previous)).toEqual([]);
+    expect(mergeCourtOrder(['Padel Court 2'], [])).toEqual(['Padel Court 2']);
+  });
+
+  it('пустые наборы до сохранения не доезжают', () => {
+    expect(draftProblem(EMPTY_RULE_DRAFT)).toContain('день');
+    expect(draftProblem({ ...EMPTY_RULE_DRAFT, days: DAYS_MASK_MAX })).toContain('времени');
+    expect(draftProblem({ ...EMPTY_RULE_DRAFT, days: DAYS_MASK_MAX, times: maskOfBits([20]) })).toContain('корт');
+    expect(
+      draftProblem({ ...EMPTY_RULE_DRAFT, days: DAYS_MASK_MAX, times: maskOfBits([20]), courts: 4 }),
+    ).toBeNull();
+  });
+});
+
+describe('мастер расписаний: экраны', () => {
+  const full: RuleDraft = {
+    days: maskOfDays([1, 3]),
+    times: maskOfBits([20, 21]),
+    courts: maskOfCourts(['Padel Court 3', 'Padel Court 4']),
+    mode: 'all',
+    ruleId: null,
+  };
+
+  it('каждый шаг несёт заголовок мастера, номер шага и накопленный выбор', () => {
+    expect(formatRuleDaysStep(full)).toContain('⏰ <b>Расписание</b>');
+    expect(formatRuleDaysStep(full)).toContain('шаг 1/5');
+    expect(formatRuleTimesStep(full)).toContain('шаг 2/5');
+    expect(formatRuleTimesStep(full)).toContain('пн, ср');
+    expect(formatRuleCourtsStep(full)).toContain('шаг 3/5');
+    expect(formatRuleCourtsStep(full)).toContain('20:00, 21:00');
+    expect(formatRuleModeStep(full)).toContain('шаг 4/5');
+    expect(formatRuleModeStep(full)).toContain('C3, C4');
+    expect(formatRuleConfirm(full)).toContain('шаг 5/5');
+  });
+
+  it('пустой шаг честно пишет «—», а не притворяется выбором', () => {
+    expect(formatRuleDaysStep(EMPTY_RULE_DRAFT)).toContain('Отмечено: —');
+  });
+
+  it('правка отличается от нового сценария прямо в крошках', () => {
+    expect(formatRuleDaysStep({ ...full, ruleId: 'r-1' })).toContain('правка');
+    expect(formatRuleDaysStep(full)).toContain('новый');
+  });
+
+  it('подтверждение показывает сводку и объясняет логику дропа', () => {
+    const text = formatRuleConfirm(full);
+    expect(text).toContain('20:00+21:00 · C3,C4');
+    expect(text).toContain('пн, ср');
+    expect(text).toContain('Padel Court 3, Padel Court 4');
+    expect(text).toContain(RULE_MODE_LABEL.all);
+    expect(text).toContain('слот часа H открывается в H:59:00 за 7 суток');
+  });
+
+  it('подтверждение неполного черновика говорит, чего не хватает', () => {
+    const text = formatRuleConfirm({ ...EMPTY_RULE_DRAFT, days: DAYS_MASK_MAX });
+    expect(text).toContain('не выбрано ни одного времени');
+    expect(text).not.toContain(DROP_EXPLAINER);
+  });
+
+  it('удаление показывает, что именно удаляют, и что брони останутся', () => {
+    const text = formatRuleDeleteAsk({
+      id: 'r-1',
+      profileId: 'ilya',
+      times: ['20:00'],
+      courts: ['Padel Court 3'],
+      daysOfWeek: [1],
+      enabled: true,
+      mode: 'priority',
+      label: 'Вечер',
+    });
+    expect(text).toContain('Вечер');
+    expect(text).toContain('брони останутся');
+  });
+
+  it('админский /add_rule печатает режим — иначе он невидим', () => {
+    expect(formatRuleSaved('ilya', ['20:00'], ['Padel Court 3', 'Padel Court 4'], [1], 'all')).toContain(
+      RULE_MODE_LABEL.all,
+    );
+    expect(formatRuleSaved('ilya', ['20:00'], ['Padel Court 3'], null)).toContain(RULE_MODE_LABEL.priority);
+  });
+
+  it('имя корта с разметкой экранируется, заголовок остаётся разметкой', () => {
+    const text = formatRuleConfirm(full);
+    expect(text.startsWith('⏰ <b>Расписание</b>')).toBe(true);
+    expect(formatRuleDeleteAsk({
+      id: 'r-1',
+      profileId: 'ilya',
+      times: ['20:00'],
+      courts: ['<b>Court</b>'],
+      daysOfWeek: null,
+      enabled: true,
+      mode: 'priority',
+      label: '<script>',
+    })).toContain('&lt;script&gt;');
+  });
+});
+
+describe('клавиатура мультивыбора', () => {
+  const rowsOf = (kb: { inline_keyboard: { text: string; callback_data?: string }[][] }) => kb.inline_keyboard;
+
+  it('галочка видна в подписи и меняется вместе с состоянием', () => {
+    const kb = multiSelectKeyboard(
+      [
+        { text: 'пн', data: 'a', checked: true },
+        { text: 'вт', data: 'b', checked: false },
+      ],
+      2,
+    );
+    expect(rowsOf(kb)[0]!.map((b) => b.text)).toEqual([`${CHECK_ON} пн`, `${CHECK_OFF} вт`]);
+  });
+
+  it('пункты режутся по perRow, хвостовые кнопки идут отдельными рядами', () => {
+    const kb = multiSelectKeyboard(
+      Array.from({ length: 5 }, (_, i) => ({ text: `t${i}`, data: `d${i}`, checked: false })),
+      2,
+      [[{ text: '➡️ Готово', data: 'done' }], [{ text: BACK_LABEL, data: 'back' }]],
+    );
+    const rows = rowsOf(kb);
+    expect(rows.map((r) => r.length)).toEqual([2, 2, 1, 1, 1]);
+    expect(rows[rows.length - 1]).toEqual([{ text: BACK_LABEL, callback_data: 'back' }]);
+    expect(rows.every((r) => r.length > 0)).toBe(true);
+  });
+
+  it('пустой список пунктов не оставляет пустых рядов', () => {
+    const kb = multiSelectKeyboard([], 3, [[{ text: BACK_LABEL, data: 'back' }]]);
+    expect(rowsOf(kb)).toEqual([[{ text: BACK_LABEL, callback_data: 'back' }]]);
   });
 });
 

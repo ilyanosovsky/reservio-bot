@@ -1,6 +1,7 @@
 // Репозитории бота поверх Supabase/PostgREST: профили, правила расписания,
 // скипы дней и настройки. Схема — supabase/migrations/20260731110000_bot_core.sql
-// (тот же DDL в docs/supabase-schema.sql).
+// плюс 20260801110000_multicourt.sql (mode/label у schedule_rules); тот же DDL
+// в docs/supabase-schema.sql.
 //
 // Почему голый fetch, а не @supabase/supabase-js: те же соображения, что в
 // state-supabase.ts — ради нескольких запросов к PostgREST тянуть SDK в core
@@ -21,6 +22,8 @@ const DEFAULT_TIMEOUT_MS = 5_000;
 const ERROR_BODY_LIMIT = 300;
 /** Миграция, создающая таблицы этого модуля — на неё ссылаются ошибки «нет таблицы». */
 const MIGRATION_FILE = 'supabase/migrations/20260731110000_bot_core.sql';
+/** Миграция мультикорта: колонки mode/label у schedule_rules. */
+const MULTICOURT_MIGRATION = 'supabase/migrations/20260801110000_multicourt.sql';
 
 const T_PROFILES = 'profiles';
 const T_RULES = 'schedule_rules';
@@ -28,7 +31,11 @@ const T_SKIPS = 'skips';
 const T_SETTINGS = 'settings';
 
 const PROFILE_COLUMNS = 'id,label,name,email,phone,telegram_chat_id,is_admin';
-const RULE_COLUMNS = 'id,profile_id,times,courts,days_of_week,enabled';
+const RULE_COLUMNS = 'id,profile_id,times,courts,days_of_week,enabled,mode,label';
+
+/** Режимы правила; см. ScheduleRuleRow.mode. */
+const RULE_MODES = ['priority', 'all'] as const;
+export type ScheduleMode = (typeof RULE_MODES)[number];
 
 /** Ключ дедупликации скипа — тот же, что уникальный ключ в схеме. */
 const SKIP_CONFLICT_TARGET = 'profile_id,date';
@@ -60,11 +67,19 @@ export interface ScheduleRuleRow {
   profileId: string;
   /** ['20:00','21:00'] — каждое время это отдельный дроп и отдельная бронь. */
   times: string[];
-  /** Имена кортов в порядке приоритета: первый основной, дальше fallback. */
+  /** Набор кортов сценария; в режиме 'priority' порядок = приоритет. */
   courts: string[];
   /** [0..6], вс = 0; null = каждый день. */
   daysOfWeek: number[] | null;
   enabled: boolean;
+  /**
+   * 'priority' — первый доступный корт по приоритету и стоп (старое поведение);
+   * 'all' — бронировать КАЖДЫЙ появившийся корт набора (вечерняя вахта: клуб
+   * держит Court 2/3 на 20:00–22:00, в дроп выходит то один корт, то другой).
+   */
+  mode: ScheduleMode;
+  /** Имя сценария в интерфейсе бота; '' = бот сгенерирует его сам. */
+  label: string;
 }
 
 /**
@@ -154,6 +169,16 @@ function requireStringArray(r: Record<string, unknown>, column: string, table: s
     if (typeof item !== 'string') throw drift(table, column, label, 'содержит не-строку');
   }
   return value as string[];
+}
+
+/**
+ * Режим правила. Всё непонятное читаем как 'priority' — это «наименьшие права»
+ * по последствиям: мусор в колонке не должен превращать сценарий в вахту,
+ * которая набронирует несколько кортов на один час.
+ */
+function ruleMode(r: Record<string, unknown>): ScheduleMode {
+  const value = r['mode'];
+  return RULE_MODES.includes(value as ScheduleMode) ? (value as ScheduleMode) : 'priority';
 }
 
 function nullableDays(r: Record<string, unknown>, column: string, table: string, label: string): number[] | null {
@@ -303,11 +328,13 @@ abstract class PostgrestRepo {
       code === 'PGRST205' ||
       code === 'PGRST204' ||
       code === '42P10' ||
+      code === '42703' || // undefined_column: нет mode/label — не доехала миграция мультикорта
       (status === 404 && /could not find the table/i.test(message));
     if (schemaProblem) {
       return new SupabaseRepoError(
-        `Таблица "${this.table}" (или её колонки) не найдена в Supabase — применена ли миграция ${MIGRATION_FILE}? ` +
-          `Без CLI: docs/supabase-schema.sql в SQL Editor. Если таблица есть, обнови кэш схемы: notify pgrst, 'reload schema' [${label}]`,
+        `Таблица "${this.table}" (или её колонки) не найдена в Supabase — применены ли миграции ${MIGRATION_FILE} ` +
+          `и ${MULTICOURT_MIGRATION}? Без CLI: docs/supabase-schema.sql в SQL Editor. ` +
+          `Если таблица есть, обнови кэш схемы: notify pgrst, 'reload schema' [${label}]`,
         { status, code, table: this.table },
       );
     }
@@ -470,6 +497,16 @@ export class SchedulesRepo extends PostgrestRepo {
     }
   }
 
+  /**
+   * Удаление сценария (кнопка «🗑» в «⏰ Расписание»). profile_id в фильтре —
+   * защита в глубину: id приезжает из callback_data, а хендлер и без того
+   * ищет правило среди своих. Уже созданные брони удаление не трогает.
+   */
+  async remove(id: string, profileId: string): Promise<void> {
+    const query = new URLSearchParams({ id: `eq.${id}`, profile_id: `eq.${profileId}` });
+    await this.deleteRows(query, 'remove');
+  }
+
   /** Без `id` — новое правило (uuid выдаёт БД), с `id` — обновление существующего. */
   async upsert(r: ScheduleRuleInput): Promise<void> {
     const row: Record<string, unknown> = {
@@ -478,6 +515,8 @@ export class SchedulesRepo extends PostgrestRepo {
       courts: r.courts,
       days_of_week: r.daysOfWeek,
       enabled: r.enabled,
+      mode: r.mode,
+      label: r.label,
     };
     if (r.id === undefined) {
       await this.upsertRow(row, null, 'upsert');
@@ -495,6 +534,10 @@ export class SchedulesRepo extends PostgrestRepo {
       courts: requireStringArray(row, 'courts', T_RULES, label),
       daysOfWeek: nullableDays(row, 'days_of_week', T_RULES, label),
       enabled: boolFlag(row, 'enabled'),
+      mode: ruleMode(row),
+      // Имя сценария — косметика: пустое или неожиданное значение это ''
+      // (бот сгенерирует подпись сам), ронять из-за него список правил незачем.
+      label: typeof row['label'] === 'string' ? row['label'] : '',
     };
   }
 }

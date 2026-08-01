@@ -109,6 +109,12 @@ async function main(): Promise<void> {
     courts: profile.rule.courts,
     daysOfWeek: days,
     enabled: true,
+    // Сид создаёт правило в старом режиме «первый доступный корт по
+    // приоритету»: вахту по набору кортов ('all') владелец включает осознанно
+    // в мастере «⏰ Расписание», а не получает молча от bootstrap-скрипта.
+    mode: 'priority',
+    // Имя сценария пустое — интерфейс подставит автоимя из времён и кортов.
+    label: '',
   });
   const created = await schedules.listByProfile(profile.id);
   if (created.length === 0) throw new Error('Правило не читается обратно из Supabase — запись не подтверждена');

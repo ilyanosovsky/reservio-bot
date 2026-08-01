@@ -57,7 +57,9 @@ docs/PROTOCOL.md           # подтверждённый протокол Reser
 `dropDayOf(date)` — день наблюдения T для целевой даты T+7,
 `weekdayOf(date)`/`tbilisiStamp(now)` — день недели и метка времени в +04:00.
 
-**`core/state.ts`** (`StateStore`) — интерфейс `getBooking(profileId, date, time)`
+**`core/state.ts`** (`StateStore`) — интерфейс
+`getBooking(profileId, date, time, court)` (точечно, «занят ли ИМЕННО этот
+корт») / `listBookingsForSlot(profileId, date, time)` (весь час по всем кортам)
 / `saveBooking(b)` / `listBookings(profileId?)` / `markCanceled(bookingId)`,
 **все методы асинхронные** (`Promise`): под интерфейсом может быть и сеть.
 Здесь же `MemoryStateStore` (in-memory `Map`) — и никаких нативных импортов,
@@ -66,7 +68,13 @@ docs/PROTOCOL.md           # подтверждённый протокол Reser
 диске — локальные прогоны и тесты) и `core/state-supabase.ts`
 (`SupabaseStateStore`, PostgREST на голом `fetch`, без `@supabase/supabase-js`
 — общее хранилище облака и будущего бота, DDL в `docs/supabase-schema.sql`).
-Ключ дедупликации везде один: `(profileId, date, time)` — уникальный индекс.
+Ключ дедупликации везде один: `(profileId, date, time, court)` — уникальный
+индекс (`bookings_profile_slot_court`, миграция `20260801110000_multicourt.sql`).
+Корт в ключе с 01.08.2026: клуб держит Court 2/3 на 20:00–22:00 под свои группы,
+вечером в дроп выходит то один корт, то другой, поэтому бот ловит НАБОР кортов и
+бронирует каждый появившийся — две брони на один час на разных кортах легитимны,
+лишнее владелец отменяет руками. SQLite-файлы старой схемы (`PRIMARY KEY` без
+корта) `SqliteStateStore` пересобирает при открытии.
 Таблица `settings` (skip-флаги и т.п. из целевой архитектуры фазы 3) пока не
 реализована.
 
@@ -86,12 +94,15 @@ telegramChatId?, rule: {times, courts, daysOfWeek?}}`. Профиль по ум�
 своим временем/приоритетом кортов).
 
 **`core/booking-engine.ts`** — экспортирует
-`bookSlotDrop(profile, {date, time}, deps: EngineDeps): Promise<DropReport>`
+`bookSlotDrop(profile, {date, time, courts, mode}, deps: EngineDeps): Promise<DropReport>`
 (`EngineDeps = {client, state, now?, sleep?, log?}` — `now`/`sleep`
 инжектируются в тестах для детерминизма). Идемпотентность — первым делом:
-если в `state.getBooking(profileId, date, time)` уже есть непогашенная
-(`state !== 'canceled'`) запись, `POST` не делается вовсе, возвращается
-`{ok: false, error: {kind: 'AlreadyBooked'}}`. Та же проверка повторяется
+если непогашенная (`state !== 'canceled'`) запись уже есть — `POST` не
+делается вовсе и возвращается `{ok: false, error: {kind: 'AlreadyBooked'}}`.
+Проверка идёт по режиму: `listBookingsForSlot(profileId, date, time)` в
+`priority` (любая бронь часа блокирует ран) и точечный
+`getBooking(profileId, date, time, court)` в `all` (закрывается только этот
+корт — брони на разных кортах одного часа легитимны). Та же проверка повторяется
 после сна до окна и непосредственно перед каждым `POST` — иначе два прогона,
 стартовавшие до окна, создали бы дубль. Окно считается от `dropDayOf(date)`
 (целевая дата − 7 суток), а не от «сегодня»; если окно уже закрыто или
@@ -102,14 +113,20 @@ telegramChatId?, rule: {times, courts, daysOfWeek?}}`. Профиль по ум�
 `POST` не ретраится: **одна попытка на корт за запуск**, после исчерпания
 попыток polling прекращается досрочно. Детерминированный отказ (`4xx`) →
 следующий корт; неоднозначный (таймаут/обрыв/`5xx`/`2xx` без `data.id`) →
-весь дроп останавливается, потому что бронь могла быть создана на сервере
-(вторая попытка означала бы две реальные брони). Ошибки клиента с
+в `priority` весь дроп останавливается, потому что бронь могла быть создана
+на сервере (вторая попытка означала бы две реальные брони), а в `all`
+закрывается только этот корт (остальные — другие ресурсы, дубля на них не
+будет) и он помечается `ambiguous` для предупреждения владельцу. Ошибки клиента с
 `code=unexpectedResponse` классифицируются как `ApiChanged`, а не как
 `Timeout`. У раундов опроса свой
 backoff при 429/5xx/сетевых ошибках: 2 c → 4 c → 8 c → 16 c → 30 c (это
 отдельный уровень поверх retry внутри самого `reservio/client.ts`).
 `DropReport`: `{ok, profileId, date, time, court?, bookingId?, token?,
-msFromSeenToBooked?, timeline: {at, event}[], error?: {kind, detail?}}`,
+msFromSeenToBooked?, results: {court, ok, bookingId?, msFromSeenToBooked?,
+error?, ambiguous?}[], timeline: {at, event}[], error?: {kind, detail?}}`
+(корневые `court`/`bookingId`/`token` — ПЕРВАЯ бронь рана, полная картина по
+набору всегда в `results`; `ambiguous` помечает корт, чей `POST` мог всё-таки
+создать бронь, — по нему таск шлёт отдельное `⚠️` даже в зелёном отчёте),
 `DropErrorKind = 'SlotTaken' | 'ApiChanged' | 'Timeout' | 'AlreadyBooked'`.
 Наружу исключения не летят вообще: кривые `date`/`time` и любой сбой `state`
 превращаются в `DropReport` (иначе в Telegram не уйдёт ни одного сообщения —
@@ -206,14 +223,15 @@ T-2ч, команды «Мои брони» / «Отменить сегодня�
 ## Дроп-модель (из `docs/PROTOCOL.md`)
 
 Дроп — **почасовой, rolling T+7**: слот на час `H` дня T+7 появляется в
-`H:58:50–59:00` дня T — в ТОТ ЖЕ час, что и сам слот. Горизонт ровно 7×24 ч
+`H:59:00 ± 2 c` дня T — в ТОТ ЖЕ час, что и сам слот. Горизонт ровно 7×24 ч
 отсчитывается от КОНЦА слота (`end − 7 суток` = `H:59:00`). Для пары
-20:00+21:00 это два отдельных дропа: ~20:58:50 и ~21:58:50 дня T.
-Подтверждено живым наблюдением 30.07.2026: слот
-06.08 10:00 отсутствовал в availability в 10:58:49.4 и появился в 10:58:59.9;
-`POST` в 10:59:01 → `confirmed` (1.1 c от появления слота до подтверждённой
-брони). Разброс секунд уточняется дальнейшими наблюдениями, поэтому
-`booking-engine` начинает polling заранее — с `H:58:30`.
+20:00+21:00 это два отдельных дропа: ~20:59:00 и ~21:59:00 дня T.
+Подтверждено живыми замерами 30–31.07.2026: слот
+06.08 10:00 отсутствовал в availability в 10:58:49.4 и появился в 10:58:59.9
+(`POST` в 10:59:01 → `confirmed`, 1.1 c от появления слота до подтверждённой
+брони); 07.08 20:00 на Court 3 появился 31.07 в 20:59:00–01.5 (бронь за
+743 мс), 07.08 21:00 на Court 4 — в 21:59:00. Полный журнал замеров —
+`docs/PROTOCOL.md`; `booking-engine` начинает polling заранее, с `H:58:30`.
 (Формула `(H-1):58:50` из первых редакций доков ошибочна: она противоречит
 этому замеру и заставляла поллить за час до дропа.)
 
@@ -230,8 +248,8 @@ sequenceDiagram
     Scheduler-->>CLI: {start H:58:30, deadline +5 мин}
     CLI->>State: getBooking(...) — проба хранилища до окна дропа
     State-->>CLI: ok / ошибка → посадка на Memory + предупреждение
-    CLI->>Engine: bookSlotDrop(profile, {date, time}, deps)
-    Engine->>State: getBooking(profileId, date, time)
+    CLI->>Engine: bookSlotDrop(profile, {date, time, courts, mode}, deps)
+    Engine->>State: listBookingsForSlot / getBooking (по режиму)
     State-->>Engine: null (брони ещё нет)
 
     loop polling каждые ≥2с до появления слота или deadline
@@ -239,7 +257,7 @@ sequenceDiagram
         API-->>Engine: список свободных слотов (без 20:00)
     end
 
-    Note over API: ~H:58:50–59:00 дня T — дроп: слот появляется в availability
+    Note over API: ~H:59:00 ± 2 c дня T — дроп: слот появляется в availability
 
     Engine->>API: GET availability/booking-slots (Court 3)
     API-->>Engine: 20:00 есть в data[]

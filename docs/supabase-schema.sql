@@ -3,9 +3,10 @@
 -- Как применить: Supabase Dashboard -> SQL Editor -> New query -> вставить целиком -> Run.
 -- Скрипт идемпотентен: повторный запуск ничего не ломает и не трогает данные.
 --
--- Тот же DDL лежит миграцией supabase/migrations/20260730123000_bookings.sql
--- (для `supabase db push`). Этот файл — источник правды и путь без CLI; держать
--- их в синхроне, иначе схема разъедется с адаптером.
+-- Тот же DDL лежит миграциями supabase/migrations/*.sql (для `supabase db push`):
+-- 20260730123000_bookings, 20260730140000_bookings_hardening,
+-- 20260731110000_bot_core, 20260801110000_multicourt. Этот файл — источник
+-- правды и путь без CLI; держать в синхроне, иначе схема разъедется с адаптером.
 --
 -- Читает/пишет только адаптер src/core/state-supabase.ts (PostgREST через fetch,
 -- ключ SUPABASE_SERVICE_ROLE_KEY). Пока таблицы нет, адаптер кидает ошибку со
@@ -26,11 +27,18 @@ create table if not exists public.bookings (
   created_at text not null                  -- ISO с явным оффсетом, например 2026-07-30T19:58:51+04:00
 );
 
--- Один слот профиля = максимум одна бронь. В этот индекс целится upsert адаптера
--- (POST ?on_conflict=profile_id,date,time + Prefer: resolution=merge-duplicates):
+-- Один слот профиля НА ОДНОМ КОРТЕ = максимум одна бронь. Корт в ключе с
+-- 01.08.2026 (миграция 20260801110000_multicourt.sql): клуб держит Court 2/3 на
+-- 20:00–22:00 под свои группы, вечером в дроп выходит то один корт, то другой,
+-- поэтому бот ловит НАБОР кортов и бронирует каждый появившийся — лишнее
+-- владелец отменяет руками. Старый индекс (profile_id, date, time) это запрещал.
+drop index if exists public.bookings_profile_date_time;
+
+-- В этот индекс целится upsert адаптера
+-- (POST ?on_conflict=profile_id,date,time,court + Prefer: resolution=merge-duplicates):
 -- без него PostgREST ответит 42P10 и запись брони не подтвердится.
-create unique index if not exists bookings_profile_date_time
-  on public.bookings (profile_id, "date", "time");
+create unique index if not exists bookings_profile_slot_court
+  on public.bookings (profile_id, "date", "time", court);
 
 -- markCanceled ищет бронь по booking_id — отдельный индекс, как в SQLite-схеме.
 create index if not exists bookings_booking_id_idx on public.bookings (booking_id);
@@ -52,8 +60,9 @@ alter table public.bookings enable row level security;
 revoke all on table public.bookings from anon, authenticated;
 
 -- ===========================================================================
--- Ядро Telegram-бота (фаза 3). Тот же DDL лежит миграцией
--- supabase/migrations/20260731110000_bot_core.sql — держать файлы в синхроне.
+-- Ядро Telegram-бота (фаза 3). Тот же DDL лежит миграциями
+-- supabase/migrations/20260731110000_bot_core.sql и 20260801110000_multicourt.sql
+-- (mode/label у schedule_rules) — держать файлы в синхроне.
 -- Читает/пишет только src/core/repos.ts (PostgREST через fetch, service-ключ).
 -- ===========================================================================
 
@@ -76,9 +85,13 @@ create table if not exists public.schedule_rules (
   id           uuid primary key default gen_random_uuid(),
   profile_id   text not null references public.profiles (id) on delete cascade,
   times        jsonb not null,  -- ["20:00","21:00"] — каждое время это отдельный дроп и отдельная бронь
-  courts       jsonb not null,  -- ["Padel Court 3","Padel Court 2"] — порядок = приоритет
+  courts       jsonb not null,  -- ["Padel Court 3","Padel Court 4"] — набор кортов сценария
   days_of_week jsonb,           -- [1,2,3] (вс=0); null = каждый день
   enabled      boolean not null default true,
+  -- 'priority' — первый доступный корт по приоритету и стоп (старое поведение);
+  -- 'all'      — бронировать КАЖДЫЙ появившийся корт набора (вечерняя вахта).
+  mode         text not null default 'priority',
+  label        text not null default '',  -- имя сценария в боте; '' = сгенерировать
   created_at   text not null default to_char(now() at time zone 'Asia/Tbilisi', 'YYYY-MM-DD"T"HH24:MI:SS"+04:00"'),
   -- jsonb принимает и число, и строку, и объект: без этих проверок правило
   -- {"times": "20:00"} тихо доехало бы до планировщика и не забронировало ничего.
@@ -88,6 +101,22 @@ create table if not exists public.schedule_rules (
 );
 
 create index if not exists schedule_rules_profile_idx on public.schedule_rules (profile_id);
+
+-- Для БД, созданной до 01.08.2026: create table выше её не трогает, колонки
+-- добавляем отдельно (миграция 20260801110000_multicourt.sql). Дефолт
+-- 'priority' специально — миграция не меняет поведение уже созданных правил.
+alter table public.schedule_rules add column if not exists mode  text not null default 'priority';
+alter table public.schedule_rules add column if not exists label text not null default '';
+
+-- Мусор в mode тихо доехал бы до движка и выбрал бы не ту стратегию вечера.
+-- add constraint if not exists в Postgres нет — проверяем сами (идемпотентно).
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'schedule_rules_mode_check') then
+    alter table public.schedule_rules
+      add constraint schedule_rules_mode_check check (mode in ('priority', 'all'));
+  end if;
+end $$;
 
 -- Скип целого дня: планировщик не ставит на эту дату ни одного дропа, а уже
 -- поставленная бронь-джоба проверяет скип ещё раз перед окном.

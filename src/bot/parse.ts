@@ -12,6 +12,11 @@
  * (двоеточие занято внутри времени '20:00'), корт едет индексом в BOOKABLE_COURTS.
  * Исключение — скип: его формат `skip:{date}` зафиксирован контрактом фазы 3,
  * потому что те же кнопки шлёт pre-drop сообщение планировщика.
+ *
+ * Мультивыборы мастера расписаний (дни/времена/корты) едут БИТМАСКАМИ в hex:
+ * серверного состояния мастера нет, весь черновик сценария живёт в кнопке.
+ * Нажатие галочки — это не «запомни выбор», а «нарисуй экран с уже
+ * переключённым битом», поэтому кнопка сразу несёт СЛЕДУЮЩЕЕ состояние.
  */
 
 import { courtByName, COURTS } from '../reservio/types.js';
@@ -26,9 +31,12 @@ export const ADD_PROFILE_USAGE = [
 ].join('\n');
 
 export const ADD_RULE_USAGE = [
-  'Формат: /add_rule profile_id;времена;корты[;дни недели]',
-  'Пример: /add_rule ilya;20:00,21:00;Padel Court 3,Padel Court 2;1,2,3,4,5',
+  'Формат: /add_rule profile_id;времена;корты[;дни недели][;режим]',
+  'Пример: /add_rule ilya;20:00,21:00;Padel Court 3,Padel Court 4;1,2,3,4,5;all',
   'Дни недели: 0–6, вс = 0. Не указаны — правило работает каждый день.',
+  'Режим: priority — первый доступный корт по приоритету (по умолчанию);',
+  'all — бронировать КАЖДЫЙ появившийся корт набора (лишнее отменишь руками).',
+  'Обычный путь — кнопка «⏰ Расписание»; команда осталась админским фолбэком.',
 ].join('\n');
 
 const PROFILE_ID_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
@@ -52,11 +60,23 @@ export interface AddProfileInput {
   telegramChatId: string | null;
 }
 
+/**
+ * Режим сценария (колонка schedule_rules.mode):
+ *  - 'priority' — корты это приоритетный список, бронируем ПЕРВЫЙ доступный;
+ *  - 'all' — корты это НАБОР, бронируем каждый появившийся (клуб держит
+ *    вечерние Padel 2/3, поэтому пак 20:00+21:00 ловится вахтой по набору).
+ */
+export type RuleMode = 'priority' | 'all';
+
+export const RULE_MODES: readonly RuleMode[] = ['priority', 'all'];
+
 export interface AddRuleInput {
   profileId: string;
   times: string[];
   courts: string[];
   daysOfWeek: number[] | null;
+  /** null — поле не указано: у существующего правила режим сохраняется как был. */
+  mode: RuleMode | null;
 }
 
 function splitFields(raw: string): string[] {
@@ -116,14 +136,14 @@ export function parseAddProfile(raw: string): ParseResult<AddProfileInput> {
   };
 }
 
-/** `/add_rule profile_id;20:00,21:00;Padel Court 3,Padel Court 2[;1,2,3]`. */
+/** `/add_rule profile_id;20:00,21:00;Padel Court 3,Padel Court 4[;1,2,3][;all]`. */
 export function parseAddRule(raw: string): ParseResult<AddRuleInput> {
   const text = raw.trim();
   if (text === '') return fail(`Нужны аргументы.\n${ADD_RULE_USAGE}`);
 
   const parts = splitFields(text);
-  if (parts.length < 3 || parts.length > 4) {
-    return fail(`Ожидалось 3–4 поля через «;», получено ${parts.length}.\n${ADD_RULE_USAGE}`);
+  if (parts.length < 3 || parts.length > 5) {
+    return fail(`Ожидалось 3–5 полей через «;», получено ${parts.length}.\n${ADD_RULE_USAGE}`);
   }
 
   const profileId = (parts[0] ?? '').toLowerCase();
@@ -169,7 +189,17 @@ export function parseAddRule(raw: string): ParseResult<AddRuleInput> {
     daysOfWeek = days.sort((a, b) => a - b);
   }
 
-  return { ok: true, value: { profileId, times, courts, daysOfWeek } };
+  // Режим необязателен. Не указан — null: перезапуск команды без этого поля не
+  // должен молча разжаловать сценарий из 'all' обратно в 'priority'.
+  const modeRaw = (parts[4] ?? '').toLowerCase();
+  let mode: RuleMode | null = null;
+  if (modeRaw !== '') {
+    if (modeRaw === 'priority' || modeRaw === 'p') mode = 'priority';
+    else if (modeRaw === 'all' || modeRaw === 'a') mode = 'all';
+    else return fail(`Режим «${modeRaw}» неизвестен: priority (по приоритету) или all (все появившиеся).`);
+  }
+
+  return { ok: true, value: { profileId, times, courts, daysOfWeek, mode } };
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +221,12 @@ export type Callback =
   | { kind: 'cancel-confirm'; bookingId: string }
   | { kind: 'skip-toggle'; date: string }
   | { kind: 'rule-toggle'; ruleId: string }
+  // Конструктор сценариев расписания: список, правка, удаление и шаги мастера.
+  | { kind: 'rules-list' }
+  | { kind: 'rule-edit'; ruleId: string }
+  | { kind: 'rule-delete-ask'; ruleId: string }
+  | { kind: 'rule-delete'; ruleId: string }
+  | { kind: 'rule-wizard'; step: RuleStep; draft: RuleDraft }
   | { kind: 'close' }
   | { kind: 'noop' };
 
@@ -212,7 +248,95 @@ export const CB_PREFIXES = {
   book: 'bk',
   cancel: 'cx',
   rule: 'rule',
+  /** Конструктор сценариев расписания (rule wizard). */
+  rules: 'rw',
 } as const;
+
+// ---------------------------------------------------------------------------
+// Битмаски мультивыбора (мастер расписаний)
+// ---------------------------------------------------------------------------
+
+/** Дни недели: бит N = день N (вс = 0). */
+export const DAYS_MASK_MAX = 0x7f;
+/** Времена: бит H = слот часа H. 24 бита — весь возможный диапазон суток. */
+export const TIMES_MASK_MAX = 0xff_ffff;
+/** Корты: бит N = индекс в BOOKABLE_COURTS (шесть кортов клуба). */
+export const COURTS_MASK_MAX = 0x3f;
+
+/** Маска в hex без ведущих нулей: '0' | '7f' | 'ffffff'. */
+export function encodeMask(mask: number): string {
+  if (!Number.isInteger(mask) || mask < 0 || mask > TIMES_MASK_MAX) {
+    throw new RangeError(`битмаска «${mask}» вне диапазона 0..${TIMES_MASK_MAX}`);
+  }
+  return mask.toString(16);
+}
+
+/** null — не hex, пусто или бит вне разрешённого диапазона (чужая/битая кнопка). */
+export function decodeMask(raw: string | undefined, max: number): number | null {
+  if (raw === undefined || !/^[0-9a-f]{1,6}$/i.test(raw)) return null;
+  const value = Number.parseInt(raw, 16);
+  return value > max ? null : value;
+}
+
+/** Номера установленных битов по возрастанию: 0b1010 -> [1, 3]. */
+export function bitsOf(mask: number): number[] {
+  const out: number[] = [];
+  for (let bit = 0; bit < 24; bit += 1) {
+    if ((mask & (1 << bit)) !== 0) out.push(bit);
+  }
+  return out;
+}
+
+/** Переключение одной галочки мультивыбора. */
+export function toggleBit(mask: number, bit: number): number {
+  return mask ^ (1 << bit);
+}
+
+export function maskOfBits(bits: Iterable<number>): number {
+  let mask = 0;
+  for (const bit of bits) {
+    if (Number.isInteger(bit) && bit >= 0 && bit < 24) mask |= 1 << bit;
+  }
+  return mask;
+}
+
+// ---------------------------------------------------------------------------
+// Черновик сценария расписания
+// ---------------------------------------------------------------------------
+
+/**
+ * Состояние мастера целиком: три битмаски, режим и id редактируемого сценария
+ * (null — создаём новый). Никакого server-side state: это ровно то, что едет
+ * в callback_data каждой кнопки мастера.
+ */
+export interface RuleDraft {
+  days: number;
+  times: number;
+  courts: number;
+  mode: RuleMode;
+  /** null — новый сценарий; иначе правим существующий (владение проверяет хендлер). */
+  ruleId: string | null;
+}
+
+export const EMPTY_RULE_DRAFT: RuleDraft = { days: 0, times: 0, courts: 0, mode: 'priority', ruleId: null };
+
+/** Шаги мастера: дни → времена → корты → режим → подтверждение → запись. */
+export type RuleStep = 'days' | 'times' | 'courts' | 'mode' | 'confirm' | 'save';
+
+const RULE_STEP_CODE: Record<RuleStep, string> = {
+  days: 'd',
+  times: 't',
+  courts: 'c',
+  mode: 'm',
+  confirm: 'y',
+  save: 's',
+};
+
+const RULE_STEP_BY_CODE = new Map<string, RuleStep>(
+  (Object.entries(RULE_STEP_CODE) as [RuleStep, string][]).map(([step, code]) => [code, step]),
+);
+
+const MODE_CODE: Record<RuleMode, string> = { priority: 'p', all: 'a' };
 
 /**
  * Страховка от «кнопка молча не работает»: Telegram отвергает callback_data
@@ -249,6 +373,70 @@ export const cbCancelConfirm = (bookingId: string): string => cb(`cx${SEP}y${SEP
 export const cbSkip = (date: string): string => cb(`${SKIP_CB_PREFIX}${date}`);
 export const cbRuleToggle = (ruleId: string): string => cb(`${CB_PREFIXES.rule}${SEP}${ruleId}`);
 
+/**
+ * Кнопки конструктора сценариев.
+ *
+ * Худший случай — шаг мастера с id правки: 'rw~c~7f~ffffff~3f~a~' + uuid(36)
+ * = 56 байт при лимите 64. Запас съел бы только id длиннее uuid — на такой
+ * cb() бросит RangeError, и это правильно: молча мёртвая кнопка хуже.
+ */
+export const cbRulesList = (): string => cb(`${CB_PREFIXES.rules}${SEP}l`);
+export const cbRuleEdit = (ruleId: string): string => cb(`${CB_PREFIXES.rules}${SEP}ed${SEP}${ruleId}`);
+export const cbRuleDeleteAsk = (ruleId: string): string => cb(`${CB_PREFIXES.rules}${SEP}rm${SEP}${ruleId}`);
+export const cbRuleDelete = (ruleId: string): string => cb(`${CB_PREFIXES.rules}${SEP}ok${SEP}${ruleId}`);
+
+export function cbRuleWizard(step: RuleStep, draft: RuleDraft): string {
+  const fields = [
+    CB_PREFIXES.rules,
+    RULE_STEP_CODE[step],
+    encodeMask(draft.days),
+    encodeMask(draft.times),
+    encodeMask(draft.courts),
+    MODE_CODE[draft.mode],
+    draft.ruleId ?? '',
+  ];
+  return cb(fields.join(SEP));
+}
+
+/**
+ * Ветка 'rw': либо действие над готовым сценарием (список/правка/удаление,
+ * 2–3 поля), либо шаг мастера с черновиком (ровно 7 полей). Коды шагов и коды
+ * действий не пересекаются, поэтому спутать их нельзя.
+ */
+function parseRulesCallback(parts: string[]): Callback | null {
+  const code = parts[1];
+  if (code === undefined) return null;
+
+  if (code === 'l') return parts.length === 2 ? { kind: 'rules-list' } : null;
+
+  if (code === 'ed' || code === 'rm' || code === 'ok') {
+    const ruleId = parts[2];
+    if (parts.length !== 3 || ruleId === undefined || !RULE_ID_RE.test(ruleId)) return null;
+    if (code === 'ed') return { kind: 'rule-edit', ruleId };
+    if (code === 'rm') return { kind: 'rule-delete-ask', ruleId };
+    return { kind: 'rule-delete', ruleId };
+  }
+
+  const step = RULE_STEP_BY_CODE.get(code);
+  if (step === undefined || parts.length !== 7) return null;
+
+  const days = decodeMask(parts[2], DAYS_MASK_MAX);
+  const times = decodeMask(parts[3], TIMES_MASK_MAX);
+  const courts = decodeMask(parts[4], COURTS_MASK_MAX);
+  if (days === null || times === null || courts === null) return null;
+
+  const modeCode = parts[5];
+  const mode: RuleMode | null = modeCode === 'p' ? 'priority' : modeCode === 'a' ? 'all' : null;
+  if (mode === null) return null;
+
+  // Пустой хвост — новый сценарий. Непустой обязан выглядеть как id: сам по
+  // себе он ничего не доказывает, владение проверяет хендлер.
+  const idRaw = parts[6] ?? '';
+  if (idRaw !== '' && !RULE_ID_RE.test(idRaw)) return null;
+
+  return { kind: 'rule-wizard', step, draft: { days, times, courts, mode, ruleId: idRaw === '' ? null : idRaw } };
+}
+
 function courtIndexOrNull(raw: string | undefined): number | null {
   if (raw === undefined || !/^\d{1,2}$/.test(raw)) return null;
   return Number(raw);
@@ -277,6 +465,8 @@ export function parseCallbackData(data: string): Callback | null {
       ? { kind: 'rule-toggle', ruleId }
       : null;
   }
+
+  if (head === CB_PREFIXES.rules) return parseRulesCallback(parts);
 
   if (head === CB_PREFIXES.cancel) {
     const bookingId = parts[2];

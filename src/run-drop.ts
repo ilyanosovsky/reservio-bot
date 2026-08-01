@@ -2,7 +2,7 @@
  * CLI для ручных боевых прогонов дропа брони (фаза 2, вне cron).
  *
  * Запуск:
- *   npx tsx src/run-drop.ts --profile ilya --date 2026-08-06 --time 20:00 [--live] [--court "Padel Court 3"]
+ *   npx tsx src/run-drop.ts --profile ilya --date 2026-08-06 --time 20:00 [--live] [--courts "Padel Court 3,Padel Court 4"] [--all]
  *
  * Без --live — DRY-RUN: движок работает по-настоящему (polling, ожидание окна,
  * идемпотентность), но вместо реального POST createBooking логируется
@@ -19,7 +19,11 @@
  * создают ДВА реальных бронирования на один слот. --sqlite — аварийный выход
  * на локальный файл, когда Supabase недоступен (защиты от дубля тогда нет).
  *
- * --court переопределяет приоритет кортов профиля на один-единственный корт.
+ * --court переопределяет набор кортов профиля на один-единственный корт,
+ * --courts — на произвольный список через запятую (порядок = приоритет).
+ * --all включает режим вечерней вахты: бронировать КАЖДЫЙ появившийся корт
+ * набора, а не только первый (клуб держит C2/C3 на 20–22, в дроп выходит то
+ * один корт, то другой — лишнее отменяется руками).
  * --force снимает проверку дня недели из правила профиля.
  */
 
@@ -30,7 +34,7 @@ import { loadProfiles, ruleAppliesOn, type Profile } from './core/profiles.js';
 import type { StateStore } from './core/state.js';
 import { SqliteStateStore } from './core/state-sqlite.js';
 import { SupabaseStateStore } from './core/state-supabase.js';
-import { bookSlotDrop, type EngineDeps, type DropReport } from './core/booking-engine.js';
+import { bookSlotDrop, type DropMode, type EngineDeps, type DropReport } from './core/booking-engine.js';
 import { dropDayOf, dropWatchWindow, tbilisiStamp, weekdayOf } from './core/scheduler.js';
 
 // мини-загрузчик .env (тот же паттерн, что в spike-reservio.ts — без зависимостей)
@@ -59,8 +63,12 @@ const PROFILE_ID = opt('--profile', 'ilya')!;
 const DATE = opt('--date');
 const TIME = opt('--time');
 const COURT_OVERRIDE = opt('--court');
+/** Список кортов через запятую: порядок = приоритет (в режиме --all — просто набор вахты). */
+const COURTS_OVERRIDE = opt('--courts');
 const LIVE = flag('--live');
 const FORCE = flag('--force');
+/** Вечерняя вахта: бронировать каждый появившийся корт набора, а не только первый. */
+const MODE: DropMode = flag('--all') ? 'all' : 'priority';
 /** Аварийный выход на локальный файл, когда Supabase настроен, но недоступен. */
 const FORCE_SQLITE = flag('--sqlite');
 
@@ -73,7 +81,10 @@ const MAX_WAIT_MS = 24 * 60 * 60 * 1000;
 const WEEKDAY_NAMES = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 
 if (!DATE || !TIME) {
-  console.error('Использование: npx tsx src/run-drop.ts --profile ilya --date YYYY-MM-DD --time HH:MM [--live] [--court "Padel Court 3"] [--force] [--sqlite]');
+  console.error(
+    'Использование: npx tsx src/run-drop.ts --profile ilya --date YYYY-MM-DD --time HH:MM ' +
+      '[--live] [--court "Padel Court 3"] [--courts "Padel Court 3,Padel Court 4"] [--all] [--force] [--sqlite]',
+  );
   process.exit(1);
 }
 // после проверки выше DATE/TIME гарантированно string; process.exit(1) имеет тип
@@ -129,8 +140,8 @@ async function openState(profileId: string, date: string, time: string): Promise
   const state = new SupabaseStateStore({ url, serviceKey: key, timeoutMs: 1_500 });
   try {
     // Пробное чтение до окна: «нет таблицы» / «не тот ключ» должны всплыть
-    // сейчас, а не в секунду дропа.
-    await state.getBooking(profileId, date, time);
+    // сейчас, а не в секунду дропа. Читаем весь слот: пробе не нужен корт.
+    await state.listBookingsForSlot(profileId, date, time);
   } catch (err) {
     throw new Error(
       `state: Supabase недоступен — ${err instanceof Error ? err.message : String(err)}. ` +
@@ -144,7 +155,11 @@ async function openState(profileId: string, date: string, time: string): Promise
 
 async function main(date: string, time: string): Promise<void> {
   console.log(`\n=== run-drop: режим ${LIVE ? 'LIVE (реальная бронь!)' : 'DRY-RUN (без реального POST)'} ===`);
-  console.log(`    profile=${PROFILE_ID} date=${date} time=${time}${COURT_OVERRIDE ? ` court=${COURT_OVERRIDE}` : ''}\n`);
+  console.log(
+    `    profile=${PROFILE_ID} date=${date} time=${time}` +
+      `${COURT_OVERRIDE ? ` court=${COURT_OVERRIDE}` : ''}${COURTS_OVERRIDE ? ` courts=${COURTS_OVERRIDE}` : ''}` +
+      ` mode=${MODE === 'all' ? 'all (бронируем все появившиеся корты)' : 'priority (первый по приоритету)'}\n`,
+  );
 
   const profiles = loadProfiles(process.env);
   const profile = profiles.find((p) => p.id === PROFILE_ID);
@@ -163,9 +178,21 @@ async function main(date: string, time: string): Promise<void> {
     log(`ВНИМАНИЕ: ${date} (${day}) вне дней профиля (${allowed}), но задан --force — продолжаем`);
   }
 
-  const withCourts: Profile = COURT_OVERRIDE
-    ? { ...profile, rule: { ...profile.rule, courts: [COURT_OVERRIDE] } }
-    : profile;
+  // --courts бьёт --court: список явнее одиночного корта, а молча смешивать их
+  // нельзя — человек должен видеть ровно тот набор, который написал.
+  const courtsOverride = COURTS_OVERRIDE
+    ? COURTS_OVERRIDE.split(',')
+        .map((c) => c.trim())
+        .filter((c) => c !== '')
+    : COURT_OVERRIDE
+      ? [COURT_OVERRIDE]
+      : null;
+  if (COURTS_OVERRIDE && courtsOverride !== null && courtsOverride.length === 0) {
+    console.error('✗ --courts пуст после разбора: ожидается список имён кортов через запятую.');
+    process.exit(2);
+  }
+  const withCourts: Profile =
+    courtsOverride === null ? profile : { ...profile, rule: { ...profile.rule, courts: courtsOverride } };
   // DRY пишет state под отдельным id — иначе фиктивная бронь заняла бы боевой
   // ключ (profile, date, time) и настоящий прогон вышел бы с AlreadyBooked.
   const effectiveProfile: Profile = LIVE
@@ -216,16 +243,29 @@ async function main(date: string, time: string): Promise<void> {
 
   await waitForWindowStart(start);
 
-  const report: DropReport = await bookSlotDrop(effectiveProfile, { date, time }, deps);
+  const report: DropReport = await bookSlotDrop(
+    effectiveProfile,
+    { date, time, courts: effectiveProfile.rule.courts, mode: MODE },
+    deps,
+  );
 
   console.log('\n--- Результат ---');
   console.log(report.ok ? '✅ УСПЕХ' : `✗ НЕУДАЧА (${report.error?.kind ?? 'unknown'})`);
+  // По кортам — построчно: в режиме --all за один дроп бывает несколько броней
+  // и несколько промахов сразу, из корневых полей отчёта этого не видно.
+  for (const r of report.results) {
+    const speed = r.msFromSeenToBooked === undefined ? '' : ` за ${r.msFromSeenToBooked} мс`;
+    console.log(r.ok ? `   ✅ ${r.court}: ${r.bookingId}${speed}` : `   ✗ ${r.court}: ${r.error ?? 'брони нет'}`);
+  }
 
   // token — guest-ключ к брони (чтение + отмена), в stdout ему не место.
   // Если он доехал до state — печатаем только факт; если нет, показываем как
   // последний след брони.
-  const stored = await state.getBooking(effectiveProfile.id, date, time);
-  const tokenInState = stored?.bookingId === report.bookingId && (stored?.token ?? '') !== '';
+  // Ключ state включает корт, а корт брони известен только из отчёта — поэтому
+  // ищем свою строку среди всех броней слота по bookingId.
+  const slotRows = await state.listBookingsForSlot(effectiveProfile.id, date, time);
+  const stored = slotRows.find((b) => b.bookingId === report.bookingId);
+  const tokenInState = stored !== undefined && (stored.token ?? '') !== '';
   const printable: DropReport = report.token
     ? { ...report, token: tokenInState ? `<сохранён в ${stateWhere}>` : report.token }
     : report;

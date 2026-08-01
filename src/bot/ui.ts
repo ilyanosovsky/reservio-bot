@@ -79,6 +79,56 @@ export function confirmKeyboard(
   return withBack(new InlineKeyboard().text(yesLabel, yesData).text('↩️ Отмена', noData), backData);
 }
 
+// ---------------------------------------------------------------------------
+// Мультивыбор (мастер расписаний)
+// ---------------------------------------------------------------------------
+
+/** Галочки мультивыбора. Пустой квадрат виден и в светлой, и в тёмной теме. */
+export const CHECK_ON = '☑️';
+export const CHECK_OFF = '▫️';
+
+export function checkLabel(text: string, checked: boolean): string {
+  return `${checked ? CHECK_ON : CHECK_OFF} ${text}`;
+}
+
+export interface CheckItem {
+  text: string;
+  data: string;
+  checked: boolean;
+}
+
+/** Кнопка хвоста мультивыбора: «Готово», «каждый день», «Назад» и т.п. */
+export interface TailButton {
+  text: string;
+  data: string;
+}
+
+/**
+ * Клавиатура мультивыбора: отмеченные пункты по `perRow` в ряд, затем хвостовые
+ * ряды (каждый — отдельный ряд). Состояния мастера на сервере нет: каждая
+ * кнопка уже несёт СЛЕДУЮЩИЙ черновик, поэтому клавиатура — чистая функция.
+ */
+export function multiSelectKeyboard(
+  items: readonly CheckItem[],
+  perRow: number,
+  tail: readonly TailButton[][] = [],
+): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  const width = Math.max(1, perRow);
+  items.forEach((item, i) => {
+    kb.text(checkLabel(item.text, item.checked), item.data);
+    if ((i + 1) % width === 0) kb.row();
+  });
+  const rows = kb.inline_keyboard;
+  while (rows.length > 0 && (rows[rows.length - 1]?.length ?? 0) === 0) rows.pop();
+  for (const row of tail) {
+    if (row.length === 0) continue;
+    kb.row();
+    for (const button of row) kb.text(button.text, button.data);
+  }
+  return kb;
+}
+
 /** Гасит спиннер на кнопке. Никогда не бросает: протухший callback — норма. */
 export async function answer(ctx: BotContext, text?: string): Promise<void> {
   try {

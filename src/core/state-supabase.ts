@@ -15,8 +15,14 @@ import type { StateStore, StoredBooking } from './state.js';
 const DEFAULT_TIMEOUT_MS = 5_000;
 const TABLE = 'bookings';
 const COLUMNS = 'profile_id,date,time,court,booking_id,token,state,created_at';
-/** Ключ дедупликации слота — тот же, что уникальный индекс в схеме. */
-const CONFLICT_TARGET = 'profile_id,date,time';
+/**
+ * Ключ дедупликации слота — тот же, что уникальный индекс в схеме
+ * (bookings_profile_slot_court). Корт в ключе с 01.08.2026: на один час
+ * легитимны несколько броней на РАЗНЫХ кортах — см. state.ts.
+ */
+const CONFLICT_TARGET = 'profile_id,date,time,court';
+/** Миграция, вводящая этот ключ — на неё ссылается ошибка 42P10. */
+const MULTICOURT_MIGRATION = 'supabase/migrations/20260801110000_multicourt.sql';
 /** Кусок чужого текста в ошибке обрезаем: тело ответа может быть большим. */
 const ERROR_BODY_LIMIT = 300;
 
@@ -138,12 +144,13 @@ export class SupabaseStateStore implements StateStore {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
-  async getBooking(profileId: string, date: string, time: string): Promise<StoredBooking | null> {
+  async getBooking(profileId: string, date: string, time: string, court: string): Promise<StoredBooking | null> {
     const query = new URLSearchParams({
       select: COLUMNS,
       profile_id: `eq.${profileId}`,
       date: `eq.${date}`,
       time: `eq.${time}`,
+      court: `eq.${court}`,
       limit: '1',
     });
     const label = 'getBooking';
@@ -151,9 +158,23 @@ export class SupabaseStateStore implements StateStore {
     return rows.length === 0 ? null : fromRow(rows[0], label);
   }
 
+  async listBookingsForSlot(profileId: string, date: string, time: string): Promise<StoredBooking[]> {
+    const query = new URLSearchParams({
+      select: COLUMNS,
+      profile_id: `eq.${profileId}`,
+      date: `eq.${date}`,
+      time: `eq.${time}`,
+      order: 'court.asc',
+    });
+    const label = 'listBookingsForSlot';
+    const rows = this.expectRows(await this.request({ method: 'GET', query, label }), label);
+    return rows.map((row) => fromRow(row, label));
+  }
+
   async saveBooking(b: StoredBooking): Promise<void> {
-    // upsert по уникальному индексу слота: повторная бронь того же слота
-    // перезаписывает строку, а не плодит дубль (семантика INSERT OR REPLACE).
+    // upsert по уникальному индексу слот+корт: повторная бронь того же корта на
+    // тот же час перезаписывает строку, а не плодит дубль (семантика INSERT OR
+    // REPLACE); другой корт того же часа — отдельная строка, так и задумано.
     const query = new URLSearchParams({ on_conflict: CONFLICT_TARGET });
     const label = 'saveBooking';
     const rows = this.expectRows(
@@ -177,7 +198,9 @@ export class SupabaseStateStore implements StateStore {
   }
 
   async listBookings(profileId?: string): Promise<StoredBooking[]> {
-    const query = new URLSearchParams({ select: COLUMNS, order: 'date.asc,time.asc' });
+    // Корт в order: на один час бывает несколько броней, без него порядок
+    // между ними определяет Postgres, и списки в боте «прыгают».
+    const query = new URLSearchParams({ select: COLUMNS, order: 'date.asc,time.asc,court.asc' });
     if (profileId !== undefined) query.set('profile_id', `eq.${profileId}`);
     const label = 'listBookings';
     const rows = this.expectRows(await this.request({ method: 'GET', query, label }), label);
@@ -256,6 +279,15 @@ export class SupabaseStateStore implements StateStore {
       return new SupabaseStateError(
         `Таблица "${TABLE}" не найдена в Supabase — выполни DDL из docs/supabase-schema.sql в SQL Editor ` +
           `(если таблица есть, обнови кэш схемы: notify pgrst, 'reload schema') [${label}]`,
+        { status, code },
+      );
+    }
+    // Нет уникального индекса под on_conflict: старая схема без корта в ключе.
+    // Без подсказки это выглядит как «бронь не сохранилась, и непонятно почему».
+    if (code === '42P10') {
+      return new SupabaseStateError(
+        `Уникального индекса (${CONFLICT_TARGET}) в таблице "${TABLE}" нет — применена ли миграция ` +
+          `${MULTICOURT_MIGRATION}? Без CLI: docs/supabase-schema.sql в SQL Editor [${label}]`,
         { status, code },
       );
     }

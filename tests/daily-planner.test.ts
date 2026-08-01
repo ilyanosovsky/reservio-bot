@@ -23,6 +23,7 @@ const {
   dropTriggerDelay,
   formatPreDropMessage,
   makeTriggerDrop,
+  mergePlannedDrops,
   ruleAppliesOnDate,
   runDailyPlanner,
   selectEligibleRules,
@@ -50,6 +51,7 @@ function rule(patch: Partial<PlannerRule> = {}): PlannerRule {
     courts: ['Padel Court 3', 'Padel Court 2'],
     daysOfWeek: null,
     enabled: true,
+    mode: 'priority',
     ...patch,
   };
 }
@@ -81,8 +83,66 @@ describe('dropTriggerDelay', () => {
 });
 
 describe('dropIdempotencyKey', () => {
-  it('формат drop-{profileId}-{date}-{time}', () => {
-    expect(dropIdempotencyKey('ilya', DATE, '20:00')).toBe('drop-ilya-2026-08-07-20:00');
+  it('формат drop-{profileId}-{date}-{time}-{ruleId}', () => {
+    expect(dropIdempotencyKey('ilya', DATE, '20:00', 'rule-1')).toBe('drop-ilya-2026-08-07-20:00-rule-1');
+  });
+
+  it('разные сценарии на один час дают РАЗНЫЕ ключи', () => {
+    // Ключ описывает НАБОР схлопнутых сценариев (mergePlannedDrops): изменился
+    // набор — изменился и ключ, иначе trigger.dev принял бы новый план за дубль
+    // старого и вечер отработал бы по вчерашним кортам.
+    const a = dropIdempotencyKey('ilya', DATE, '20:00', 'rule-1');
+    const b = dropIdempotencyKey('ilya', DATE, '20:00', 'rule-2');
+    expect(a).not.toBe(b);
+  });
+
+  it('ключ стабилен между ранами планировщика (защита от дубля не слабеет)', () => {
+    expect(dropIdempotencyKey('ilya', DATE, '20:00', 'rule-1')).toBe(dropIdempotencyKey('ilya', DATE, '20:00', 'rule-1'));
+  });
+});
+
+describe('mergePlannedDrops', () => {
+  const req = (patch: Partial<import('../src/trigger/daily-planner.js').DropRequest> = {}) => ({
+    profileId: 'ilya',
+    time: '20:00',
+    courts: ['Padel Court 3'],
+    mode: 'priority' as const,
+    ruleId: 'r1',
+    ...patch,
+  });
+
+  it('одна заявка проходит как есть', () => {
+    expect(mergePlannedDrops([req()])).toEqual([
+      { profileId: 'ilya', time: '20:00', courts: ['Padel Court 3'], mode: 'priority', ruleIds: ['r1'] },
+    ]);
+  });
+
+  it('общий (профиль, час): корты объединяются без дублей, порядок приоритета первого сохраняется', () => {
+    const merged = mergePlannedDrops([
+      req({ ruleId: 'r1', courts: ['Padel Court 3', 'Padel Court 4'] }),
+      req({ ruleId: 'r2', courts: ['Padel Court 4', 'Padel Court 1'] }),
+    ]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.courts).toEqual(['Padel Court 3', 'Padel Court 4', 'Padel Court 1']);
+    expect(merged[0]!.ruleIds).toEqual(['r1', 'r2']);
+  });
+
+  it('режим all побеждает: пропущенный корт не вернуть, лишнюю бронь отменить можно', () => {
+    expect(mergePlannedDrops([req({ ruleId: 'r1' }), req({ ruleId: 'r2', mode: 'all' })])[0]!.mode).toBe('all');
+    expect(mergePlannedDrops([req({ ruleId: 'r1', mode: 'all' }), req({ ruleId: 'r2' })])[0]!.mode).toBe('all');
+  });
+
+  it('разные часы и разные профили остаются отдельными дропами', () => {
+    const merged = mergePlannedDrops([
+      req({ time: '20:00' }),
+      req({ time: '21:00' }),
+      req({ profileId: 'anna', time: '20:00' }),
+    ]);
+    expect(merged.map((d) => [d.profileId, d.time])).toEqual([
+      ['ilya', '20:00'],
+      ['ilya', '21:00'],
+      ['anna', '20:00'],
+    ]);
   });
 });
 
@@ -99,6 +159,26 @@ describe('formatPreDropMessage', () => {
     const text = formatPreDropMessage({ label: 'A & <B>', date: DATE, times: ['20:00'], courts: ['C'] });
     expect(text).toContain('A &amp; &lt;B&gt;');
     expect(text).not.toContain('<B>');
+  });
+
+  it('режим all: корты перечислены без стрелки приоритета + предупреждение про лишние брони', () => {
+    // Стрелка «→» в этом режиме врала бы: бот берёт КАЖДЫЙ появившийся корт.
+    const text = formatPreDropMessage({
+      label: 'Ilya',
+      date: DATE,
+      times: ['20:00'],
+      courts: ['Padel Court 4', 'Padel Court 1'],
+      mode: 'all',
+    });
+    expect(text).toContain('Padel Court 4, Padel Court 1');
+    expect(text).not.toContain('→');
+    expect(text).toContain('отменишь вручную');
+  });
+
+  it('режим не задан — прежний текст с приоритетом (обратная совместимость)', () => {
+    const text = formatPreDropMessage({ label: 'Ilya', date: DATE, times: ['20:00'], courts: ['A', 'B'] });
+    expect(text).toContain('Корты (приоритет): A → B');
+    expect(text).not.toContain('отменишь вручную');
   });
 });
 
@@ -228,22 +308,100 @@ describe('runDailyPlanner', () => {
 
     expect(deps.triggerDropMock).toHaveBeenCalledTimes(2);
     const [payload1, opts1] = deps.triggerDropMock.mock.calls[0]!;
-    expect(payload1).toEqual({ profileId: 'ilya', date: DATE, time: '20:00', live: true, force: true });
+    // courts/mode обязаны быть в payload: без них book-drop.ts переспрашивает
+    // правило у БД по времени и на профиле с несколькими сценариями может
+    // выбрать чужой набор кортов.
+    expect(payload1).toEqual({
+      profileId: 'ilya',
+      date: DATE,
+      time: '20:00',
+      live: true,
+      force: true,
+      courts: ['Padel Court 3', 'Padel Court 2'],
+      mode: 'priority',
+    });
     expect(opts1).toEqual({
       delay: dropTriggerDelay(DAY_T, '20:00'),
-      idempotencyKey: 'drop-ilya-2026-08-07-20:00',
+      idempotencyKey: 'drop-ilya-2026-08-07-20:00-rule-1',
       // очередь на профиль: дропы разных людей на одну секунду не должны
       // выстраиваться в затылок друг другу (concurrencyLimit book-slot-drop = 1)
       concurrencyKey: 'ilya',
     });
 
     const [payload2, opts2] = deps.triggerDropMock.mock.calls[1]!;
-    expect(payload2).toEqual({ profileId: 'ilya', date: DATE, time: '21:00', live: true, force: true });
+    expect(payload2).toEqual({
+      profileId: 'ilya',
+      date: DATE,
+      time: '21:00',
+      live: true,
+      force: true,
+      courts: ['Padel Court 3', 'Padel Court 2'],
+      mode: 'priority',
+    });
     expect(opts2).toEqual({
       delay: dropTriggerDelay(DAY_T, '21:00'),
-      idempotencyKey: 'drop-ilya-2026-08-07-21:00',
+      idempotencyKey: 'drop-ilya-2026-08-07-21:00-rule-1',
       concurrencyKey: 'ilya',
     });
+  });
+
+  it('режим и корты сценария уезжают в payload как есть (вечерняя вахта)', async () => {
+    const rules = [rule({ id: 'watch', times: ['21:00'], courts: ['Padel Court 4', 'Padel Court 1'], mode: 'all' })];
+    const deps = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
+
+    await runDailyPlanner(deps, NOW);
+
+    const [payload] = deps.triggerDropMock.mock.calls[0]!;
+    expect(payload).toMatchObject({ time: '21:00', courts: ['Padel Court 4', 'Padel Court 1'], mode: 'all' });
+  });
+
+  it('два сценария профиля на ОДИН час схлопываются в ОДИН дроп с объединённым набором', async () => {
+    // Регрессия: раньше на такой час уезжали ДВА рана. У book-slot-drop
+    // concurrencyLimit 1 на concurrencyKey=profileId, поэтому второй ран ждал
+    // бы конца пятиминутного окна первого, приходил в закрытое окно, не делал
+    // ни одного getAvailability (корты второго сценария никто не сторожит) и
+    // присылал второй ❌-отчёт за вечер — при инварианте «ровно одно сообщение».
+    const rules = [
+      rule({ id: 'r-prio', times: ['20:00'], courts: ['Padel Court 3'], mode: 'priority' }),
+      rule({ id: 'r-all', times: ['20:00'], courts: ['Padel Court 4', 'Padel Court 1'], mode: 'all' }),
+    ];
+    const deps = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
+
+    const summary = await runDailyPlanner(deps, NOW);
+
+    expect(summary.dropsTriggered).toBe(1);
+    expect(deps.triggerDropMock).toHaveBeenCalledTimes(1);
+    const [payload, opts] = deps.triggerDropMock.mock.calls[0]!;
+    // Корты обоих сценариев в вахте, порядок приоритета первого — впереди.
+    expect(payload).toMatchObject({
+      time: '20:00',
+      courts: ['Padel Court 3', 'Padel Court 4', 'Padel Court 1'],
+      // 'all' просил хотя бы один сценарий: лишнюю бронь владелец отменит,
+      // пропущенный корт не вернуть.
+      mode: 'all',
+    });
+    // Ключ идемпотентности стабилен и включает оба сценария.
+    expect(opts.idempotencyKey).toBe('drop-ilya-2026-08-07-20:00-r-prio+r-all');
+  });
+
+  it('сценарии на РАЗНЫЕ часы не схлопываются, а сценарии разных профилей не смешиваются', async () => {
+    const rules = [
+      rule({ id: 'r1', profileId: 'ilya', times: ['20:00'], courts: ['Padel Court 3'] }),
+      rule({ id: 'r2', profileId: 'ilya', times: ['21:00'], courts: ['Padel Court 4'] }),
+      rule({ id: 'r3', profileId: 'anna', times: ['20:00'], courts: ['Padel Court 1'] }),
+    ];
+    const deps = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
+
+    const summary = await runDailyPlanner(deps, NOW);
+
+    expect(summary.dropsTriggered).toBe(3);
+    expect(
+      deps.triggerDropMock.mock.calls.map(([p]) => [p.profileId, p.time, p.courts]),
+    ).toEqual([
+      ['ilya', '20:00', ['Padel Court 3']],
+      ['ilya', '21:00', ['Padel Court 4']],
+      ['anna', '20:00', ['Padel Court 1']],
+    ]);
   });
 
   it('дропы разных профилей получают РАЗНЫЕ concurrencyKey', async () => {
