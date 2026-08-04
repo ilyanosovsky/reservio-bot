@@ -39,7 +39,17 @@
 //      ❌-отчёт каждый вечер.
 //      Триггерим с force:true: критерий «этот день недели ок» уже проверен
 //      здесь по данным Supabase (schedule_rules) — book-drop.ts второй раз
-//      сверяет это по правилу профиля и без force кинул бы отказ.
+//      сверяет это по правилу профиля и без force кинул бы отказ;
+//   5) записывает в settings.planner_last_plan список ПОСТАВЛЕННЫХ дропов
+//      ({date, at, slots:[{profileId,time}]}): по нему heartbeat в 22:12 сверяет
+//      квитанции. Живые schedule_rules для этого не годятся — владелец правит
+//      их и вечером (снятый в 21:00 скип на T+7 заставил бы сторожа ждать
+//      отчёты по дропам, которых никто не ставил);
+//   6) в конце УСПЕШНОГО рана ставит settings.planner_last_run = тбилисский
+//      stamp (у выключенного планировщика — он же с префиксом 'disabled@').
+//      По этой отметке heartbeat в 22:12 понимает, что cron сегодня реально
+//      тикнул: без неё «вечер не спланирован» никак не отличить от «всё
+//      спланировано, просто нечего было бронировать».
 //
 // Изоляция от src/core/repos.ts: он живёт в отдельном контракте фазы 3 и на
 // момент написания этого файла может ещё не существовать на диске (агенты
@@ -54,11 +64,21 @@
 
 import { idempotencyKeys, logger, schedules, tasks } from '@trigger.dev/sdk';
 import type { BookSlotDropPayload } from './book-drop.js';
-import { dropDayOf, slotStartISO, targetDate, weekdayOf } from '../core/scheduler.js';
+import { dropDayOf, slotStartISO, targetDate, tbilisiStamp, weekdayOf } from '../core/scheduler.js';
+// Ключи таблицы settings живут в ОДНОМ месте (core/heartbeat-logic.ts): их
+// читает сторож наблюдаемости, и разъехавшаяся строка означала бы, что вечер
+// планируется, а heartbeat считает планировщик мёртвым. Модуль чистый (тянет
+// только core/scheduler.js) — обвязке планировщика он ничего лишнего не приносит.
+import {
+  formatPlannerPlan,
+  PLANNER_DISABLED_PREFIX,
+  PLANNER_ENABLED_KEY,
+  PLANNER_ENABLED_VALUE,
+  PLANNER_LAST_PLAN_KEY,
+  PLANNER_LAST_RUN_KEY,
+} from '../core/heartbeat-logic.js';
 
-/** Ключ в таблице settings, которым планировщик включается/выключается. */
-const PLANNER_ENABLED_KEY = 'planner_enabled';
-const PLANNER_ENABLED_VALUE = 'true';
+export { PLANNER_DISABLED_PREFIX, PLANNER_LAST_PLAN_KEY, PLANNER_LAST_RUN_KEY };
 
 /** Сколько минут до конца часа H шлём book-slot-drop дню T: H:57:00 +04:00. */
 const TRIGGER_LEAD_MINUTES = 57;
@@ -104,7 +124,8 @@ export interface PlannerTriggerOptions {
 }
 
 export interface PlannerDeps {
-  settings: { get(key: string): Promise<string | null> };
+  /** set — только для отметки PLANNER_LAST_RUN_KEY (см. markPlannerRun). */
+  settings: { get(key: string): Promise<string | null>; set(key: string, value: string): Promise<void> };
   schedules: { listEnabled(): Promise<PlannerRule[]> };
   profiles: { getById(id: string): Promise<PlannerProfile | null> };
   skips: { isSkipped(profileId: string, date: string): Promise<boolean> };
@@ -258,6 +279,16 @@ export function selectEligibleRules(
   return out;
 }
 
+/**
+ * Значение отметки «планировщик отработал»: тбилисский stamp, а у выключенного
+ * планировщика — он же с префиксом 'disabled@'. Дата в отметке — дата ЗАПУСКА
+ * (день T), heartbeat сверяет именно её с сегодняшним днём.
+ */
+export function plannerLastRunValue(now: Date, enabled: boolean): string {
+  const stamp = tbilisiStamp(now);
+  return enabled ? stamp : `${PLANNER_DISABLED_PREFIX}${stamp}`;
+}
+
 function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -291,6 +322,59 @@ export function formatPreDropMessage(input: {
 // -------------------------- оркестрация (I/O) --------------------------
 
 /**
+ * Отметка «планировщик сегодня отработал» — best-effort: её отказ не имеет
+ * права уронить ран, который уже разослал сообщения и поставил дропы. Цена
+ * потерянной отметки — ложная тревога heartbeat'а, цена упавшего рана — вечер.
+ */
+async function markPlannerRun(deps: PlannerDeps, now: Date, enabled: boolean): Promise<void> {
+  try {
+    await deps.settings.set(PLANNER_LAST_RUN_KEY, plannerLastRunValue(now, enabled));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error(
+      `daily-planner: отметка ${PLANNER_LAST_RUN_KEY} не записана (${message}) — heartbeat решит, ` +
+        'что планировщик сегодня не отработал',
+    );
+  }
+}
+
+/**
+ * Записанный план вечера — то, ЧТО планировщик реально поставил. Читает его
+ * heartbeat в 22:12: без этой записи ему пришлось бы восстанавливать план из
+ * живых schedule_rules/skips, а владелец правит их и вечером (снял скип с даты
+ * T+7 после 20:30 — и сторож ждал бы квитанции по дропам, которых не было).
+ *
+ * В план попадают ВСЕ схлопнутые дропы, включая те, чей triggerDrop сорвался:
+ * несостоявшийся ран — ровно тот случай, о котором сторож обязан сказать вслух,
+ * а не тот, который надо от него спрятать.
+ *
+ * Best-effort, как и отметка планировщика: цена потерянной записи — запасной
+ * путь у сторожа, цена упавшего рана — вечер.
+ */
+async function markPlannerPlan(
+  deps: PlannerDeps,
+  date: string,
+  now: Date,
+  drops: readonly PlannedDrop[],
+): Promise<void> {
+  try {
+    await deps.settings.set(
+      PLANNER_LAST_PLAN_KEY,
+      formatPlannerPlan({
+        date,
+        at: tbilisiStamp(now),
+        slots: drops.map((d) => ({ profileId: d.profileId, time: d.time })),
+      }),
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error(
+      `daily-planner: план вечера не записан (${message}) — heartbeat будет восстанавливать его по живым правилам`,
+    );
+  }
+}
+
+/**
  * Собирает план на targetDate(now) и запускает его: pre-drop сообщения +
  * отложенные триггеры book-slot-drop. Ошибка на одном профиле не должна
  * остановить остальных — каждый профиль обрабатывается в своём try/catch.
@@ -307,6 +391,9 @@ export async function runDailyPlanner(deps: PlannerDeps, now: Date): Promise<Pla
   const plannerEnabled = await deps.settings.get(PLANNER_ENABLED_KEY);
   if (plannerEnabled !== PLANNER_ENABLED_VALUE) {
     logger.info('планировщик выключен');
+    // Выключенный планировщик тоже отработал: heartbeat не должен принимать
+    // осознанное «сегодня не бронируем» за несработавший cron.
+    await markPlannerRun(deps, now, false);
     return summary;
   }
   summary.enabled = true;
@@ -421,6 +508,16 @@ export async function runDailyPlanner(deps: PlannerDeps, now: Date): Promise<Pla
       brokenProfiles.add(drop.profileId);
     }
   }
+
+  // План пишем ПОСЛЕ постановки дропов и ДО отметки о ране: heartbeat сверяет
+  // квитанции именно с этим списком, а не с расписанием на момент своей проверки.
+  await markPlannerPlan(deps, date, now, drops);
+
+  // Отметка ставится в конце УСПЕШНОГО рана: если планировщик рухнул раньше
+  // (не отвечает Supabase, отвалился trigger.dev), отметки за сегодня не будет
+  // — и heartbeat в 22:12 скажет об этом вслух. Ошибки по отдельным профилям
+  // (summary.errors) отметке не мешают: ран как таковой отработал.
+  await markPlannerRun(deps, now, true);
 
   return summary;
 }

@@ -1,4 +1,5 @@
-// Тесты репозиториев бота (profiles / schedule_rules / skips / settings).
+// Тесты репозиториев бота (profiles / schedule_rules / skips / settings /
+// drop_reports).
 // Никаких сетевых запросов: fetch всегда замокан, к реальному Supabase тесты
 // не ходят (и не должны — ключа в CI нет). Проверяем то, что не ловится
 // типами: форму запроса к PostgREST (эндпоинт, фильтры, on_conflict, Prefer),
@@ -7,11 +8,13 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  DropReportsRepo,
   ProfilesRepo,
   SchedulesRepo,
   SettingsRepo,
   SkipsRepo,
   SupabaseRepoError,
+  type DropReportRow,
   type ProfileRow,
 } from '../src/core/repos.js';
 
@@ -20,6 +23,7 @@ const KEY = 'sb_secret_TESTKEY_do_not_leak';
 
 const PROFILE_SELECT = 'id,label,name,email,phone,telegram_chat_id,is_admin';
 const RULE_SELECT = 'id,profile_id,times,courts,days_of_week,enabled,mode,label';
+const DROP_REPORT_SELECT = 'profile_id,date,time,ok,telegram_ok,created_at';
 
 function profileRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -57,6 +61,30 @@ function ruleRow(overrides: Record<string, unknown> = {}): Record<string, unknow
     enabled: true,
     mode: 'priority',
     label: 'вечер',
+    ...overrides,
+  };
+}
+
+function dropReportRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    profile_id: 'ilya',
+    date: '2026-08-11',
+    time: '20:00',
+    ok: true,
+    telegram_ok: true,
+    created_at: '2026-08-04T20:59:03+04:00',
+    ...overrides,
+  };
+}
+
+function dropReport(overrides: Partial<DropReportRow> = {}): DropReportRow {
+  return {
+    profileId: 'ilya',
+    date: '2026-08-11',
+    time: '20:00',
+    ok: true,
+    telegramOk: true,
+    createdAt: '2026-08-04T20:59:03+04:00',
     ...overrides,
   };
 }
@@ -490,6 +518,89 @@ describe('SettingsRepo', () => {
     const call = calls[0]!;
     expect(call.params.get('on_conflict')).toBe('key');
     expect(call.body).toEqual({ key: 'planner_enabled', value: 'true' });
+  });
+});
+
+describe('DropReportsRepo', () => {
+  it('record: POST в свою таблицу, тело snake_case, без on_conflict', async () => {
+    // Без on_conflict специально: повторный ран того же слота обязан оставить
+    // ВТОРУЮ квитанцию, а не переписать первую (история вечеров).
+    const { fn, calls } = fetchStub(jsonRes([dropReportRow()], 201));
+    await new DropReportsRepo(opts(fn)).record(dropReport());
+
+    const call = calls[0]!;
+    expect(call.path).toBe('/rest/v1/drop_reports');
+    expect(call.method).toBe('POST');
+    expect(call.params.has('on_conflict')).toBe(false);
+    expect(call.headers['Prefer']).toContain('return=representation');
+    expect(call.body).toEqual(dropReportRow());
+    const keys = Object.keys(call.body as object);
+    expect(keys).not.toContain('telegramOk');
+    expect(keys).not.toContain('createdAt');
+  });
+
+  it('record: 2xx без строки в ответе — не считается успехом', async () => {
+    // Молча «записанная» квитанция хуже отсутствующей: heartbeat промолчал бы
+    // о вечере, которого не было.
+    const { fn } = fetchStub(jsonRes([], 201));
+    await expect(new DropReportsRepo(opts(fn)).record(dropReport())).rejects.toThrow(/не подтверждена/);
+  });
+
+  it('record: telegramOk=false уезжает как есть (отчёт не доставлен)', async () => {
+    const { fn, calls } = fetchStub(jsonRes([dropReportRow({ telegram_ok: false })], 201));
+    await new DropReportsRepo(opts(fn)).record(dropReport({ telegramOk: false, ok: false }));
+
+    expect(calls[0]!.body).toMatchObject({ ok: false, telegram_ok: false });
+  });
+
+  it('listForDate: eq. по дате игры, стабильный порядок, все нужные колонки', async () => {
+    const { fn, calls } = fetchStub(jsonRes([dropReportRow(), dropReportRow({ time: '21:00' })]));
+    const rows = await new DropReportsRepo(opts(fn)).listForDate('2026-08-11');
+
+    const call = calls[0]!;
+    expect(call.method).toBe('GET');
+    expect(call.params.get('date')).toBe('eq.2026-08-11');
+    expect(call.params.get('select')).toBe(DROP_REPORT_SELECT);
+    expect(call.params.get('order')).toBe('created_at.asc');
+    expect(rows).toEqual([dropReport(), dropReport({ time: '21:00' })]);
+  });
+
+  it('listForDate: квитанций нет -> пустой массив (heartbeat скажет «отчёта не было»)', async () => {
+    const { fn } = fetchStub(jsonRes([]));
+    expect(await new DropReportsRepo(opts(fn)).listForDate('2026-08-11')).toEqual([]);
+  });
+
+  it('флаги: всё, что не строго true, — false (heartbeat лучше разбудит зря)', async () => {
+    const { fn } = fetchStub(
+      jsonRes([
+        dropReportRow({ ok: null, telegram_ok: 'true' }),
+        dropReportRow({ ok: 1, telegram_ok: false }),
+      ]),
+    );
+    const rows = await new DropReportsRepo(opts(fn)).listForDate('2026-08-11');
+
+    expect(rows.map((r) => [r.ok, r.telegramOk])).toEqual([
+      [false, false],
+      [false, false],
+    ]);
+  });
+
+  it('битая колонка -> ошибка со ссылкой на СВОЮ миграцию, а не на bot_core', async () => {
+    const { fn } = fetchStub(jsonRes([dropReportRow({ created_at: 42 })]));
+    const err = await rejection(new DropReportsRepo(opts(fn)).listForDate('2026-08-11'));
+
+    expect(err.message).toMatch(/created_at/);
+    expect(err.message).toContain('20260804140000_heartbeat.sql');
+    expect(err.message).not.toContain('20260731110000_bot_core.sql');
+  });
+
+  it('нет таблицы (PGRST205) -> подсказка применить миграцию heartbeat', async () => {
+    const { fn } = fetchStub(
+      jsonRes({ code: 'PGRST205', message: "Could not find the table 'public.drop_reports' in the schema cache" }, 404),
+    );
+    await expect(new DropReportsRepo(opts(fn)).record(dropReport())).rejects.toThrow(
+      /20260804140000_heartbeat\.sql/,
+    );
   });
 });
 
