@@ -88,6 +88,35 @@ export async function showBookTimes(
   );
 }
 
+/**
+ * Экран подтверждения: текст + клавиатура, без отправки. Вынесен отдельно,
+ * потому что ведут к нему ДВА пути — мастер «📆 Бронировать» (правит своё
+ * сообщение) и свободный запрос (шлёт новое, handlers/free-query.ts). Экран и
+ * callback-схема при этом обязаны быть одни и те же: настоящую бронь создаёт
+ * только кнопка `bk~y` (doBook), и другого способа её создать в боте нет.
+ *
+ * null — корта с таким индексом нет (подделанная или устаревшая кнопка).
+ */
+export function bookingConfirmView(
+  date: string,
+  courtIndex: number,
+  time: string,
+): { text: string; keyboard: InlineKeyboard } | null {
+  const court = courtByIndex(courtIndex);
+  if (court === null) return null;
+  return {
+    text: formatBookingConfirm(date, time, court.name),
+    // Назад — к выбору времени той же даты и корта: showBookTimes сходит в
+    // availability заново, устаревший список времён не всплывёт.
+    keyboard: confirmKeyboard(
+      cbBookConfirm(date, courtIndex, time),
+      CB_CLOSE,
+      '✅ Бронировать',
+      cbBookCourt(date, courtIndex),
+    ),
+  };
+}
+
 export async function confirmBook(
   ctx: BotContext,
   _deps: BotDeps,
@@ -95,18 +124,12 @@ export async function confirmBook(
   courtIndex: number,
   time: string,
 ): Promise<void> {
-  const court = courtByIndex(courtIndex);
-  if (court === null) {
+  const view = bookingConfirmView(date, courtIndex, time);
+  if (view === null) {
     await edit(ctx, '⚠️ Неизвестный корт — открой «📆 Бронировать» заново.');
     return;
   }
-  await edit(
-    ctx,
-    formatBookingConfirm(date, time, court.name),
-    // Назад — к выбору времени той же даты и корта: showBookTimes сходит в
-    // availability заново, устаревший список времён не всплывёт.
-    confirmKeyboard(cbBookConfirm(date, courtIndex, time), CB_CLOSE, '✅ Бронировать', cbBookCourt(date, courtIndex)),
-  );
+  await edit(ctx, view.text, view.keyboard);
 }
 
 export async function doBook(
