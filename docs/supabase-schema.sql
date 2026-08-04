@@ -5,8 +5,9 @@
 --
 -- Тот же DDL лежит миграциями supabase/migrations/*.sql (для `supabase db push`):
 -- 20260730123000_bookings, 20260730140000_bookings_hardening,
--- 20260731110000_bot_core, 20260801110000_multicourt. Этот файл — источник
--- правды и путь без CLI; держать в синхроне, иначе схема разъедется с адаптером.
+-- 20260731110000_bot_core, 20260801110000_multicourt, 20260804140000_heartbeat.
+-- Этот файл — источник правды и путь без CLI; держать в синхроне, иначе схема
+-- разъедется с адаптером.
 --
 -- Читает/пишет только адаптер src/core/state-supabase.ts (PostgREST через fetch,
 -- ключ SUPABASE_SERVICE_ROLE_KEY). Пока таблицы нет, адаптер кидает ошибку со
@@ -131,6 +132,15 @@ create table if not exists public.skips (
 
 -- Глобальные флаги бота. Ключ planner_enabled='true' — единственный способ
 -- включить автоматический планировщик (фаза 4, по явному одобрению пользователя).
+-- Остальные ключи (пишет код, руками трогать не нужно):
+--   planner_last_run     — 'YYYY-MM-DDTHH:MM:SS.mmm+04:00' конца рана планировщика,
+--                          с префиксом 'disabled@', если он отработал выключенным;
+--   planner_last_plan    — JSON {date, at, slots:[{profileId,time}]}: дропы,
+--                          которые планировщик реально поставил (сверяет heartbeat);
+--   bot_alive_at         — отметка живости процесса бота (раз в 5 минут);
+--   bot_alive_required   — 'true' включает проверку живости бота в heartbeat;
+--                          ставится ВРУЧНУЮ вместе с хостингом бота
+--                          (docs/wiki/Runbook.md -> «Heartbeat»).
 create table if not exists public.settings (
   key   text primary key,
   value text not null
@@ -147,6 +157,37 @@ revoke all on table public.profiles       from anon, authenticated;
 revoke all on table public.schedule_rules from anon, authenticated;
 revoke all on table public.skips          from anon, authenticated;
 revoke all on table public.settings       from anon, authenticated;
+
+-- ===========================================================================
+-- Heartbeat (фаза 4). Тот же DDL лежит миграцией
+-- supabase/migrations/20260804140000_heartbeat.sql — держать файлы в синхроне.
+-- Читает/пишет только src/core/repos.ts (DropReportsRepo).
+-- ===========================================================================
+
+-- Квитанция о вечернем отчёте. Инвариант CLAUDE.md: каждый вечер уходит ровно
+-- одно сообщение о дропе, молчаливый провал — худший баг проекта. Изнутри рана
+-- «сообщение ушло» не проверить: если ран не стартовал вовсе (умер воркер, не
+-- сработал планировщик), рассказать об этом некому. Поэтому каждый ран
+-- book-slot-drop оставляет здесь квитанцию, а таск heartbeat в 22:12 Тбилиси
+-- сверяет квитанции с планом вечера и будит админов, если чего-то нет.
+create table if not exists public.drop_reports (
+  id          uuid primary key default gen_random_uuid(),
+  -- Без внешнего ключа на profiles специально: DRY-прогоны пишут квитанцию под
+  -- id с суффиксом ':dry' (см. book-drop.ts), а такого профиля в profiles нет.
+  profile_id  text not null,
+  "date"      text not null,           -- YYYY-MM-DD, дата игры в Asia/Tbilisi
+  "time"      text not null,           -- HH:MM, начало слота
+  ok          boolean not null,        -- исход дропа: бронь есть / брони нет
+  telegram_ok boolean not null,        -- отчёт РЕАЛЬНО доставлен в Telegram
+  created_at  text not null default to_char(now() at time zone 'Asia/Tbilisi', 'YYYY-MM-DD"T"HH24:MI:SS"+04:00"')
+);
+
+-- Heartbeat читает квитанции ровно одним запросом «за дату игры». Уникальности
+-- нет намеренно: повторный ран (Replay) оставляет ВТОРУЮ квитанцию.
+create index if not exists drop_reports_date_idx on public.drop_reports ("date");
+
+alter table public.drop_reports enable row level security;
+revoke all on table public.drop_reports from anon, authenticated;
 
 -- PostgREST кэширует схему; в Supabase кэш обновляется сам, но если сразу после
 -- Run адаптер жалуется на PGRST205 "Could not find the table" — выполнить это:

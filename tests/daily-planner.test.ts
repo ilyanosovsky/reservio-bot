@@ -6,6 +6,7 @@
 // tasks.trigger.
 import { describe, expect, it, vi } from 'vitest';
 import { weekdayOf } from '../src/core/scheduler.js';
+import { parsePlannerPlan } from '../src/core/heartbeat-logic.js';
 
 // dailyPlannerTask регистрируется через schedules.task при импорте модуля —
 // подменяем SDK на «верни конфиг как есть», как в tests/book-drop.test.ts.
@@ -24,6 +25,10 @@ const {
   formatPreDropMessage,
   makeTriggerDrop,
   mergePlannedDrops,
+  PLANNER_DISABLED_PREFIX,
+  PLANNER_LAST_PLAN_KEY,
+  PLANNER_LAST_RUN_KEY,
+  plannerLastRunValue,
   ruleAppliesOnDate,
   runDailyPlanner,
   selectEligibleRules,
@@ -242,28 +247,40 @@ describe('selectEligibleRules', () => {
 
 type SendPreDropMock = ReturnType<typeof vi.fn<PlannerDeps['sendPreDrop']>>;
 type TriggerDropMock = ReturnType<typeof vi.fn<PlannerDeps['triggerDrop']>>;
+type SettingsSetMock = ReturnType<typeof vi.fn<PlannerDeps['settings']['set']>>;
 
-function fakeDeps(overrides: Partial<PlannerDeps> = {}): PlannerDeps & {
+/**
+ * settings в overrides можно задавать частично (обычно нужен только get):
+ * недостающий set подставляется моком, иначе каждый тест про выключенный
+ * планировщик тащил бы за собой заглушку отметки planner_last_run.
+ */
+type DepsOverrides = Partial<Omit<PlannerDeps, 'settings'>> & { settings?: Partial<PlannerDeps['settings']> };
+
+function fakeDeps(overrides: DepsOverrides = {}): PlannerDeps & {
   sendPreDropMock: SendPreDropMock;
   triggerDropMock: TriggerDropMock;
+  settingsSetMock: SettingsSetMock;
 } {
   const sendPreDropMock: SendPreDropMock = vi.fn<PlannerDeps['sendPreDrop']>();
   sendPreDropMock.mockImplementation(overrides.sendPreDrop ?? (async () => true));
   const triggerDropMock: TriggerDropMock = vi.fn<PlannerDeps['triggerDrop']>();
   triggerDropMock.mockImplementation(overrides.triggerDrop ?? (async () => undefined));
+  const settingsSetMock: SettingsSetMock = vi.fn<PlannerDeps['settings']['set']>();
+  settingsSetMock.mockImplementation(overrides.settings?.set ?? (async () => undefined));
 
   const deps: PlannerDeps = {
-    settings: { get: vi.fn(async () => 'true') },
     schedules: { listEnabled: vi.fn(async () => [rule()]) },
     profiles: { getById: vi.fn(async (id: string) => profile({ id })) },
     skips: { isSkipped: vi.fn(async () => false) },
     ...overrides,
+    settings: { get: overrides.settings?.get ?? vi.fn(async () => 'true'), set: settingsSetMock },
     sendPreDrop: sendPreDropMock,
     triggerDrop: triggerDropMock,
   };
-  // *Mock — тот же объект, что deps.sendPreDrop/triggerDrop, чтобы assert'ы по
-  // deps.*Mock никогда не расходились с тем, что реально дёрнул runDailyPlanner.
-  return Object.assign(deps, { sendPreDropMock, triggerDropMock });
+  // *Mock — тот же объект, что deps.sendPreDrop/triggerDrop/settings.set, чтобы
+  // assert'ы по deps.*Mock никогда не расходились с тем, что реально дёрнул
+  // runDailyPlanner.
+  return Object.assign(deps, { sendPreDropMock, triggerDropMock, settingsSetMock });
 }
 
 describe('runDailyPlanner', () => {
@@ -564,5 +581,176 @@ describe('dailyPlannerTask — регистрация', () => {
     const config = dailyPlannerTask as unknown as { id: string; cron: string };
     expect(config.id).toBe('daily-planner');
     expect(config.cron).toBe('30 16 * * *');
+  });
+});
+
+describe('planner_last_run: отметка «планировщик сегодня отработал»', () => {
+  // Без этой отметки heartbeat не отличает «вечер спланирован, просто нечего
+  // было бронировать» от «cron не тикнул / ран упал» — то есть от молчаливого
+  // провала, ради которого heartbeat и существует.
+
+  it('plannerLastRunValue: включённый — чистый тбилисский stamp', () => {
+    expect(plannerLastRunValue(NOW, true)).toBe('2026-07-31T20:30:00.000+04:00');
+  });
+
+  it('plannerLastRunValue: выключенный — тот же stamp с префиксом disabled@', () => {
+    expect(plannerLastRunValue(NOW, false)).toBe(`${PLANNER_DISABLED_PREFIX}2026-07-31T20:30:00.000+04:00`);
+    // дата в отметке та же: heartbeat сверяет её с сегодняшним днём
+    expect(plannerLastRunValue(NOW, false)).toContain('2026-07-31');
+  });
+
+  it('успешный ран пишет отметку ровно один раз', async () => {
+    const deps = fakeDeps();
+
+    await runDailyPlanner(deps, NOW);
+
+    const lastRunCalls = deps.settingsSetMock.mock.calls.filter(([key]) => key === PLANNER_LAST_RUN_KEY);
+    expect(lastRunCalls).toHaveLength(1);
+    expect(deps.settingsSetMock).toHaveBeenCalledWith(PLANNER_LAST_RUN_KEY, plannerLastRunValue(NOW, true));
+  });
+
+  it('выключенный планировщик тоже отмечается — он отработал, просто не бронирует', async () => {
+    const deps = fakeDeps({ settings: { get: vi.fn(async () => null) } });
+
+    const summary = await runDailyPlanner(deps, NOW);
+
+    expect(summary.enabled).toBe(false);
+    expect(deps.settingsSetMock).toHaveBeenCalledWith(PLANNER_LAST_RUN_KEY, plannerLastRunValue(NOW, false));
+  });
+
+  it('отметка ставится ПОСЛЕ сообщений и триггеров, а не вместо них', async () => {
+    const order: string[] = [];
+    const deps = fakeDeps({
+      sendPreDrop: async () => {
+        order.push('message');
+        return true;
+      },
+      triggerDrop: async () => {
+        order.push('drop');
+      },
+      settings: {
+        get: vi.fn(async () => 'true'),
+        set: async (key: string) => {
+          order.push(key === PLANNER_LAST_PLAN_KEY ? 'plan' : 'mark');
+        },
+      },
+    });
+
+    await runDailyPlanner(deps, NOW);
+
+    // План — тоже после дропов: в него попадает то, что реально поставлено.
+    expect(order).toEqual(['message', 'drop', 'drop', 'plan', 'mark']);
+  });
+
+  it('сбой записи отметки не роняет ран: сообщения и дропы уже ушли', async () => {
+    const deps = fakeDeps({
+      settings: {
+        get: vi.fn(async () => 'true'),
+        set: async () => {
+          throw new Error('PostgREST 503');
+        },
+      },
+    });
+
+    const summary = await runDailyPlanner(deps, NOW);
+
+    expect(summary.dropsTriggered).toBe(2);
+    expect(summary.errors).toEqual([]); // это не проблема профиля, а проблема отметки
+  });
+
+  it('ошибки по отдельным профилям отметке не мешают: сам ран отработал', async () => {
+    const deps = fakeDeps({
+      triggerDrop: async () => {
+        throw new Error('trigger.dev 503');
+      },
+    });
+
+    const summary = await runDailyPlanner(deps, NOW);
+
+    expect(summary.errors.length).toBeGreaterThan(0);
+    expect(deps.settingsSetMock).toHaveBeenCalledWith(PLANNER_LAST_RUN_KEY, plannerLastRunValue(NOW, true));
+  });
+
+  it('план вечера записан вместе с отметкой: heartbeat сверяет квитанции с ним', async () => {
+    const deps = fakeDeps();
+
+    await runDailyPlanner(deps, NOW);
+
+    const call = deps.settingsSetMock.mock.calls.find(([key]) => key === PLANNER_LAST_PLAN_KEY);
+    expect(call).toBeDefined();
+    const plan = parsePlannerPlan(String(call![1]));
+    expect(plan).toEqual({
+      date: DATE,
+      at: '2026-07-31T20:30:00.000+04:00',
+      slots: [
+        { profileId: 'ilya', time: '20:00' },
+        { profileId: 'ilya', time: '21:00' },
+      ],
+    });
+  });
+
+  it('скипнутый профиль в план не попадает — сторож не ждёт по нему отчётов', async () => {
+    const deps = fakeDeps({ skips: { isSkipped: vi.fn(async () => true) } });
+
+    await runDailyPlanner(deps, NOW);
+
+    const call = deps.settingsSetMock.mock.calls.find(([key]) => key === PLANNER_LAST_PLAN_KEY);
+    // Пустой план — это ФАКТ «сегодня не ставили ничего», а не отсутствие плана:
+    // снятый вечером скип уже не заставит heartbeat выдумать пропавшие отчёты.
+    expect(parsePlannerPlan(String(call![1]))?.slots).toEqual([]);
+  });
+
+  it('сорвавшийся триггер всё равно попадает в план: несостоявшийся ран — как раз повод для тревоги', async () => {
+    const deps = fakeDeps({
+      triggerDrop: async () => {
+        throw new Error('trigger.dev 503');
+      },
+    });
+
+    await runDailyPlanner(deps, NOW);
+
+    const call = deps.settingsSetMock.mock.calls.find(([key]) => key === PLANNER_LAST_PLAN_KEY);
+    expect(parsePlannerPlan(String(call![1]))?.slots).toEqual([
+      { profileId: 'ilya', time: '20:00' },
+      { profileId: 'ilya', time: '21:00' },
+    ]);
+  });
+
+  it('сбой записи плана не роняет ран и не мешает отметке', async () => {
+    const deps = fakeDeps({
+      settings: {
+        get: vi.fn(async () => 'true'),
+        set: vi.fn(async (key: string) => {
+          if (key === PLANNER_LAST_PLAN_KEY) throw new Error('PostgREST 503');
+        }),
+      },
+    });
+
+    const summary = await runDailyPlanner(deps, NOW);
+
+    expect(summary.dropsTriggered).toBe(2);
+    expect(summary.errors).toEqual([]);
+    expect(deps.settingsSetMock).toHaveBeenCalledWith(PLANNER_LAST_RUN_KEY, plannerLastRunValue(NOW, true));
+  });
+
+  it('выключенный планировщик план не пишет — вечер не планировался', async () => {
+    const deps = fakeDeps({ settings: { get: vi.fn(async () => null) } });
+
+    await runDailyPlanner(deps, NOW);
+
+    expect(deps.settingsSetMock.mock.calls.map(([key]) => key)).toEqual([PLANNER_LAST_RUN_KEY]);
+  });
+
+  it('ран упал до конца — отметки нет, и heartbeat скажет об этом вслух', async () => {
+    const deps = fakeDeps({
+      schedules: {
+        listEnabled: async () => {
+          throw new Error('Supabase не отвечает');
+        },
+      },
+    });
+
+    await expect(runDailyPlanner(deps, NOW)).rejects.toThrow('Supabase не отвечает');
+    expect(deps.settingsSetMock).not.toHaveBeenCalled();
   });
 });

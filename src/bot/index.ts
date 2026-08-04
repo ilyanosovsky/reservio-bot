@@ -17,13 +17,14 @@
 
 import { readFileSync } from 'node:fs';
 import { Bot } from 'grammy';
-import { ProfilesRepo, SchedulesRepo, SkipsRepo } from '../core/repos.js';
+import { ProfilesRepo, SchedulesRepo, SettingsRepo, SkipsRepo } from '../core/repos.js';
 import { SupabaseStateStore } from '../core/state-supabase.js';
 import { ReservioClient } from '../reservio/client.js';
 import { bookNow } from '../core/book-now.js';
 import type { BotContext, BotDeps } from './context.js';
 import { installBot } from './setup.js';
 import { makeReminderScheduler } from './reminder.js';
+import { createAliveBeacon } from './alive.js';
 import { safeErrorText } from './errors.js';
 
 // мини-загрузчик .env (тот же паттерн, что в src/run-drop.ts — без зависимостей)
@@ -56,7 +57,7 @@ async function main(): Promise<void> {
   const token = required('TELEGRAM_BOT_TOKEN');
   const url = required('SUPABASE_URL');
   const serviceKey = required('SUPABASE_SERVICE_ROLE_KEY');
-  const debugChatIds = (process.env.BOT_DEBUG ?? '').trim() === 'true';
+  const botDebug = (process.env.BOT_DEBUG ?? '').trim() === 'true';
 
   const repoOpts = { url, serviceKey };
   // undefined — trigger.dev не настроен: бот работает, просто без напоминаний.
@@ -82,10 +83,23 @@ async function main(): Promise<void> {
   });
 
   // Порядок «auth, потом хендлеры» живёт в installBot и проверен тестами.
-  installBot(bot, deps, { debug: log, exposeChatId: debugChatIds });
+  installBot(bot, deps, { debug: log, exposeChatId: botDebug });
+
+  // Пульс запускаем до bot.start(): дальше управление уходит в long-polling и
+  // не возвращается до остановки процесса. Проба — getMe тем же каналом, что и
+  // long-polling: отметка «бот жив» не должна пережить потерю связи с Telegram
+  // (см. src/bot/alive.ts).
+  const beacon = createAliveBeacon({
+    settings: new SettingsRepo(repoOpts),
+    probe: () => bot.api.getMe(),
+    log,
+    debug: botDebug,
+  });
+  beacon.start();
 
   const stop = (signal: string): void => {
     log(`получен ${signal}, останавливаюсь`);
+    beacon.stop();
     void bot.stop();
   };
   process.once('SIGINT', () => stop('SIGINT'));

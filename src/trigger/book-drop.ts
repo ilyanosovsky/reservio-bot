@@ -15,6 +15,15 @@
 // сообщение в Telegram — успех, неудача, скип или крах самого рана. Молчаливый
 // провал — худший баг этого проекта.
 //
+// Квитанция вечера: сразу после отправки (или провала отправки) отчёта ран
+// пишет строку в drop_reports — «за слот отчитались, доставлено: да/нет».
+// Изнутри рана дыру «рана не было вовсе» не закрыть: если воркер умер или
+// планировщик не сработал, сообщать об этом некому. Сверяет квитанции с планом
+// вечера отдельный таск heartbeat (22:12 Тбилиси). Запись best-effort: её сбой
+// логируется, но не роняет ран и ничего не меняет в поведении Telegram —
+// потерянная квитанция стоит ложной тревоги heartbeat'а, а упавший из-за неё
+// ран стоил бы брони.
+//
 // Профиль (контакт, приоритет кортов, чат для отчёта) берётся из Supabase —
 // таблицы profiles/schedule_rules, то есть ровно оттуда, куда пишет админ
 // (/add_profile, /add_rule) и откуда читает планировщик. ENV-профиль
@@ -48,7 +57,7 @@ import { SupabaseStateStore } from '../core/state-supabase.js';
 import { formatDropReport, sendTelegram, telegramFromEnv, type TelegramTarget } from '../core/notify.js';
 import { bookSlotDrop, type EngineDeps, type DropCourtResult, type DropMode, type DropReport } from '../core/booking-engine.js';
 import { dropDayOf, dropWatchWindow, tbilisiStamp } from '../core/scheduler.js';
-import { ProfilesRepo, SchedulesRepo, SkipsRepo, type SupabaseRepoOptions } from '../core/repos.js';
+import { DropReportsRepo, ProfilesRepo, SchedulesRepo, SkipsRepo, type SupabaseRepoOptions } from '../core/repos.js';
 import { scheduleReminder } from './remind.js';
 
 export interface BookSlotDropPayload {
@@ -237,12 +246,18 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * громким. Транзиентные отказы Telegram (429 flood, 502, таймаут) переживаем
  * ретраями: после брони у рана остаются сотни секунд бюджета maxDuration, а
  * ноль сообщений за вечер — это молчаливый провал.
+ *
+ * Возвращает, доставлено ли сообщение: этот флаг уезжает в квитанцию вечера
+ * (drop_reports.telegram_ok), по которой heartbeat отличает «отчёта не было» от
+ * «отчёт был, но до человека не доехал». Ненастроенный Telegram (target=null) —
+ * тоже «не доставлено»: молчание по причине забытой переменной остаётся
+ * молчанием.
  */
-async function deliver(target: TelegramTarget | null, text: string): Promise<void> {
-  if (target === null) return;
+async function deliver(target: TelegramTarget | null, text: string): Promise<boolean> {
+  if (target === null) return false;
   for (let attempt = 1; attempt <= DELIVER_ATTEMPTS; attempt += 1) {
     try {
-      if (await sendTelegram(target, text)) return;
+      if (await sendTelegram(target, text)) return true;
       logger.warn(`Telegram: отчёт не ушёл (попытка ${attempt}/${DELIVER_ATTEMPTS})`);
     } catch (err) {
       logger.error(`Telegram: отправка упала (попытка ${attempt}/${DELIVER_ATTEMPTS}): ${redactSecrets(describeError(err))}`);
@@ -252,6 +267,7 @@ async function deliver(target: TelegramTarget | null, text: string): Promise<voi
   logger.error(
     `Telegram: отчёт НЕ доставлен за ${DELIVER_ATTEMPTS} попытки — результат дропа остался только в логах этого рана`,
   );
+  return false;
 }
 
 /** Запасной текст на случай, если сам форматтер отчёта сломался. Без token и контактов. */
@@ -524,6 +540,44 @@ export const bookSlotDropTask = task({
     }
     /** Ровно одно сообщение за ран: взведён — крах-ветка молчит. */
     let reported = false;
+    /**
+     * Куда писать квитанцию вечера; null — Supabase не настроен (тогда её
+     * некуда писать, и heartbeat увидит слот без отчёта). Объявлено ДО try,
+     * потому что квитанцию пишет и крах-ветка.
+     */
+    let receiptTarget: SupabaseRepoOptions | null = null;
+
+    /**
+     * Квитанция «за этот слот отчитались» — best-effort. Ни один её отказ не
+     * имеет права уронить ран или изменить то, что уже ушло в Telegram: цена
+     * потерянной квитанции — ложная тревога heartbeat'а, цена упавшего рана —
+     * бронь. DRY пишет под id с суффиксом ':dry' (как и state, см.
+     * DRY_PROFILE_SUFFIX): репетиция не должна выдавать себя за боевой отчёт и
+     * прятать от heartbeat'а молчание настоящего дропа.
+     */
+    const recordReceipt = async (ok: boolean, telegramOk: boolean): Promise<void> => {
+      if (receiptTarget === null) {
+        logger.warn(
+          'квитанция вечера не записана: SUPABASE_* не заданы — heartbeat не отличит этот слот от несостоявшегося рана',
+        );
+        return;
+      }
+      try {
+        await new DropReportsRepo(receiptTarget).record({
+          profileId: live ? profileId : `${profileId}${DRY_PROFILE_SUFFIX}`,
+          date,
+          time,
+          ok,
+          telegramOk,
+          createdAt: tbilisiStamp(new Date()),
+        });
+      } catch (err) {
+        logger.error(
+          `квитанция вечера не записана (${redactSecrets(describeError(err))}) — heartbeat может поднять ложную ` +
+            `тревогу по ${date} ${time}; на бронь и отчёт это не влияет`,
+        );
+      }
+    };
 
     try {
       logger.info('book-slot-drop: старт', { profileId, date, time, live });
@@ -534,6 +588,8 @@ export const bookSlotDropTask = task({
         supabaseUrl !== '' && supabaseKey !== ''
           ? { url: supabaseUrl, serviceKey: supabaseKey, timeoutMs: SKIP_CHECK_TIMEOUT_MS }
           : null;
+      // С этого момента крах-ветка тоже умеет оставить квитанцию.
+      receiptTarget = supabaseOpts;
 
       // ENV-профиль собираем «мягко»: для профиля, живущего только в Supabase
       // (заведён через /add_profile), отсутствие CLIENT_*/PROFILE_<K>_* — не
@@ -603,7 +659,11 @@ export const bookSlotDropTask = task({
       const reportSkipped = async (when: string): Promise<DropReport> => {
         logger.info(`book-slot-drop: ${date} пропущен по команде профиля "${profileId}" (${when}) — брони не будет`);
         reported = true;
-        await deliver(target, skippedText(payload));
+        // ok=false: брони по итогам этого рана нет. Скип — не провал, и
+        // heartbeat его различает сам (он видит тот же skip в таблице skips и
+        // отчёта по такому слоту не ждёт); квитанция здесь на случай, если скип
+        // поставили уже ПОСЛЕ планирования вечера.
+        await recordReceipt(false, await deliver(target, skippedText(payload)));
         return {
           ok: false,
           profileId,
@@ -771,7 +831,10 @@ export const bookSlotDropTask = task({
       }
       reported = true;
       // Чужой текст в detail мог процитировать контакт профиля — режем его и здесь.
-      await deliver(target, redactSecrets(text));
+      const telegramOk = await deliver(target, redactSecrets(text));
+      // Квитанция — сразу после доставки и ДО напоминаний: она про инвариант
+      // вечера, а напоминание про удобство.
+      await recordReceipt(report.ok, telegramOk);
 
       // Напоминание за 2 часа ставим ПОСЛЕ отчёта: отчёт — инвариант вечера, а
       // напоминание приятный бонус, который не имеет права его задерживать или
@@ -802,7 +865,9 @@ export const bookSlotDropTask = task({
       logger.error(`book-slot-drop: ран упал: ${detail}`);
       if (!reported) {
         reported = true;
-        await deliver(target, crashText(payload, detail));
+        // Ран упал, но человек об этом узнал — квитанция обязана это
+        // зафиксировать, иначе heartbeat разбудит админов второй раз тем же.
+        await recordReceipt(false, await deliver(target, crashText(payload, detail)));
       }
       // Ран обязан упасть, но исходное сообщение могло содержать секрет или
       // контакт профиля — в дашборде оно осело бы навсегда. Подменяем ошибку

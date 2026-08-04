@@ -1,7 +1,8 @@
 // Репозитории бота поверх Supabase/PostgREST: профили, правила расписания,
-// скипы дней и настройки. Схема — supabase/migrations/20260731110000_bot_core.sql
-// плюс 20260801110000_multicourt.sql (mode/label у schedule_rules); тот же DDL
-// в docs/supabase-schema.sql.
+// скипы дней, настройки и квитанции вечерних отчётов. Схема —
+// supabase/migrations/20260731110000_bot_core.sql плюс 20260801110000_multicourt.sql
+// (mode/label у schedule_rules) и 20260804140000_heartbeat.sql (drop_reports);
+// тот же DDL в docs/supabase-schema.sql.
 //
 // Почему голый fetch, а не @supabase/supabase-js: те же соображения, что в
 // state-supabase.ts — ради нескольких запросов к PostgREST тянуть SDK в core
@@ -24,14 +25,28 @@ const ERROR_BODY_LIMIT = 300;
 const MIGRATION_FILE = 'supabase/migrations/20260731110000_bot_core.sql';
 /** Миграция мультикорта: колонки mode/label у schedule_rules. */
 const MULTICOURT_MIGRATION = 'supabase/migrations/20260801110000_multicourt.sql';
+/** Миграция heartbeat: таблица drop_reports (квитанции вечерних отчётов). */
+const HEARTBEAT_MIGRATION = 'supabase/migrations/20260804140000_heartbeat.sql';
 
 const T_PROFILES = 'profiles';
 const T_RULES = 'schedule_rules';
 const T_SKIPS = 'skips';
 const T_SETTINGS = 'settings';
+const T_DROP_REPORTS = 'drop_reports';
 
 const PROFILE_COLUMNS = 'id,label,name,email,phone,telegram_chat_id,is_admin';
 const RULE_COLUMNS = 'id,profile_id,times,courts,days_of_week,enabled,mode,label';
+const DROP_REPORT_COLUMNS = 'profile_id,date,time,ok,telegram_ok,created_at';
+
+/**
+ * Какие миграции создают таблицу — на них ссылаются подсказки «нет таблицы» и
+ * «схема разъехалась». drop_reports приехала отдельной миграцией и своей
+ * подсказкой: советовать применить bot_core тому, у кого нет только квитанций,
+ * значит отправить человека чинить не тот файл.
+ */
+function migrationsFor(table: string): string {
+  return table === T_DROP_REPORTS ? HEARTBEAT_MIGRATION : `${MIGRATION_FILE} и ${MULTICOURT_MIGRATION}`;
+}
 
 /** Режимы правила; см. ScheduleRuleRow.mode. */
 const RULE_MODES = ['priority', 'all'] as const;
@@ -88,6 +103,26 @@ export interface ScheduleRuleRow {
  */
 export type ScheduleRuleInput = Omit<ScheduleRuleRow, 'id'> & { id?: string };
 
+/**
+ * Квитанция о вечернем отчёте: «за слот (profileId, date, time) отчитались».
+ * Пишет ран book-slot-drop сразу после доставки отчёта, читает heartbeat в 22:12
+ * Тбилиси. Только по ней и видно, что вечер прошёл не молча: если рана не было
+ * вовсе (умер воркер, не сработал планировщик), строки за слот просто нет.
+ */
+export interface DropReportRow {
+  profileId: string;
+  /** Дата игры (T+7), YYYY-MM-DD в Asia/Tbilisi. */
+  date: string;
+  /** Начало слота, HH:MM. */
+  time: string;
+  /** Исход дропа: бронь есть / брони нет. */
+  ok: boolean;
+  /** Отчёт реально доставлен в Telegram (а не просто сформирован). */
+  telegramOk: boolean;
+  /** ISO с явным +04:00 (scheduler.tbilisiStamp). */
+  createdAt: string;
+}
+
 export class SupabaseRepoError extends Error {
   status?: number;
   code?: string;
@@ -132,7 +167,7 @@ function asRecord(row: unknown, table: string, label: string): Record<string, un
 
 function drift(table: string, column: string, label: string, what: string): SupabaseRepoError {
   return new SupabaseRepoError(
-    `${label}: в строке таблицы ${table} колонка "${column}" ${what} — схема разъехалась с ${MIGRATION_FILE}`,
+    `${label}: в строке таблицы ${table} колонка "${column}" ${what} — схема разъехалась с ${migrationsFor(table)}`,
     { code: 'unexpectedRow', table },
   );
 }
@@ -332,8 +367,8 @@ abstract class PostgrestRepo {
       (status === 404 && /could not find the table/i.test(message));
     if (schemaProblem) {
       return new SupabaseRepoError(
-        `Таблица "${this.table}" (или её колонки) не найдена в Supabase — применены ли миграции ${MIGRATION_FILE} ` +
-          `и ${MULTICOURT_MIGRATION}? Без CLI: docs/supabase-schema.sql в SQL Editor. ` +
+        `Таблица "${this.table}" (или её колонки) не найдена в Supabase — применены ли миграции ` +
+          `${migrationsFor(this.table)}? Без CLI: docs/supabase-schema.sql в SQL Editor. ` +
           `Если таблица есть, обнови кэш схемы: notify pgrst, 'reload schema' [${label}]`,
         { status, code, table: this.table },
       );
@@ -601,5 +636,60 @@ export class SettingsRepo extends PostgrestRepo {
 
   async set(key: string, value: string): Promise<void> {
     await this.upsertRow({ key, value }, 'key', 'set');
+  }
+}
+
+/**
+ * Квитанции вечерних отчётов (таблица drop_reports, миграция heartbeat).
+ *
+ * Пишутся дропом, читаются heartbeat'ом. Ключ идемпотентности здесь НЕ нужен:
+ * повторный ран того же слота обязан оставить вторую строку, а не переписать
+ * первую — heartbeat'у важно «отчитались ли хоть раз», а истории вечеров
+ * дублирующая строка не мешает.
+ */
+export class DropReportsRepo extends PostgrestRepo {
+  constructor(opts: SupabaseRepoOptions) {
+    super(T_DROP_REPORTS, opts);
+  }
+
+  /** Вставка квитанции. id и default created_at ставит БД, но stamp шлём свой. */
+  async record(r: DropReportRow): Promise<void> {
+    await this.upsertRow(
+      {
+        profile_id: r.profileId,
+        date: r.date,
+        time: r.time,
+        ok: r.ok,
+        telegram_ok: r.telegramOk,
+        created_at: r.createdAt,
+      },
+      null,
+      'record',
+    );
+  }
+
+  /** Все квитанции за дату игры — ровно то, чем heartbeat сверяет план вечера. */
+  async listForDate(date: string): Promise<DropReportRow[]> {
+    const query = new URLSearchParams({
+      select: DROP_REPORT_COLUMNS,
+      date: `eq.${date}`,
+      order: 'created_at.asc',
+    });
+    const label = 'listForDate';
+    return (await this.select(query, label)).map((row) => this.toReport(row, label));
+  }
+
+  private toReport(row: Record<string, unknown>, label: string): DropReportRow {
+    return {
+      profileId: requireString(row, 'profile_id', T_DROP_REPORTS, label),
+      date: requireString(row, 'date', T_DROP_REPORTS, label),
+      time: requireString(row, 'time', T_DROP_REPORTS, label),
+      // Флаги читаем «наименьшими правами»: всё, что не строго true, — false.
+      // Для telegram_ok это единственный безопасный дефолт по последствиям:
+      // мусор в колонке заставит heartbeat разбудить админа, а не промолчать.
+      ok: boolFlag(row, 'ok'),
+      telegramOk: boolFlag(row, 'telegram_ok'),
+      createdAt: requireString(row, 'created_at', T_DROP_REPORTS, label),
+    };
   }
 }

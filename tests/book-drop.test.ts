@@ -132,17 +132,33 @@ function jsonResponse(body: unknown): Response {
  * можно было проверить сам URL (например, под каким profile_id ищется скип).
  */
 function supabaseRouted(
-  handlers: { skips?: () => Response; profiles?: () => Response; rules?: () => Response } = {},
+  handlers: {
+    skips?: () => Response;
+    profiles?: () => Response;
+    rules?: () => Response;
+    /** Квитанция вечера (drop_reports). По умолчанию запись подтверждается. */
+    dropReports?: () => Response;
+  } = {},
 ): FetchMock {
   const fetchMock = vi.fn<(input: unknown, init?: unknown) => Promise<Response>>(async (input: unknown) => {
     const url = String(input);
     if (url.includes('/rest/v1/skips')) return (handlers.skips ?? ((): Response => jsonResponse([])))();
     if (url.includes('/rest/v1/profiles')) return (handlers.profiles ?? ((): Response => jsonResponse([])))();
     if (url.includes('/rest/v1/schedule_rules')) return (handlers.rules ?? ((): Response => jsonResponse([])))();
+    if (url.includes('/rest/v1/drop_reports')) {
+      return (handlers.dropReports ?? ((): Response => jsonResponse([{ id: 'receipt-1' }])))();
+    }
     return jsonResponse([]);
   });
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
+}
+
+/** Тела всех POST'ов в drop_reports — что именно ран записал о вечере. */
+function receipts(fetchMock: FetchMock): Array<Record<string, unknown>> {
+  return fetchMock.mock.calls
+    .filter((c) => String(c[0]).includes('/rest/v1/drop_reports'))
+    .map((c) => JSON.parse(String((c[1] as { body?: string } | undefined)?.body ?? '{}')) as Record<string, unknown>);
 }
 
 /** Строка profiles так, как её вернул бы PostgREST (ProfilesRepo.getById). */
@@ -895,5 +911,132 @@ describe('book-slot-drop: напоминание за 2 часа', () => {
     await run(payload());
 
     expect(order).toEqual(['telegram', 'remind']);
+  });
+});
+
+describe('book-slot-drop: квитанция вечера (drop_reports)', () => {
+  beforeEach(() => {
+    useSupabaseEnv();
+  });
+
+  it('успех: одна квитанция со слотом, ok=true и отметкой о доставке', async () => {
+    // Без квитанции heartbeat не отличит «вечер прошёл нормально» от «рана
+    // не было вовсе»: снаружи и то, и другое выглядит как тишина.
+    const fetchMock = supabaseRouted();
+
+    await run(payload());
+
+    const rows = receipts(fetchMock);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      profile_id: 'ilya',
+      date: DATE,
+      time: TIME,
+      ok: true,
+      telegram_ok: true,
+    });
+    expect(String(rows[0]!['created_at'])).toContain('+04:00');
+  });
+
+  it('дроп не удался — квитанция всё равно есть, с ok=false', async () => {
+    const fetchMock = supabaseRouted();
+    bookSlotDropMock.mockResolvedValue(
+      okReport({ ok: false, token: undefined, bookingId: undefined, error: { kind: 'SlotTaken' } }),
+    );
+
+    await run(payload());
+
+    expect(receipts(fetchMock)[0]).toMatchObject({ ok: false, telegram_ok: true });
+  });
+
+  it('Telegram не доставил отчёт — telegram_ok=false (heartbeat разбудит админов)', async () => {
+    vi.useFakeTimers();
+    const fetchMock = supabaseRouted();
+    sendTelegramMock.mockResolvedValue(false);
+
+    const p = run(payload());
+    await vi.advanceTimersByTimeAsync(10_000);
+    await p;
+
+    expect(sendTelegramMock).toHaveBeenCalledTimes(3);
+    expect(receipts(fetchMock)[0]).toMatchObject({ ok: true, telegram_ok: false });
+  });
+
+  it('квитанция пишется ПОСЛЕ отправки отчёта, а не вместо неё', async () => {
+    const order: string[] = [];
+    const fetchMock = supabaseRouted({
+      dropReports: () => {
+        order.push('receipt');
+        return jsonResponse([{ id: 'receipt-1' }]);
+      },
+    });
+    sendTelegramMock.mockImplementation(async () => {
+      order.push('telegram');
+      return true;
+    });
+
+    await run(payload());
+
+    expect(order).toEqual(['telegram', 'receipt']);
+    expect(receipts(fetchMock)).toHaveLength(1);
+  });
+
+  it('запись квитанции упала — ран НЕ падает, бронь и отчёт не страдают', async () => {
+    // Цена потерянной квитанции — ложная тревога heartbeat'а; цена упавшего
+    // рана — потерянный вечер. Приоритет очевиден.
+    supabaseRouted({ dropReports: () => jsonResponse({ code: '42P01', message: 'boom' }) });
+
+    const report = await run(payload());
+
+    expect(report.ok).toBe(true);
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+    expect(scheduleReminderMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('квитанцию не подтвердили (2xx без строки) — ран тоже не падает', async () => {
+    supabaseRouted({ dropReports: () => jsonResponse([]) });
+
+    await expect(run(payload())).resolves.toMatchObject({ ok: true });
+  });
+
+  it('DRY пишет квитанцию под id с суффиксом :dry — она не заменяет боевую', async () => {
+    // Иначе репетиция в 21:00 «отчиталась» бы за настоящий слот и heartbeat
+    // промолчал бы о молчании боевого дропа.
+    const fetchMock = supabaseRouted();
+
+    await run(payload({ live: false }));
+
+    expect(receipts(fetchMock)[0]).toMatchObject({ profile_id: 'ilya:dry', date: DATE, time: TIME });
+  });
+
+  it('скип: квитанция есть (сообщение-то ушло), ok=false', async () => {
+    const fetchMock = supabaseRouted({ skips: () => skipRow(DATE) });
+
+    await run(payload());
+
+    expect(sentText()).toContain('Пропущено по команде');
+    expect(receipts(fetchMock)[0]).toMatchObject({ ok: false, telegram_ok: true });
+  });
+
+  it('крах рана: квитанция с ok=false, ошибка по-прежнему пробрасывается', async () => {
+    const fetchMock = supabaseRouted();
+    bookSlotDropMock.mockRejectedValue(new Error('движок взорвался'));
+
+    await expect(run(payload())).rejects.toThrow('движок взорвался');
+
+    expect(sentText()).toContain('Дроп сорвался');
+    expect(receipts(fetchMock)[0]).toMatchObject({ profile_id: 'ilya', ok: false, telegram_ok: true });
+  });
+
+  it('без SUPABASE_* квитанции нет, но ран отрабатывает как раньше', async () => {
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    const fetchMock = supabaseRouted();
+
+    const report = await run(payload());
+
+    expect(report.ok).toBe(true);
+    expect(receipts(fetchMock)).toHaveLength(0);
+    expect(sendTelegramMock).toHaveBeenCalledTimes(1);
   });
 });

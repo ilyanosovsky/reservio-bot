@@ -304,6 +304,7 @@ describe('изоляция native-зависимостей', () => {
     'trigger/remind.ts',
     'trigger/daily-planner.ts',
     'trigger/drop-observe.ts',
+    'trigger/heartbeat.ts',
     'bot/index.ts',
   ];
 
