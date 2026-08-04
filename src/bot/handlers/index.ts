@@ -5,6 +5,12 @@
 // каждый callback получит answerCallbackQuery: иначе у пользователя на кнопке
 // навсегда останется крутящийся спиннер, а он читает это как «бот завис».
 //
+// Порядок разбора ТЕКСТА (важен, проверяется тестами):
+//  1. гейт мастера профиля — активный черновик съедает свободный текст;
+//  2. команды и кнопки меню — они всегда значат ровно себя;
+//  3. свободный запрос (handlers/free-query.ts) — ПОСЛЕДНИМ, как фолбэк.
+// Иначе нажатие «⏰ Расписание» уезжало бы в платный API вместо расписания.
+//
 // Любое исключение в хендлере превращается в понятное сообщение (guard):
 // молчаливый провал — худший баг этого проекта (CLAUDE.md).
 
@@ -20,6 +26,7 @@ import { sendWelcome } from '../welcome.js';
 import { ProfileDraftStore } from '../wizard-state.js';
 import { commandArgs, logOf } from './shared.js';
 import { showBookings } from './bookings.js';
+import { handleFreeQuery } from './free-query.js';
 import { backToSlotDates, showSlotCourts, showSlotDates, showSlots } from './slots.js';
 import { backToBookDates, confirmBook, doBook, showBookCourts, showBookDates, showBookTimes } from './book.js';
 import { confirmCancel, doCancel, showCancelList } from './cancel.js';
@@ -211,4 +218,10 @@ export function registerHandlers(bot: Composer<BotContext>, deps: BotDeps): void
       }
     }),
   );
+
+  // Свободный запрос — ПОСЛЕДНИЙ обработчик текста и единственный фолбэк.
+  // Сюда доходит только то, что не съели мастер, команды и кнопки меню выше
+  // (у grammY хендлер без next() обрывает цепочку). Кнопки этой ветки ведут в
+  // уже зарегистрированный диспетчер callback'ов — своих kind у неё нет.
+  bot.on('message:text', guard(deps, (ctx) => handleFreeQuery(ctx, deps)));
 }

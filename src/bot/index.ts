@@ -21,6 +21,7 @@ import { InvitesRepo, ProfilesRepo, SchedulesRepo, SettingsRepo, SkipsRepo } fro
 import { SupabaseStateStore } from '../core/state-supabase.js';
 import { ReservioClient } from '../reservio/client.js';
 import { bookNow } from '../core/book-now.js';
+import { parseIntent } from '../core/intent.js';
 import type { BotContext, BotDeps } from './context.js';
 import { installBot } from './setup.js';
 import { makeReminderScheduler } from './reminder.js';
@@ -62,6 +63,11 @@ async function main(): Promise<void> {
   const repoOpts = { url, serviceKey };
   // undefined — trigger.dev не настроен: бот работает, просто без напоминаний.
   const scheduleReminder = makeReminderScheduler(process.env, log);
+  // Ключ модели читается ЗДЕСЬ и больше нигде: хендлеры в process.env не
+  // заглядывают. Пустой ключ ветку свободных запросов не отключает — бот должен
+  // сказать человеку, что разбор текста выключен, а не молчать в ответ на
+  // сообщение. В stdout ключ не печатается никогда (только факт наличия).
+  const anthropicApiKey = (process.env.ANTHROPIC_API_KEY ?? '').trim();
   const deps: BotDeps = {
     profiles: new ProfilesRepo(repoOpts),
     schedules: new SchedulesRepo(repoOpts),
@@ -71,8 +77,10 @@ async function main(): Promise<void> {
     client: new ReservioClient({ log }),
     bookNow,
     ...(scheduleReminder === undefined ? {} : { scheduleReminder }),
+    freeQuery: { parseIntent, settings: new SettingsRepo(repoOpts), apiKey: anthropicApiKey },
     log,
   };
+  log(`свободные запросы: ${anthropicApiKey === '' ? 'выключены (нет ANTHROPIC_API_KEY)' : 'включены'}`);
 
   const bot = new Bot<BotContext>(token);
 

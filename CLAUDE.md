@@ -119,7 +119,10 @@ Padel Court 4, Padel Court 1}`: бронируем КАЖДЫЙ появивши
 - Сложные задачи (engine, клиент API, архитектура) — Opus.
 - Мелкие/механические (scaffold, конфиги, доки) — Sonnet.
 - Фаза 5 (парсинг свободных запросов из Telegram) — Haiku
-  (`claude-haiku-4-5`), ключ: env `ANTHROPIC_API_KEY`.
+  (`claude-haiku-4-5`), ключ: env `ANTHROPIC_API_KEY`. Базовая часть
+  реализована: `src/core/intent.ts` (парсер, форсированный tool-use,
+  никакого текста от модели пользователю), `docs/wiki/Bot.md` →
+  «Свободные запросы».
 
 ## Стек
 
