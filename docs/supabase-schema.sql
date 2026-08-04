@@ -5,7 +5,8 @@
 --
 -- Тот же DDL лежит миграциями supabase/migrations/*.sql (для `supabase db push`):
 -- 20260730123000_bookings, 20260730140000_bookings_hardening,
--- 20260731110000_bot_core, 20260801110000_multicourt, 20260804140000_heartbeat.
+-- 20260731110000_bot_core, 20260801110000_multicourt, 20260804140000_heartbeat,
+-- 20260804160000_invites.
 -- Этот файл — источник правды и путь без CLI; держать в синхроне, иначе схема
 -- разъедется с адаптером.
 --
@@ -188,6 +189,38 @@ create index if not exists drop_reports_date_idx on public.drop_reports ("date")
 
 alter table public.drop_reports enable row level security;
 revoke all on table public.drop_reports from anon, authenticated;
+
+-- ===========================================================================
+-- Приглашения игроков. Тот же DDL лежит миграцией
+-- supabase/migrations/20260804160000_invites.sql — держать файлы в синхроне.
+-- Читает/пишет только src/core/repos.ts (InvitesRepo).
+-- ===========================================================================
+
+-- Одноразовый код привязки Telegram-чата к профилю. Бот молчит всем, кого нет в
+-- allowlist'е, поэтому новый игрок не может представиться сам: его chat_id
+-- неоткуда взять. Мост — ссылка https://t.me/<bot>?start=inv_<code>, которую
+-- админ выдаёт после мастера «➕ Добавить профиль». Это единственное исключение
+-- из инварианта тишины, отсюда и требования: код неугадываемый (16 случайных
+-- байт = 32 hex) и сгораемый (used_at).
+--
+-- Одноразовость держит БД, а не код: InvitesRepo.claim делает один
+--   update profile_invites set used_at = ... where code = $1 and used_at is null
+-- и смотрит, изменилась ли строка. Postgres сериализует конкурирующие update'ы
+-- одной строки, поэтому двойной тап по ссылке даёт ровно одну привязку.
+create table if not exists public.profile_invites (
+  code       text primary key,          -- он же секрет: 32 hex из crypto.randomBytes(16)
+  -- Профиль удалили — его коды умирают вместе с ним (живой код в никуда = дыра).
+  profile_id text not null references public.profiles (id) on delete cascade,
+  created_at text not null default to_char(now() at time zone 'Asia/Tbilisi', 'YYYY-MM-DD"T"HH24:MI:SS"+04:00"'),
+  used_at    text                       -- null = не использован; иначе момент погашения, ISO +04:00
+);
+
+create index if not exists profile_invites_profile_idx on public.profile_invites (profile_id);
+
+-- Доступ — как у остальных таблиц: только service-ключ. Здесь лежат ЖИВЫЕ коды
+-- доступа к боту, утечка непогашенного кода = чужая привязка к профилю игрока.
+alter table public.profile_invites enable row level security;
+revoke all on table public.profile_invites from anon, authenticated;
 
 -- PostgREST кэширует схему; в Supabase кэш обновляется сам, но если сразу после
 -- Run адаптер жалуется на PGRST205 "Could not find the table" — выполнить это:

@@ -1,5 +1,5 @@
 // Тесты репозиториев бота (profiles / schedule_rules / skips / settings /
-// drop_reports).
+// drop_reports / profile_invites).
 // Никаких сетевых запросов: fetch всегда замокан, к реальному Supabase тесты
 // не ходят (и не должны — ключа в CI нет). Проверяем то, что не ловится
 // типами: форму запроса к PostgREST (эндпоинт, фильтры, on_conflict, Prefer),
@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DropReportsRepo,
+  InvitesRepo,
   ProfilesRepo,
   SchedulesRepo,
   SettingsRepo,
@@ -20,6 +21,12 @@ import {
 
 const URL_BASE = 'https://kbwmrqoxjlydmwyxirqm.supabase.co';
 const KEY = 'sb_secret_TESTKEY_do_not_leak';
+
+/** Код приглашения того же вида, что выдаёт InvitesRepo.create: 32 hex. */
+const INVITE_CODE = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+const HEX_32 = /^[0-9a-f]{32}$/;
+/** Отметка времени в зоне клуба: 2026-08-01T01:30:00.000+04:00. */
+const TBILISI_STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\+04:00$/;
 
 const PROFILE_SELECT = 'id,label,name,email,phone,telegram_chat_id,is_admin';
 const RULE_SELECT = 'id,profile_id,times,courts,days_of_week,enabled,mode,label';
@@ -156,12 +163,14 @@ describe('репозитории: конструктор', () => {
     await new SchedulesRepo(o).listEnabled();
     await new SkipsRepo(o).isSkipped('ilya', '2026-08-06');
     await new SettingsRepo(o).get('planner_enabled');
+    await new InvitesRepo(o).claim(INVITE_CODE, '111222333');
 
     expect(calls.map((c) => c.path)).toEqual([
       '/rest/v1/profiles',
       '/rest/v1/schedule_rules',
       '/rest/v1/skips',
       '/rest/v1/settings',
+      '/rest/v1/profile_invites',
     ]);
   });
 
@@ -601,6 +610,160 @@ describe('DropReportsRepo', () => {
     await expect(new DropReportsRepo(opts(fn)).record(dropReport())).rejects.toThrow(
       /20260804140000_heartbeat\.sql/,
     );
+  });
+});
+
+describe('InvitesRepo', () => {
+  it('create: POST в profile_invites, тело {code, profile_id}, без on_conflict', async () => {
+    const { fn, calls } = fetchStub(jsonRes([{ code: INVITE_CODE, profile_id: 'p1a2b3c4' }], 201));
+    await new InvitesRepo(opts(fn)).create('p1a2b3c4');
+
+    const call = calls[0]!;
+    expect(call.path).toBe('/rest/v1/profile_invites');
+    expect(call.method).toBe('POST');
+    expect(call.params.has('on_conflict')).toBe(false);
+    expect(call.headers['Prefer']).toContain('return=representation');
+    expect(Object.keys(call.body as object).sort()).toEqual(['code', 'profile_id']);
+    expect((call.body as { profile_id: string }).profile_id).toBe('p1a2b3c4');
+    // created_at не шлём: его ставит default миграции.
+    expect(Object.keys(call.body as object)).not.toContain('created_at');
+  });
+
+  it('create: возвращает ровно тот код, который записал; 32 hex-символа', async () => {
+    const { fn, calls } = fetchStub(() => jsonRes([{ code: 'ответ-игнорируем' }], 201));
+    const code = await new InvitesRepo(opts(fn)).create('p1a2b3c4');
+
+    expect(code).toMatch(HEX_32);
+    // Код берём свой, а не из ответа Supabase: наружу уходит именно записанное.
+    expect((calls[0]!.body as { code: string }).code).toBe(code);
+  });
+
+  it('create: два приглашения — два разных кода (не счётчик и не константа)', async () => {
+    const { fn } = fetchStub(() => jsonRes([{ code: 'x' }], 201));
+    const repo = new InvitesRepo(opts(fn));
+    const codes = new Set([await repo.create('p1a2b3c4'), await repo.create('p1a2b3c4'), await repo.create('p1a2b3c4')]);
+
+    expect(codes.size).toBe(3);
+  });
+
+  it('create: 2xx без строки в ответе — не считается успехом', async () => {
+    // Иначе админ отправит игроку ссылку с кодом, которого в базе нет, и
+    // «единственное исключение из тишины» окажется мёртвым.
+    const { fn } = fetchStub(jsonRes([], 201));
+    await expect(new InvitesRepo(opts(fn)).create('p1a2b3c4')).rejects.toThrow(/не подтверждена/);
+  });
+
+  it('create: пустой profile_id -> ошибка без запроса в сеть', async () => {
+    const { fn, calls } = fetchStub(jsonRes([{ code: INVITE_CODE }], 201));
+    await expect(new InvitesRepo(opts(fn)).create('  ')).rejects.toThrow(/profile_id/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('claim: один PATCH с условиями code=eq. И used_at=is.null', async () => {
+    // Оба условия обязаны быть в САМОМ update: одноразовость держит Postgres,
+    // а не проверка «сначала прочитали, потом записали».
+    const { fn, calls } = fetchStub(jsonRes([{ profile_id: 'p1a2b3c4' }]));
+    await new InvitesRepo(opts(fn)).claim(INVITE_CODE, '444555666');
+
+    const call = calls[0]!;
+    expect(calls).toHaveLength(1);
+    expect(call.method).toBe('PATCH');
+    expect(call.params.get('code')).toBe(`eq.${INVITE_CODE}`);
+    expect(call.params.get('used_at')).toBe('is.null');
+    expect(call.params.get('select')).toBe('profile_id');
+    expect(call.headers['Prefer']).toContain('return=representation');
+    expect(call.body).toEqual({ used_at: expect.stringMatching(TBILISI_STAMP) });
+  });
+
+  it('claim: код подошёл -> профиль, к которому он вёл', async () => {
+    const { fn } = fetchStub(jsonRes([{ profile_id: 'p1a2b3c4' }]));
+    expect(await new InvitesRepo(opts(fn)).claim(INVITE_CODE, '444555666')).toEqual({ profileId: 'p1a2b3c4' });
+  });
+
+  it('claim: несуществующий и уже погашенный код неразличимы снаружи — оба null', async () => {
+    // Разное поведение подсказало бы перебирающему, что он угадал живой код.
+    const { fn } = fetchStub(() => jsonRes([]));
+    const repo = new InvitesRepo(opts(fn));
+
+    expect(await repo.claim(INVITE_CODE, '444555666')).toBeNull();
+    expect(await repo.claim('0'.repeat(32), '444555666')).toBeNull();
+  });
+
+  it('claim: двойной тап по ссылке -> ровно одна привязка', async () => {
+    // Гонка: оба PATCH уходят одновременно, но условие used_at is null стоит
+    // внутри update, поэтому второй не меняет ни одной строки (пустой ответ).
+    const { fn, calls } = fetchStub(jsonRes([{ profile_id: 'p1a2b3c4' }]), jsonRes([]));
+    const repo = new InvitesRepo(opts(fn));
+
+    const results = await Promise.all([repo.claim(INVITE_CODE, '444555666'), repo.claim(INVITE_CODE, '444555666')]);
+
+    expect(results.filter((r) => r !== null)).toEqual([{ profileId: 'p1a2b3c4' }]);
+    expect(calls).toHaveLength(2);
+    for (const call of calls) expect(call.params.get('used_at')).toBe('is.null');
+  });
+
+  it('claim: заведомо не наш код -> null, и в Supabase не ходим', async () => {
+    const { fn, calls } = fetchStub(() => jsonRes([{ profile_id: 'p1a2b3c4' }]));
+    const repo = new InvitesRepo(opts(fn));
+
+    for (const bad of ['', '   ', 'short', 'код-с-кириллицей', 'with space', 'a'.repeat(129), '*', 'a,b']) {
+      expect(await repo.claim(bad, '444555666')).toBeNull();
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('claim: пустой chat_id -> null без запроса (код не тратим впустую)', async () => {
+    // Погасить код и не суметь привязать чат — значит убить приглашение молча.
+    const { fn, calls } = fetchStub(() => jsonRes([{ profile_id: 'p1a2b3c4' }]));
+    expect(await new InvitesRepo(opts(fn)).claim(INVITE_CODE, '  ')).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('claim: used_at ставится в зоне клуба, а не в таймзоне сервера', async () => {
+    // TZ тестов — America/New_York (vitest.config.ts). 21:30 UTC 31 июля в
+    // Батуми — уже 1 августа.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-31T21:30:00Z'));
+
+    const { fn, calls } = fetchStub(jsonRes([{ profile_id: 'p1a2b3c4' }]));
+    await new InvitesRepo(opts(fn)).claim(INVITE_CODE, '444555666');
+
+    expect(calls[0]!.body).toEqual({ used_at: '2026-08-01T01:30:00.000+04:00' });
+  });
+
+  it('claim: ответ не массив -> ошибка, а не тихий null', async () => {
+    // Тихий null здесь — худший исход: код уже мог сгореть, а бот сказал бы
+    // «такого кода нет» и оставил игрока без доступа навсегда.
+    const { fn } = fetchStub(jsonRes({ profile_id: 'p1a2b3c4' }));
+    await expect(new InvitesRepo(opts(fn)).claim(INVITE_CODE, '444555666')).rejects.toThrow(/массив изменённых строк/);
+  });
+
+  it('claim: битая колонка -> ошибка со ссылкой на СВОЮ миграцию, а не на bot_core', async () => {
+    const { fn } = fetchStub(jsonRes([{ profile_id: 42 }]));
+    const err = await rejection(new InvitesRepo(opts(fn)).claim(INVITE_CODE, '444555666'));
+
+    expect(err.message).toMatch(/profile_id/);
+    expect(err.message).toContain('20260804160000_invites.sql');
+    expect(err.message).not.toContain('20260731110000_bot_core.sql');
+  });
+
+  it('нет таблицы (PGRST205) -> подсказка применить миграцию приглашений', async () => {
+    const { fn } = fetchStub(
+      jsonRes(
+        { code: 'PGRST205', message: "Could not find the table 'public.profile_invites' in the schema cache" },
+        404,
+      ),
+    );
+    await expect(new InvitesRepo(opts(fn)).create('p1a2b3c4')).rejects.toThrow(/20260804160000_invites\.sql/);
+  });
+
+  it('create: выданный код уезжает телом запроса, а не в URL', async () => {
+    // При создании держим код подальше от строки запроса (URL светится в логах
+    // прокси). У claim иначе: PostgREST фильтрует только query-параметрами.
+    const { fn, calls } = fetchStub(jsonRes([{ code: INVITE_CODE }], 201));
+    const code = await new InvitesRepo(opts(fn)).create('p1a2b3c4');
+
+    expect(calls[0]!.url).not.toContain(code);
   });
 });
 

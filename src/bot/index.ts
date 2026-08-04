@@ -17,7 +17,7 @@
 
 import { readFileSync } from 'node:fs';
 import { Bot } from 'grammy';
-import { ProfilesRepo, SchedulesRepo, SettingsRepo, SkipsRepo } from '../core/repos.js';
+import { InvitesRepo, ProfilesRepo, SchedulesRepo, SettingsRepo, SkipsRepo } from '../core/repos.js';
 import { SupabaseStateStore } from '../core/state-supabase.js';
 import { ReservioClient } from '../reservio/client.js';
 import { bookNow } from '../core/book-now.js';
@@ -66,6 +66,7 @@ async function main(): Promise<void> {
     profiles: new ProfilesRepo(repoOpts),
     schedules: new SchedulesRepo(repoOpts),
     skips: new SkipsRepo(repoOpts),
+    invites: new InvitesRepo(repoOpts),
     state: new SupabaseStateStore(repoOpts),
     client: new ReservioClient({ log }),
     bookNow,

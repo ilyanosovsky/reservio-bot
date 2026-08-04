@@ -8,14 +8,16 @@
 // Любое исключение в хендлере превращается в понятное сообщение (guard):
 // молчаливый провал — худший баг этого проекта (CLAUDE.md).
 
-import type { Composer } from 'grammy';
+import type { Composer, NextFunction } from 'grammy';
 import { adminOnly } from '../auth.js';
 import type { BotContext, BotDeps } from '../context.js';
-import { escapeHtml, formatWelcome } from '../format.js';
-import { BTN, mainMenu } from '../menu.js';
+import { escapeHtml } from '../format.js';
+import { BTN } from '../menu.js';
 import { parseCallbackData } from '../parse.js';
 import { answer, edit, reply } from '../ui.js';
 import { safeErrorText } from '../errors.js';
+import { sendWelcome } from '../welcome.js';
+import { ProfileDraftStore } from '../wizard-state.js';
 import { commandArgs, logOf } from './shared.js';
 import { showBookings } from './bookings.js';
 import { backToSlotDates, showSlotCourts, showSlotDates, showSlots } from './slots.js';
@@ -31,7 +33,17 @@ import {
   showSchedule,
   toggleRule,
 } from './schedule.js';
-import { addProfile, addRule, showProfiles } from './profiles.js';
+import {
+  addProfile,
+  addRule,
+  cancelNothing,
+  cancelProfileWizard,
+  createProfileFromDraft,
+  profileWizardGate,
+  reissueInvite,
+  showProfiles,
+  startProfileWizard,
+} from './profiles.js';
 
 type Handler = (ctx: BotContext) => Promise<void>;
 
@@ -59,20 +71,49 @@ function guard(deps: BotDeps, fn: Handler): Handler {
 /** Кнопки, которые сами показывают всплывающий ответ (toast) с итогом действия. */
 const SELF_ANSWERING = new Set(['skip-toggle', 'rule-toggle', 'rule-wizard', 'rule-delete']);
 
+/** Право на админскую кнопку. Отказ — молча, как и везде в админской ветке. */
+function isAdmin(ctx: BotContext, deps: BotDeps): boolean {
+  if (ctx.state.profile.isAdmin === true) return true;
+  logOf(deps)(`callback: админская кнопка от не-админа (профиль ${ctx.state.profile.id}) — молчим`);
+  return false;
+}
+
 export function registerHandlers(bot: Composer<BotContext>, deps: BotDeps): void {
   const admin = adminOnly({ debug: logOf(deps) });
+  // Черновики мастера профиля — один экземпляр на бота (в тестах свой на каждую
+  // сборку: глобальный синглтон протекал бы между сценариями).
+  const drafts = new ProfileDraftStore();
 
-  const start: Handler = async (ctx) => {
-    const profile = ctx.state.profile;
-    await ctx.reply(formatWelcome(profile.label, profile.isAdmin), {
-      parse_mode: 'HTML',
-      reply_markup: mainMenu(profile.isAdmin),
-    });
-  };
+  const start: Handler = async (ctx) => sendWelcome(ctx, ctx.state.profile);
+
+  // Гейт мастера стоит ПЕРЕД командами и кнопками: пока у админа висит
+  // черновик, его свободный текст — это ответ на шаг, а не мимо пролетевшее
+  // сообщение. Кнопки меню и команды гейт пропускает дальше (сбросив черновик),
+  // поэтому «⏰ Расписание» из середины мастера работает как обычно.
+  bot.on('message:text', async (ctx: BotContext, next: NextFunction) => {
+    let eaten = false;
+    try {
+      eaten = await profileWizardGate(ctx, deps, drafts, ctx.message?.text ?? '');
+    } catch (err) {
+      // Мастер упал — сообщение съеденным не считаем, но и молчать нельзя.
+      const detail = safeErrorText(err);
+      logOf(deps)(`мастер профиля упал: ${detail}`);
+      try {
+        await reply(ctx, `⚠️ Не получилось: ${escapeHtml(detail)}`);
+      } catch {
+        // чат недоступен — ошибка уже в логе процесса
+      }
+      return;
+    }
+    if (!eaten) await next();
+  });
 
   bot.command('start', guard(deps, start));
   bot.command('help', guard(deps, start));
   bot.command('menu', guard(deps, start));
+  // Активный черновик /cancel съедает в гейте выше; сюда команда доходит,
+  // только когда отменять нечего.
+  bot.command('cancel', admin, guard(deps, cancelNothing));
 
   bot.hears(BTN.bookings, guard(deps, (ctx) => showBookings(ctx, deps)));
   bot.hears(BTN.slots, guard(deps, (ctx) => showSlotDates(ctx, deps)));
@@ -136,6 +177,22 @@ export function registerHandlers(bot: Composer<BotContext>, deps: BotDeps): void
           return deleteRule(ctx, deps, cb.ruleId);
         case 'rule-wizard':
           return ruleWizardStep(ctx, deps, cb.step, cb.draft);
+        // Мастер профиля — админский. adminOnly навешивается на bot.hears и
+        // bot.command, а диспетчер callback'ов один на всех, поэтому право
+        // проверяем прямо здесь: не-админ получает ту же тишину, что и всегда
+        // (спиннер ему уже погасили выше).
+        case 'profile-new':
+          if (!isAdmin(ctx, deps)) return;
+          return startProfileWizard(ctx, deps, drafts);
+        case 'profile-create':
+          if (!isAdmin(ctx, deps)) return;
+          return createProfileFromDraft(ctx, deps, drafts);
+        case 'profile-cancel':
+          if (!isAdmin(ctx, deps)) return;
+          return cancelProfileWizard(ctx, deps, drafts);
+        case 'profile-invite':
+          if (!isAdmin(ctx, deps)) return;
+          return reissueInvite(ctx, deps, cb.profileId);
         case 'close':
           return edit(ctx, '↩️ Отменено.');
         case 'noop':

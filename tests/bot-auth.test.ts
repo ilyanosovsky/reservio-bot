@@ -220,6 +220,11 @@ function harness(profile: ProfileRow | null, rules: ScheduleRuleRow[] = []): Bot
     profiles: { getByChatId: vi.fn(async () => profile), getById: vi.fn(async () => null), list, upsert },
     schedules,
     skips: { listUpcoming: vi.fn(async () => []), add: vi.fn(async () => {}), remove: vi.fn(async () => {}) },
+    // Приглашения installBot требует всегда (inviteMiddleware собирается первым).
+    // Здесь они не проверяются — это tests/bot-invite.test.ts, — но заглушка
+    // обязана быть: без неё сценарии этого файла молча ходили бы по ветке
+    // «мастер упал», и тишина в них ничего не доказывала бы.
+    invites: { claim: vi.fn(async () => null), create: vi.fn(async () => 'код-не-используется') },
     state: { listBookings },
     client: {},
     bookNow: vi.fn(),
