@@ -48,6 +48,64 @@ const CHAT_ID_RE = /^-?\d{5,20}$/;
 const BOOKING_ID_RE = /^[A-Za-z0-9_-]{1,48}$/;
 const RULE_ID_RE = /^[A-Za-z0-9_-]{1,48}$/;
 
+/** Имя/подпись профиля: длиннее в кнопку и в список всё равно не влезет. */
+export const PROFILE_NAME_MAX = 64;
+
+// Валидаторы полей профиля вынесены отдельно, потому что тех же полей просит
+// мастер «➕ Добавить профиль» (src/bot/wizard-state.ts). Две копии одного
+// правила разошлись бы: /add_profile принимал бы то, что мастер отвергает.
+
+/**
+ * id профиля: 2–32 символа, латиница/цифры/-/_ . Нужен не только команде
+ * /add_profile, но и кнопке «🔗 Ссылка» — в её callback_data едет именно id,
+ * и разбирать оттуда что попало нельзя.
+ */
+export function isProfileId(raw: string): boolean {
+  return PROFILE_ID_RE.test(raw);
+}
+
+export function isProfileName(raw: string): boolean {
+  const value = raw.trim();
+  return value !== '' && value.length <= PROFILE_NAME_MAX;
+}
+
+export function isProfileEmail(raw: string): boolean {
+  return EMAIL_RE.test(raw.trim());
+}
+
+/** Пробелы, скобки и дефисы из набранного человеком номера убираем молча. */
+export function normalizePhone(raw: string): string {
+  return raw.trim().replace(/[\s()-]/g, '');
+}
+
+/** Ждёт уже нормализованный номер (см. normalizePhone). */
+export function isProfilePhone(phone: string): boolean {
+  return PHONE_RE.test(phone);
+}
+
+/**
+ * Код приглашения в `/start inv_<code>`. Формат — тот же, что выдаёт
+ * InvitesRepo.create: 32 hex-символа (16 случайных байт). Верхняя граница есть
+ * специально: `/start` может принести килобайт мусора, и тащить его в фильтр
+ * PostgREST незачем.
+ */
+const INVITE_CODE_RE = /^[0-9a-f]{32,64}$/i;
+
+/**
+ * `/start inv_<code>` → код, всё остальное → null.
+ *
+ * Разбираем строго: команда ровно `/start` (Telegram при пересылке добавляет
+ * `@имя_бота`), ровно один аргумент, префикс `inv_`. Всё, что не подошло, —
+ * обычный апдейт, а для чата без профиля это значит полную тишину.
+ */
+export function parseInviteStart(text: string | undefined): string | null {
+  if (text === undefined) return null;
+  const m = /^\/start(?:@[A-Za-z0-9_]+)?\s+inv_(\S+)$/.exec(text.trim());
+  if (m === null) return null;
+  const code = m[1] ?? '';
+  return INVITE_CODE_RE.test(code) ? code : null;
+}
+
 /** Жёсткий лимит Telegram: более длинную callback_data API отвергает целиком. */
 export const CALLBACK_DATA_MAX_BYTES = 64;
 
@@ -110,17 +168,17 @@ export function parseAddProfile(raw: string): ParseResult<AddProfileInput> {
   }
 
   const label = parts[1] ?? '';
-  if (label === '' || label.length > 64) return fail('Поле 2 (label) пустое или длиннее 64 символов.');
+  if (!isProfileName(label)) return fail(`Поле 2 (label) пустое или длиннее ${PROFILE_NAME_MAX} символов.`);
 
   const name = parts[2] ?? '';
-  if (name === '' || name.length > 64) return fail('Поле 3 (name) пустое или длиннее 64 символов.');
+  if (!isProfileName(name)) return fail(`Поле 3 (name) пустое или длиннее ${PROFILE_NAME_MAX} символов.`);
 
   const email = parts[3] ?? '';
   // Значение не цитируем: email профиля — персональные данные, а ошибка остаётся в чате.
-  if (!EMAIL_RE.test(email)) return fail('Поле 4 (email) не похоже на адрес почты. Значение не печатаю — это персональные данные.');
+  if (!isProfileEmail(email)) return fail('Поле 4 (email) не похоже на адрес почты. Значение не печатаю — это персональные данные.');
 
-  const phone = (parts[4] ?? '').replace(/[\s()-]/g, '');
-  if (!PHONE_RE.test(phone)) return fail('Поле 5 (phone) должно быть в формате +995XXXXXXXXX (только «+» и цифры).');
+  const phone = normalizePhone(parts[4] ?? '');
+  if (!isProfilePhone(phone)) return fail('Поле 5 (phone) должно быть в формате +995XXXXXXXXX (только «+» и цифры).');
 
   const chatRaw = parts[5] ?? '';
   if (chatRaw !== '' && !CHAT_ID_RE.test(chatRaw)) {
@@ -227,6 +285,15 @@ export type Callback =
   | { kind: 'rule-delete-ask'; ruleId: string }
   | { kind: 'rule-delete'; ruleId: string }
   | { kind: 'rule-wizard'; step: RuleStep; draft: RuleDraft }
+  // Мастер «➕ Добавить профиль» (админская ветка). Черновик в кнопке не едет:
+  // шаги мастера — обычные сообщения, а состояние живёт в памяти процесса
+  // (src/bot/wizard-state.ts), поэтому кнопке хватает самого действия.
+  | { kind: 'profile-new' }
+  | { kind: 'profile-create' }
+  | { kind: 'profile-cancel' }
+  // Перевыпуск ссылки-приглашения существующему профилю. Единственная кнопка
+  // ветки с данными — id профиля; персональных данных в нём нет.
+  | { kind: 'profile-invite'; profileId: string }
   | { kind: 'close' }
   | { kind: 'noop' };
 
@@ -250,6 +317,8 @@ export const CB_PREFIXES = {
   rule: 'rule',
   /** Конструктор сценариев расписания (rule wizard). */
   rules: 'rw',
+  /** Мастер добавления профиля (profile wizard). */
+  profiles: 'pw',
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -385,6 +454,48 @@ export const cbRuleEdit = (ruleId: string): string => cb(`${CB_PREFIXES.rules}${
 export const cbRuleDeleteAsk = (ruleId: string): string => cb(`${CB_PREFIXES.rules}${SEP}rm${SEP}${ruleId}`);
 export const cbRuleDelete = (ruleId: string): string => cb(`${CB_PREFIXES.rules}${SEP}ok${SEP}${ruleId}`);
 
+/**
+ * Кнопки мастера профиля. Данных в них нет вовсе — только действие: черновик
+ * живёт в памяти процесса, а не в кнопке (в отличие от мастера расписаний, где
+ * состояние stateless по построению). Плата за это — потеря черновика при
+ * рестарте бота, и она осознанная: альтернатива это персональные данные
+ * (email, телефон) в открытой callback_data, которую видно в истории чата.
+ */
+export const cbProfileNew = (): string => cb(`${CB_PREFIXES.profiles}${SEP}n`);
+export const cbProfileCreate = (): string => cb(`${CB_PREFIXES.profiles}${SEP}y`);
+export const cbProfileCancel = (): string => cb(`${CB_PREFIXES.profiles}${SEP}x`);
+
+/**
+ * «🔗 Ссылка» у непривязанного профиля в списке: выпустить ему НОВЫЙ код
+ * приглашения. Худший случай — 'pw~i~' + id(32) = 37 байт при лимите 64.
+ */
+export const cbProfileInvite = (profileId: string): string => cb(`${CB_PREFIXES.profiles}${SEP}i${SEP}${profileId}`);
+
+/**
+ * Ветка 'pw': два поля у кнопок мастера (данных в них нет по построению) и
+ * ровно три у «🔗 Ссылка» — там едет id профиля, и он проверяется тем же
+ * предикатом, что и в /add_profile: подделанная кнопка с мусором вместо id
+ * дальше разбора не проходит.
+ */
+function parseProfilesCallback(parts: string[]): Callback | null {
+  if (parts.length === 3) {
+    const id = parts[2] ?? '';
+    if (parts[1] !== 'i' || !isProfileId(id)) return null;
+    return { kind: 'profile-invite', profileId: id };
+  }
+  if (parts.length !== 2) return null;
+  switch (parts[1]) {
+    case 'n':
+      return { kind: 'profile-new' };
+    case 'y':
+      return { kind: 'profile-create' };
+    case 'x':
+      return { kind: 'profile-cancel' };
+    default:
+      return null;
+  }
+}
+
 export function cbRuleWizard(step: RuleStep, draft: RuleDraft): string {
   const fields = [
     CB_PREFIXES.rules,
@@ -467,6 +578,8 @@ export function parseCallbackData(data: string): Callback | null {
   }
 
   if (head === CB_PREFIXES.rules) return parseRulesCallback(parts);
+
+  if (head === CB_PREFIXES.profiles) return parseProfilesCallback(parts);
 
   if (head === CB_PREFIXES.cancel) {
     const bookingId = parts[2];

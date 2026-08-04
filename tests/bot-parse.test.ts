@@ -35,6 +35,17 @@ import {
   parseAddRule,
   parseCallbackData,
   toggleBit,
+  PROFILE_NAME_MAX,
+  cbProfileCancel,
+  cbProfileCreate,
+  cbProfileInvite,
+  cbProfileNew,
+  isProfileEmail,
+  isProfileId,
+  isProfileName,
+  isProfilePhone,
+  normalizePhone,
+  parseInviteStart,
 } from '../src/bot/parse.js';
 
 const UUID = '3f2504e0-4f89-11d3-9a0c-0305e82c3301';
@@ -471,6 +482,154 @@ describe('callback_data мастера расписаний', () => {
       ruleId: 'x'.repeat(48),
     });
     expect(() => cbRuleWizard('confirm', tooLong)).toThrow(RangeError);
+  });
+});
+
+describe('parseInviteStart', () => {
+  // Разбор `/start inv_<code>` — вход в ЕДИНСТВЕННОЕ исключение из инварианта
+  // тишины (src/bot/auth.ts). Всё, что этот разбор пропустил, доедет до
+  // authMiddleware и для чата без профиля закончится молчанием, поэтому здесь
+  // важнее ложные СРАБАТЫВАНИЯ, чем ложные отказы.
+  const CODE = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+
+  it('ссылка-приглашение разбирается в код', () => {
+    expect(parseInviteStart(`/start inv_${CODE}`)).toBe(CODE);
+  });
+
+  it('Telegram-суффикс @имя_бота (пересланная ссылка) не мешает', () => {
+    expect(parseInviteStart(`/start@padel_test_bot inv_${CODE}`)).toBe(CODE);
+  });
+
+  it('регистр кода не важен, пробелы по краям срезаются', () => {
+    expect(parseInviteStart(`  /start inv_${CODE.toUpperCase()}  `)).toBe(CODE.toUpperCase());
+  });
+
+  it('обычный /start приглашением не является', () => {
+    expect(parseInviteStart('/start')).toBeNull();
+    expect(parseInviteStart('/start ')).toBeNull();
+  });
+
+  it('чужой payload /start (не inv_) игнорируется', () => {
+    // У Telegram deep link один на всех: под ним могут приехать реферальные
+    // метки и что угодно ещё. Наше — только inv_.
+    expect(parseInviteStart(`/start ref_${CODE}`)).toBeNull();
+    expect(parseInviteStart(`/start ${CODE}`)).toBeNull();
+  });
+
+  it('код не того формата отбрасывается до всякой сети', () => {
+    expect(parseInviteStart('/start inv_короткий')).toBeNull();
+    expect(parseInviteStart('/start inv_zzzz')).toBeNull();
+    // Не hex: 'g' вне алфавита.
+    expect(parseInviteStart(`/start inv_${'g'.repeat(32)}`)).toBeNull();
+    // Килобайт мусора в фильтр PostgREST не поедет.
+    expect(parseInviteStart(`/start inv_${'a'.repeat(2000)}`)).toBeNull();
+  });
+
+  it('лишние аргументы после кода — не приглашение', () => {
+    expect(parseInviteStart(`/start inv_${CODE} и ещё что-то`)).toBeNull();
+  });
+
+  it('не команда /start вовсе — null (в т.ч. похожие строки)', () => {
+    expect(parseInviteStart(undefined)).toBeNull();
+    expect(parseInviteStart('')).toBeNull();
+    expect(parseInviteStart(`inv_${CODE}`)).toBeNull();
+    expect(parseInviteStart(`/started inv_${CODE}`)).toBeNull();
+    expect(parseInviteStart(`просто текст inv_${CODE}`)).toBeNull();
+  });
+});
+
+describe('callback_data мастера профиля', () => {
+  // Черновик мастера в кнопке НЕ едет (в отличие от мастера расписаний): в нём
+  // email и телефон живого человека, а callback_data видна в разметке
+  // сообщения. Поэтому кнопки несут только действие.
+  it('кнопки кодируются и разбираются обратно', () => {
+    expect(parseCallbackData(cbProfileNew())).toEqual({ kind: 'profile-new' });
+    expect(parseCallbackData(cbProfileCreate())).toEqual({ kind: 'profile-create' });
+    expect(parseCallbackData(cbProfileCancel())).toEqual({ kind: 'profile-cancel' });
+  });
+
+  it('персональных данных в кнопке нет — только префикс и код действия', () => {
+    for (const data of [cbProfileNew(), cbProfileCreate(), cbProfileCancel()]) {
+      expect(data.startsWith('pw~')).toBe(true);
+      expect(data.split('~')).toHaveLength(2);
+      expect(Buffer.byteLength(data, 'utf8')).toBeLessThanOrEqual(CALLBACK_DATA_MAX_BYTES);
+    }
+  });
+
+  it('неизвестное действие ветки pw отбрасывается', () => {
+    expect(parseCallbackData('pw~zzz')).toBeNull();
+    expect(parseCallbackData('pw')).toBeNull();
+    // Лишнее поле у кнопок мастера — отказ: данных в них нет по построению.
+    expect(parseCallbackData('pw~y~anna@example.com')).toBeNull();
+    expect(parseCallbackData('pw~n~p1a2b3c4')).toBeNull();
+  });
+
+  it('кнопка перевыпуска ссылки везёт id профиля и разбирается обратно', () => {
+    const data = cbProfileInvite('p1a2b3c4');
+
+    expect(parseCallbackData(data)).toEqual({ kind: 'profile-invite', profileId: 'p1a2b3c4' });
+    expect(Buffer.byteLength(data, 'utf8')).toBeLessThanOrEqual(CALLBACK_DATA_MAX_BYTES);
+    // Даже самый длинный допустимый id в лимит укладывается.
+    expect(Buffer.byteLength(cbProfileInvite('p'.repeat(32)), 'utf8')).toBeLessThanOrEqual(CALLBACK_DATA_MAX_BYTES);
+  });
+
+  it('подделанный id в кнопке перевыпуска не проходит разбор', () => {
+    // Кнопка приводит к выпуску секрета — id проверяется тем же предикатом,
+    // что и в /add_profile, а не «что пришло, то и берём».
+    expect(parseCallbackData('pw~i~')).toBeNull();
+    expect(parseCallbackData('pw~i~p')).toBeNull();
+    expect(parseCallbackData('pw~i~anna@example.com')).toBeNull();
+    expect(parseCallbackData(`pw~i~${'p'.repeat(33)}`)).toBeNull();
+  });
+});
+
+describe('валидаторы полей профиля (общие для команды и мастера)', () => {
+  // Мастер и /add_profile обязаны принимать РОВНО одно и то же: разъехавшись,
+  // они дали бы «команда завела, мастер отказал» на одном и том же игроке.
+  it('имя: непустое и не длиннее лимита', () => {
+    expect(isProfileName('Аня')).toBe(true);
+    expect(isProfileName('  Аня  ')).toBe(true);
+    expect(isProfileName('')).toBe(false);
+    expect(isProfileName('   ')).toBe(false);
+    expect(isProfileName('я'.repeat(PROFILE_NAME_MAX))).toBe(true);
+    expect(isProfileName('я'.repeat(PROFILE_NAME_MAX + 1))).toBe(false);
+  });
+
+  it('id: 2–32 символа латиницей, цифрами, «-» и «_»', () => {
+    // Тот же предикат режет и id в callback_data кнопки «🔗 Ссылка».
+    expect(isProfileId('anna')).toBe(true);
+    expect(isProfileId('p1a2b3c4')).toBe(true);
+    expect(isProfileId('p'.repeat(32))).toBe(true);
+    expect(isProfileId('p'.repeat(33))).toBe(false);
+    expect(isProfileId('a')).toBe(false);
+    expect(isProfileId('')).toBe(false);
+    expect(isProfileId('Аня')).toBe(false);
+    expect(isProfileId('anna@example.com')).toBe(false);
+    expect(isProfileId('_anna')).toBe(false);
+  });
+
+  it('email: тот же предикат, что у /add_profile', () => {
+    expect(isProfileEmail('anna@example.com')).toBe(true);
+    expect(isProfileEmail('  anna@example.com  ')).toBe(true);
+    expect(isProfileEmail('anna')).toBe(false);
+    expect(isProfileEmail('anna@')).toBe(false);
+    expect(isProfileEmail('')).toBe(false);
+  });
+
+  it('телефон: пробелы и скобки убираются, формат +995XXXXXXXXX', () => {
+    expect(normalizePhone(' +995 (555) 111-222 ')).toBe('+995555111222');
+    expect(isProfilePhone(normalizePhone('+995 555 111 222'))).toBe(true);
+    expect(isProfilePhone(normalizePhone('995555111222'))).toBe(false);
+    expect(isProfilePhone(normalizePhone('+995abc111222'))).toBe(false);
+  });
+
+  it('мастер и команда принимают один и тот же набор значений', () => {
+    const ok = parseAddProfile('anna;Аня;Anna;anna@example.com;+995 555 111 222');
+    expect(ok.ok).toBe(true);
+    // Ровно те же поля через предикаты мастера.
+    expect(isProfileName('Аня')).toBe(true);
+    expect(isProfileEmail('anna@example.com')).toBe(true);
+    expect(isProfilePhone(normalizePhone('+995 555 111 222'))).toBe(true);
   });
 });
 

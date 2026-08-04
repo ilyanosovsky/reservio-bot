@@ -10,7 +10,7 @@
  */
 
 import type { Context } from 'grammy';
-import type { ProfileRow, ProfilesRepo, SchedulesRepo, SkipsRepo } from '../core/repos.js';
+import type { InvitesRepo, ProfileRow, ProfilesRepo, SchedulesRepo, SkipsRepo } from '../core/repos.js';
 import type { ReservioClient } from '../reservio/client.js';
 import type { ClientContact } from '../reservio/types.js';
 import type { StateStore, StoredBooking } from '../core/state.js';
@@ -51,6 +51,8 @@ export interface BotDeps {
   profiles: ProfilesRepo;
   schedules: SchedulesRepo;
   skips: SkipsRepo;
+  /** Одноразовые коды привязки чата к профилю (мастер «➕ Добавить профиль»). */
+  invites: InvitesRepo;
   client: ReservioClient;
   state: StateStore;
   bookNow: BookNowFn;

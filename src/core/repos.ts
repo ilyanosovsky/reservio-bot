@@ -1,8 +1,9 @@
 // Репозитории бота поверх Supabase/PostgREST: профили, правила расписания,
-// скипы дней, настройки и квитанции вечерних отчётов. Схема —
-// supabase/migrations/20260731110000_bot_core.sql плюс 20260801110000_multicourt.sql
-// (mode/label у schedule_rules) и 20260804140000_heartbeat.sql (drop_reports);
-// тот же DDL в docs/supabase-schema.sql.
+// скипы дней, настройки, квитанции вечерних отчётов и приглашения игроков.
+// Схема — supabase/migrations/20260731110000_bot_core.sql плюс
+// 20260801110000_multicourt.sql (mode/label у schedule_rules),
+// 20260804140000_heartbeat.sql (drop_reports) и 20260804160000_invites.sql
+// (profile_invites); тот же DDL в docs/supabase-schema.sql.
 //
 // Почему голый fetch, а не @supabase/supabase-js: те же соображения, что в
 // state-supabase.ts — ради нескольких запросов к PostgREST тянуть SDK в core
@@ -14,9 +15,12 @@
 //
 // Приватность: service-ключ живёт ТОЛЬКО в заголовках — никогда в URL и никогда
 // в тексте ошибки (redact вырезает его из чужого текста). Модуль ничего не
-// логирует: в profiles лежат email, телефон и chat_id — персональные данные.
+// логирует: в profiles лежат email, телефон и chat_id — персональные данные, а
+// в profile_invites — живые коды доступа к боту (секрет уровня guest-token).
 
-import { tbilisiDateOf } from './scheduler.js';
+import { randomBytes } from 'node:crypto';
+
+import { tbilisiDateOf, tbilisiStamp } from './scheduler.js';
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 /** Кусок чужого текста в ошибке обрезаем: тело ответа может быть большим. */
@@ -27,12 +31,15 @@ const MIGRATION_FILE = 'supabase/migrations/20260731110000_bot_core.sql';
 const MULTICOURT_MIGRATION = 'supabase/migrations/20260801110000_multicourt.sql';
 /** Миграция heartbeat: таблица drop_reports (квитанции вечерних отчётов). */
 const HEARTBEAT_MIGRATION = 'supabase/migrations/20260804140000_heartbeat.sql';
+/** Миграция приглашений: таблица profile_invites (одноразовые коды привязки чата). */
+const INVITES_MIGRATION = 'supabase/migrations/20260804160000_invites.sql';
 
 const T_PROFILES = 'profiles';
 const T_RULES = 'schedule_rules';
 const T_SKIPS = 'skips';
 const T_SETTINGS = 'settings';
 const T_DROP_REPORTS = 'drop_reports';
+const T_INVITES = 'profile_invites';
 
 const PROFILE_COLUMNS = 'id,label,name,email,phone,telegram_chat_id,is_admin';
 const RULE_COLUMNS = 'id,profile_id,times,courts,days_of_week,enabled,mode,label';
@@ -40,12 +47,15 @@ const DROP_REPORT_COLUMNS = 'profile_id,date,time,ok,telegram_ok,created_at';
 
 /**
  * Какие миграции создают таблицу — на них ссылаются подсказки «нет таблицы» и
- * «схема разъехалась». drop_reports приехала отдельной миграцией и своей
- * подсказкой: советовать применить bot_core тому, у кого нет только квитанций,
- * значит отправить человека чинить не тот файл.
+ * «схема разъехалась». drop_reports и profile_invites приехали отдельными
+ * миграциями и своими подсказками: советовать применить bot_core тому, у кого
+ * нет только квитанций (или только приглашений), значит отправить человека
+ * чинить не тот файл.
  */
 function migrationsFor(table: string): string {
-  return table === T_DROP_REPORTS ? HEARTBEAT_MIGRATION : `${MIGRATION_FILE} и ${MULTICOURT_MIGRATION}`;
+  if (table === T_DROP_REPORTS) return HEARTBEAT_MIGRATION;
+  if (table === T_INVITES) return INVITES_MIGRATION;
+  return `${MIGRATION_FILE} и ${MULTICOURT_MIGRATION}`;
 }
 
 /** Режимы правила; см. ScheduleRuleRow.mode. */
@@ -54,6 +64,22 @@ export type ScheduleMode = (typeof RULE_MODES)[number];
 
 /** Ключ дедупликации скипа — тот же, что уникальный ключ в схеме. */
 const SKIP_CONFLICT_TARGET = 'profile_id,date';
+
+/**
+ * Длина кода приглашения в БАЙТАХ: 16 байт crypto.randomBytes = 32 hex-символа
+ * = 128 бит. Код — единственное исключение из инварианта тишины (см. InvitesRepo),
+ * то есть по стойкости он должен быть паролем, а не «номером приглашения».
+ */
+const INVITE_CODE_BYTES = 16;
+
+/**
+ * Рамка допустимого кода на ВХОДЕ claim: то, что явно не может быть нашим кодом,
+ * до Supabase не доезжает вовсе. Формат нарочно шире собственного (hex-32):
+ * репозиторий отсекает мусор и мегабайтные строки из чужого `/start`, а не
+ * навязывает формат ключа. Инъекции здесь и так нет — значение уезжает
+ * URL-кодированным в один eq.-фильтр PostgREST.
+ */
+const INVITE_CODE_RE = /^[A-Za-z0-9_-]{8,128}$/;
 
 const UPSERT_PREFER = 'resolution=merge-duplicates,return=representation';
 
@@ -292,10 +318,32 @@ abstract class PostgrestRepo {
     }
   }
 
+  /**
+   * PATCH с возвратом ИЗМЕНЁННЫХ строк (Prefer: return=representation).
+   *
+   * Не-массив в ответе — ошибка, а не «ноль строк»: на этом ответе стоит вывод
+   * «условие не совпало», и для условных update'ов (InvitesRepo.claim) спутать
+   * его с «PostgREST ответил что-то другое» значит признать код непогашенным
+   * после того, как он уже сгорел.
+   */
+  protected async patchReturning(
+    query: URLSearchParams,
+    body: unknown,
+    label: string,
+  ): Promise<Record<string, unknown>[]> {
+    const payload = await this.request({ method: 'PATCH', query, body, prefer: 'return=representation', label });
+    if (!Array.isArray(payload)) {
+      throw new SupabaseRepoError(`${label}: ожидался массив изменённых строк от PostgREST`, {
+        code: 'unexpectedResponse',
+        table: this.table,
+      });
+    }
+    return payload.map((row) => asRecord(row, this.table, label));
+  }
+
   /** Возвращает число изменённых строк (Prefer: return=representation). */
   protected async patchRows(query: URLSearchParams, body: unknown, label: string): Promise<number> {
-    const payload = await this.request({ method: 'PATCH', query, body, prefer: 'return=representation', label });
-    return Array.isArray(payload) ? payload.length : 0;
+    return (await this.patchReturning(query, body, label)).length;
   }
 
   protected async deleteRows(query: URLSearchParams, label: string): Promise<void> {
@@ -691,5 +739,84 @@ export class DropReportsRepo extends PostgrestRepo {
       telegramOk: boolFlag(row, 'telegram_ok'),
       createdAt: requireString(row, 'created_at', T_DROP_REPORTS, label),
     };
+  }
+}
+
+/**
+ * Приглашения игроков (таблица profile_invites, миграция 20260804160000).
+ *
+ * Зачем. Авторизация бота — allowlist telegram_chat_id -> профиль, чужому чату
+ * бот молчит полностью. Поэтому новый игрок не может представиться боту сам:
+ * его chat_id взять неоткуда, пока он боту не написал, а на его сообщение бот
+ * обязан молчать. Мост — одноразовый код: админ заводит профиль мастером,
+ * получает ссылку `https://t.me/<bot>?start=inv_<code>`, игрок открывает её, и
+ * бот привязывает чат к профилю. Это ЕДИНСТВЕННОЕ исключение из тишины.
+ *
+ * Отсюда требования к коду: неугадываемый (128 бит из crypto.randomBytes) и
+ * сгораемый ровно один раз (used_at). Сам код — секрет уровня guest-token: не
+ * логировать, не показывать никому кроме админа, который его выдаёт.
+ */
+export class InvitesRepo extends PostgrestRepo {
+  constructor(opts: SupabaseRepoOptions) {
+    super(T_INVITES, opts);
+  }
+
+  /**
+   * Выдать код для профиля. Возвращает сам код — его показывают ОДИН раз, в
+   * ссылке админу; из базы он больше не читается ни одним методом.
+   *
+   * created_at не шлём: его ставит default миграции (как у profiles).
+   */
+  async create(profileId: string): Promise<string> {
+    const id = profileId?.trim() ?? '';
+    if (id === '') {
+      throw new SupabaseRepoError('create: пустой profile_id — приглашение некому выдавать', {
+        code: 'invalidArgument',
+        table: T_INVITES,
+      });
+    }
+    const code = randomBytes(INVITE_CODE_BYTES).toString('hex');
+    // upsertRow с onConflict=null: код — первичный ключ и он случайный, так что
+    // «слить дубликаты» здесь нечего, а вот подтверждение записи обязательно.
+    // Иначе админ отправит игроку ссылку с кодом, которого в базе нет.
+    await this.upsertRow({ code, profile_id: id }, null, 'create');
+    return code;
+  }
+
+  /**
+   * Погасить код и узнать, к какому профилю он вёл. `null` — код не подошёл;
+   * «нет такого кода» и «код уже использован» снаружи НЕразличимы намеренно:
+   * бот на оба случая обязан промолчать, а разное поведение подсказало бы
+   * перебирающему, что он угадал живой код.
+   *
+   * Атомарность. Гасим ОДНИМ запросом: `PATCH ?code=eq.<code>&used_at=is.null`
+   * — то есть `update ... where code = $1 and used_at is null`. Postgres
+   * сериализует конкурирующие update'ы одной строки: проигравший перечитывает
+   * её уже под блокировкой, видит заполненный used_at и под условие не подходит.
+   * Поэтому двойной тап по ссылке (или гонка двух чатов за один код) даёт ровно
+   * одну привязку — пустой ответ у второго. Связка «сначала select, потом
+   * update» такой гарантии не даёт вообще.
+   *
+   * chatId в таблицу НЕ пишем: привязка живёт в profiles.telegram_chat_id, и
+   * размазывать персональные данные по второй таблице незачем. Здесь он нужен
+   * как страховка от «погасили код, а привязывать не к чему»: без адресата код
+   * не тратим.
+   */
+  async claim(code: string, chatId: string): Promise<{ profileId: string } | null> {
+    const value = code?.trim() ?? '';
+    // Мусор из чужого /start до Supabase не доезжает: ответ тот же самый (null),
+    // но и запроса нет.
+    if (!INVITE_CODE_RE.test(value)) return null;
+    if ((chatId?.trim() ?? '') === '') return null;
+
+    const query = new URLSearchParams({
+      select: 'profile_id',
+      code: `eq.${value}`,
+      used_at: 'is.null',
+    });
+    const label = 'claim';
+    const rows = await this.patchReturning(query, { used_at: tbilisiStamp(new Date()) }, label);
+    if (rows.length === 0) return null;
+    return { profileId: requireString(rows[0]!, 'profile_id', T_INVITES, label) };
   }
 }

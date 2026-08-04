@@ -21,6 +21,9 @@ import { slotEndISO, slotStartISO, tbilisiDateOf, weekdayOf } from '../core/sche
 // format.ts не знает, поэтому цикла нет. Здесь нужен лишь числовой кодек
 // битмасок мультивыбора (имена кортов и подписи живут в этом файле).
 import { DAYS_MASK_MAX, bitsOf, maskOfBits, type RuleDraft, type RuleMode } from './parse.js';
+// Та же история с wizard-state.ts: сюда приезжают только форма черновика и
+// номер шага, обратной зависимости нет (wizard-state про тексты не знает).
+import { stepNumber, type ProfileDraft, type ProfileStep } from './wizard-state.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -724,7 +727,7 @@ export function maskTail(value: string, keep = 4): string {
 
 export function formatProfilesList(profiles: ProfileRow[]): string {
   if (profiles.length === 0) {
-    return '👤 <b>Профили</b>\n\nПрофилей нет. Добавь первый командой /add_profile.';
+    return '👤 <b>Профили</b>\n\nПрофилей нет. Заведи первого кнопкой «➕ Добавить профиль».';
   }
   const lines = profiles.map((p) => {
     const flags = [p.isAdmin ? 'админ' : null, p.telegramChatId ? `chat ${maskTail(p.telegramChatId)}` : 'chat не привязан']
@@ -739,6 +742,131 @@ export function formatProfileSaved(id: string, label: string): string {
   return `✅ Профиль <code>${escapeHtml(id)}</code> (${escapeHtml(label)}) сохранён.`;
 }
 
+// ---------------------------------------------------------------------------
+// Мастер «➕ Добавить профиль» (админская ветка)
+// ---------------------------------------------------------------------------
+
+/** Заголовок мастера профиля — по нему видно, в каком диалоге находишься. */
+const PROFILE_WIZARD_TITLE = '👤 <b>Новый игрок</b>';
+
+/** Вопрос каждого текстового шага. Отвечают СООБЩЕНИЕМ, не кнопкой. */
+export const PROFILE_STEP_PROMPT: Record<ProfileStep, string> = {
+  name: 'Имя игрока (видимое в списках)',
+  email: 'Email аккаунта Reservio игрока',
+  phone: 'Телефон (+995...)',
+  confirm: 'проверь и создай',
+};
+
+const PROFILE_STEP_HINT: Record<ProfileStep, string> = {
+  name: 'Так игрок будет подписан в списках бота и в брони клуба.',
+  email: 'На этот адрес клуб пришлёт подтверждение, к нему же привяжется бронь в кабинете Reservio.',
+  phone: 'Формат +995XXXXXXXXX — пробелы и скобки уберу сам.',
+  confirm: '',
+};
+
+/**
+ * Экран текстового шага: крошки с уже введённым + вопрос + подсказка.
+ * Введённое показываем целиком: это персональные данные, но их только что
+ * набрал сам админ в этом же чате — прятать от него нечего (в ЛОГИ они не
+ * попадают, см. handlers/profiles.ts).
+ */
+export function formatProfileStep(draft: ProfileDraft, error = ''): string {
+  const picked: string[] = [];
+  if (draft.name !== '') picked.push(draft.name);
+  if (draft.email !== '') picked.push(draft.email);
+  if (draft.phone !== '') picked.push(draft.phone);
+  const head = [PROFILE_WIZARD_TITLE, ...picked.map(escapeHtml), escapeHtml(`шаг ${stepNumber(draft.step)}/4`)].join(
+    CRUMB_SEP,
+  );
+  const hint = PROFILE_STEP_HINT[draft.step];
+  return [
+    head,
+    '',
+    ...(error === '' ? [] : [`⚠️ ${escapeHtml(error)}`, '']),
+    `<b>${escapeHtml(PROFILE_STEP_PROMPT[draft.step])}</b>`,
+    // Подсказки нет только у сводки. Отфильтровать все пустые строки разом
+    // нельзя: тогда уедут и разделители — экран слипнется в стену текста.
+    ...(hint === '' ? [] : [escapeHtml(hint)]),
+    '',
+    escapeHtml('Ответь сообщением. Отменить — /cancel.'),
+  ].join('\n');
+}
+
+/**
+ * Шаг 4: сводка перед созданием. Дальше — только кнопки.
+ *
+ * `error` — ответ на сообщение, присланное вместо нажатия кнопки. Он рисуется
+ * ЗДЕСЬ, а не через formatProfileStep: там экран заканчивается строкой «Ответь
+ * сообщением», то есть ровно противоположной инструкцией, да ещё и без кнопок
+ * под ней. Сводка же приезжает со своими «✅ Создать» / «❌ Отмена».
+ */
+export function formatProfileSummary(draft: ProfileDraft, error = ''): string {
+  return [
+    [PROFILE_WIZARD_TITLE, escapeHtml('шаг 4/4'), escapeHtml(PROFILE_STEP_PROMPT.confirm)].join(CRUMB_SEP),
+    '',
+    ...(error === '' ? [] : [`⚠️ ${escapeHtml(error)}`, '']),
+    `имя: <b>${escapeHtml(draft.name)}</b>`,
+    `email: ${escapeHtml(draft.email)}`,
+    `телефон: ${escapeHtml(draft.phone)}`,
+    '',
+    escapeHtml('По кнопке «✅ Создать» заведу профиль без доступа к боту и выдам ссылку-приглашение — её отправишь игроку.'),
+  ].join('\n');
+}
+
+/** Ссылка-приглашение: t.me/<бот>?start=inv_<код>. */
+export function inviteLink(botUsername: string, code: string): string {
+  return `https://t.me/${botUsername}?start=inv_${code}`;
+}
+
+/**
+ * Итог создания (`reissued: false`) и перевыпуск ссылки для уже заведённого,
+ * но ещё не привязанного профиля (`reissued: true`).
+ *
+ * Код приглашения — секрет: он ЗДЕСЬ и в базе, и больше нигде (в лог не
+ * пишется). Потеряли сообщение до того, как игрок перешёл, — не беда: кнопка
+ * «🔗 Ссылка» в «👤 Профили» выпускает новый код тому же профилю, заводить
+ * человека заново не нужно.
+ */
+export function formatProfileInvite(label: string, link: string, reissued = false): string {
+  return [
+    reissued ? `🔗 Новая ссылка для <b>${escapeHtml(label)}</b>.` : `✅ Профиль <b>${escapeHtml(label)}</b> создан.`,
+    '',
+    'Отправь игроку ссылку-приглашение:',
+    `<code>${escapeHtml(link)}</code>`,
+    '',
+    escapeHtml('По ней бот привяжет её чат и откроет меню. Ссылка одноразовая — после первого перехода она мертва.'),
+    // Старый код не гасим: гасить нечего, пока он не предъявлен, а лишний
+    // запрос к базе ради этого не нужен. Сработает та ссылка, которую откроют
+    // первой, — вторая после привязки профиля мертва (src/bot/auth.ts).
+    ...(reissued
+      ? [escapeHtml('Прежняя ссылка, если её ещё не открывали, тоже рабочая: сработает та, что откроют первой.')]
+      : []),
+  ].join('\n');
+}
+
+/** Кнопка «🔗 Ссылка» у профиля, чей чат уже привязан: выпускать нечего. */
+export const PROFILE_ALREADY_BOUND_TEXT =
+  '✅ У этого профиля чат уже привязан — приглашение ему не нужно. Открой «👤 Профили» заново, чтобы обновить список.';
+
+/** Кнопка «🔗 Ссылка» из старого сообщения: профиль с тех пор удалили. */
+export const PROFILE_GONE_TEXT = '⚠️ Такого профиля больше нет. Открой «👤 Профили» заново.';
+
+/** Черновик потерян: истёк TTL, бот перезапускался или уже создан профиль. */
+export const PROFILE_DRAFT_GONE_TEXT =
+  '⌛ Черновик профиля не найден: он живёт 15 минут и не переживает перезапуск бота.\nОткрой «👤 Профили» → «➕ Добавить профиль» и начни заново.';
+
+export const PROFILE_DRAFT_CANCELED_TEXT = '↩️ Черновик профиля отменён — ничего не создано.';
+
+/**
+ * Кнопка меню при активном черновике: она работает как обычно, но черновик
+ * сбрасывает. Молчаливый сброс был бы хуже — человек дописывал бы мастер,
+ * которого уже нет.
+ */
+export const PROFILE_DRAFT_DROPPED_TEXT =
+  '↩️ Черновик профиля отменён (нажата кнопка меню). Чтобы завести игрока, начни заново: «👤 Профили» → «➕ Добавить профиль».';
+
+export const PROFILE_DRAFT_NOTHING_TEXT = 'Отменять нечего: активного черновика профиля нет.';
+
 export function formatRuleSaved(
   profileId: string,
   times: string[],
@@ -752,6 +880,22 @@ export function formatRuleSaved(
     `Корты: ${escapeHtml(formatCourts(courts, mode))}`,
     `Дни: ${escapeHtml(formatDays(days))}`,
     `Режим: ${escapeHtml(RULE_MODE_LABEL[mode])}`,
+  ].join('\n');
+}
+
+/**
+ * Первое, что игрок видит после перехода по ссылке-приглашению. Это же и
+ * единственный ответ, который получает чат, до этого момента боту незнакомый
+ * (src/bot/auth.ts): значит, из него должно быть понятно, куда он попал и что
+ * делать дальше — второго сообщения «а, и ещё» не будет.
+ */
+export function formatInviteWelcome(label: string): string {
+  return [
+    formatWelcome(label, false),
+    '',
+    escapeHtml('Бот бронирует корты Padel Port Batumi. Твой чат привязан к профилю — админ больше не нужен.'),
+    escapeHtml('«⏰ Расписание» — дни, времена и корты для автоброни; «⏭ Скип» — пропустить конкретный день игры.'),
+    escapeHtml(DROP_EXPLAINER),
   ].join('\n');
 }
 
