@@ -1,81 +1,84 @@
 # Hosting
 
-Где держать постоянно запущенный процесс Telegram-бота (`src/bot/index.ts`,
-grammY, long-polling). Сам деплой — фаза 4 (`PLAN.md`), после явного
-одобрения пользователя; здесь — сравнение вариантов и черновой план, чтобы к
-тому моменту не решать с нуля.
+Where to keep a permanently running process for the Telegram bot
+(`src/bot/index.ts`, grammY, long-polling). The deployment itself is phase 4
+(`PLAN.md`), after explicit user approval; this document is a comparison of
+options and a draft plan, so that by that point the decision doesn't have to be
+made from scratch.
 
-## Почему это вообще отдельный вопрос
+## Why this is a separate question at all
 
-Бот в этом проекте использует **long-polling** (`bot.start()`) — процесс сам
-держит постоянный HTTP-опрос `api.telegram.org`, а не ждёт входящих запросов
-на свой адрес. Следствия:
+The bot in this project uses **long-polling** (`bot.start()`) — the process
+itself keeps up a continuous HTTP poll of `api.telegram.org` rather than
+waiting for incoming requests to its own address. Consequences:
 
-- процесс должен работать 24/7; «заснувший» на классическом
-  serverless-хостинге (просыпается по внешнему запросу) бот молча теряет все
-  апдейты, пока не проснётся — идеально для дроп-таска (там будит `delay`
-  trigger.dev), но не для человека, который в чате нажал «Бронировать» и ждёт
-  ответа прямо сейчас;
-- **webhook** (Telegram сам делает HTTP-запрос на наш публичный эндпоинт при
-  каждом апдейте) снимает требование «процесс всегда жив» и вписывается в
-  serverless — но требует переписать `bot.start()` на обработку входящего
-  HTTP-запроса (`bot.handleUpdate()` за эндпоинтом), то есть другой каркас
-  кода, а не просто другой хостинг.
+- the process must run 24/7; a bot that "falls asleep" on classic serverless
+  hosting (it wakes up on an external request) silently loses every update
+  until it wakes — perfect for the drop task (there `delay` in trigger.dev
+  wakes it), but not for a human who pressed "Book" in the chat and is waiting
+  for a reply right now;
+- a **webhook** (Telegram itself makes an HTTP request to our public endpoint
+  on every update) removes the "process always alive" requirement and fits
+  serverless — but it requires rewriting `bot.start()` to handle an incoming
+  HTTP request (`bot.handleUpdate()` behind an endpoint), i.e. a different code
+  scaffold, not just different hosting.
 
-Это отдельная история от облачного дропа: `trigger.dev` (cron-таски, фаза 4)
-уже serverless по своей природе и никак не связан с выбором хостинга бота —
-решения по ним независимы.
+This is a separate story from the cloud drop: `trigger.dev` (cron tasks,
+phase 4) is already serverless by nature and is in no way tied to the choice of
+bot hosting — the two decisions are independent.
 
-## Сравнение для нашего кейса
+## Comparison for our case
 
 | | Railway | Northflank | Vercel |
 |---|---|---|---|
-| Модель под наш код | long-polling как есть, без изменений в `src/bot/` | long-polling как есть, без изменений в `src/bot/` | нужен webhook — переписать `bot.start()` под serverless-функцию |
-| Цена | Hobby ~5$/мес (после пробного периода), процесс работает непрерывно | Есть бесплатный тариф, но с ограничениями по ресурсам/простою — условия меняются чаще, чем стоит на них полагаться без проверки | Serverless functions бесплатны на Hobby-плане — но именно для webhook-модели, не для долгоживущего процесса |
-| Настройка | git push → авто-деплой, простой Dockerfile/Nixpacks | тоже git push, более «инфраструктурный» UI (проекты/окружения) | zero-config для функций, но не для процесса вроде нашего в исходном виде |
-| Секреты | Environment Variables в UI | Environment Variables в UI, по окружениям | Environment Variables в UI, но код должен быть stateless между вызовами |
-| Риск для нашего кейса | Низкий — платно, но без переделки кода | Средний — бесплатный лимит на момент фазы 4 может не покрывать 24/7, проверять перед деплоем | Высокий — архитектурная переделка бота ради экономии |
+| Fit for our code | long-polling as-is, no changes in `src/bot/` | long-polling as-is, no changes in `src/bot/` | needs a webhook — rewrite `bot.start()` as a serverless function |
+| Price | Hobby ~$5/mo (after the trial period), the process runs continuously | Has a free tier, but with resource/idle limits — its terms change more often than is worth relying on without checking | Serverless functions are free on the Hobby plan — but for the webhook model, not for a long-lived process |
+| Setup | git push → auto-deploy, simple Dockerfile/Nixpacks | also git push, more "infrastructure-oriented" UI (projects/environments) | zero-config for functions, but not for a process like ours as-is |
+| Secrets | Environment Variables in the UI | Environment Variables in the UI, per environment | Environment Variables in the UI, but the code must be stateless between calls |
+| Risk for our case | Low — paid, but no code rework | Medium — the free limit at the time of phase 4 may not cover 24/7; verify before deploying | High — architectural rework of the bot for the sake of savings |
 
-## Рекомендация
+## Recommendation
 
-**Railway** (Hobby, ~5$/мес). Обоснование:
+**Railway** (Hobby, ~$5/mo). Rationale:
 
-- Наш бот — один процесс с одной точкой входа (`src/bot/index.ts`), никакого
-  кода менять не нужно — деплоится как есть, тем же способом, каким гоняется
-  локально (`pnpm bot`).
-- 5$/мес не критичны для личного проекта одного человека; экономия на
-  бесплатном тарифе Northflank стоит времени на проверку его лимитов и риска
-  вылезти за них ровно тогда, когда бот критически нужен (перед дропом).
-- Webhook на Vercel — самый дешёвый вариант по деньгам, но платит
-  архитектурной сложностью: публичный HTTPS-эндпоинт, регистрация webhook у
-  Telegram (`setWebhook`), обработка cold start (первый апдейт после простоя
-  платит временем инициализации), и по сути отдельный путь кода, который
-  локально гоняется иначе, чем long-polling. Оправдан только если цена —
-  единственный критерий.
+- Our bot is a single process with a single entry point (`src/bot/index.ts`);
+  no code needs to change — it deploys as-is, the same way it runs locally
+  (`pnpm bot`).
+- $5/mo is not critical for one person's personal project; saving with
+  Northflank's free tier costs the time to verify its limits and the risk of
+  running past them exactly when the bot is critically needed (before a drop).
+- A webhook on Vercel is the cheapest option in money, but pays for it with
+  architectural complexity: a public HTTPS endpoint, registering the webhook
+  with Telegram (`setWebhook`), handling cold starts (the first update after
+  idle pays the initialization time), and effectively a separate code path that
+  runs differently locally than long-polling. Justified only if price is the
+  sole criterion.
 
-Northflank остаётся запасным вариантом, если его бесплатный тариф на момент
-фазы 4 реально покрывает круглосуточный процесс без сюрпризов — это стоит
-перепроверить прямо перед деплоем, а не полагаться на состояние тарифов на
-момент написания этого документа.
+Northflank remains the fallback if its free tier at the time of phase 4 really
+does cover a round-the-clock process without surprises — that's worth
+re-checking right before deploy rather than relying on the state of the pricing
+tiers as of the time this document was written.
 
-## Черновой план деплоя (фаза 4, не выполнять без отдельного одобрения)
+## Draft deployment plan (phase 4, do not execute without separate approval)
 
-1. Railway: New Project → Deploy from GitHub repo (ветка `main`) →
+1. Railway: New Project → Deploy from GitHub repo (branch `main`) →
    Environment Variables: `TELEGRAM_BOT_TOKEN`, `SUPABASE_URL`,
-   `SUPABASE_SERVICE_ROLE_KEY` и `TRIGGER_SECRET_KEY_PROD`. Контакты профилей
-   (`CLIENT_*`/`PROFILE_<K>_*`) боту сейчас не нужны — все данные для
-   отображения и брони по запросу бот берёт из таблицы `profiles`, не из env.
-   Ключ trigger.dev нужен именно процессу бота: без него `src/bot/reminder.ts`
-   не сможет поставить отложенный таск `remind`, и брони, сделанные из чата,
-   останутся без напоминания «⏰ через 2 часа». Это не роняет бота и никак не
-   мешает бронировать — просто тихо (одной строкой в логе) выключает
-   напоминания, поэтому переменную легко забыть.
-2. Start command: `pnpm bot`. На момент фазы 3 build-шага нет, процесс
-   гоняется через `tsx` так же, как локально.
-3. Restart policy по умолчанию (Railway перезапускает упавший процесс) —
-   этого достаточно для long-polling бота: `getUpdates` у Telegram сам
-   передоставит апдейты, накопленные за время простоя, в пределах TTL.
-4. После первого деплоя — вручную сверить, что бот отвечает на меню
-   знакомому chat_id и молчит незнакомому (`Bot.md` → «Авторизация»).
-5. Обновить этот файл и `Runbook.md`, если фактический процесс в проде
-   отличается от плана выше.
+   `SUPABASE_SERVICE_ROLE_KEY` and `TRIGGER_SECRET_KEY_PROD`. Profile contacts
+   (`CLIENT_*`/`PROFILE_<K>_*`) are not needed by the bot right now — all data
+   for display and on-request booking is taken by the bot from the `profiles`
+   table, not from env. The trigger.dev key is needed specifically by the bot
+   process: without it `src/bot/reminder.ts` can't schedule the deferred
+   `remind` task, and bookings made from the chat will be left without the
+   "in 2 hours" reminder. This doesn't crash the bot and doesn't interfere with
+   booking in any way — it just quietly (one line in the log) disables
+   reminders, which is why the variable is easy to forget.
+2. Start command: `pnpm bot`. As of phase 3 there is no build step; the process
+   runs through `tsx` the same way as locally.
+3. Default restart policy (Railway restarts a crashed process) — this is enough
+   for a long-polling bot: Telegram's `getUpdates` will itself re-deliver the
+   updates accumulated during downtime, within the TTL.
+4. After the first deploy — manually verify that the bot replies to the menu
+   for a known chat_id and stays silent to an unknown one (`Bot.md` →
+   "Authorization").
+5. Update this file and `Runbook.md` if the actual process in production
+   differs from the plan above.

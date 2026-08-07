@@ -1,6 +1,6 @@
-// Конфиг trigger.dev: проект proj_fxjnzqesxsicrpeuepzv. Таски подхватываются
-// из ./src/trigger по `dirs` (см. ниже): book-drop, remind, drop-observe,
-// daily-planner, heartbeat.
+// Конфиг trigger.dev. Ref проекта берётся из env TRIGGER_PROJECT_REF
+// (см. .env.example). Таски подхватываются из ./src/trigger по `dirs`
+// (см. ниже): book-drop, remind, drop-observe, daily-planner, heartbeat.
 //
 // ВАЖНО про cron. Тасков с расписанием два, и бронирует только один из них:
 //   — daily-planner (`schedules.task`, cron '30 16 * * *' = 20:30 Тбилиси)
@@ -91,7 +91,7 @@ function readDotEnv(): Record<string, string> {
 }
 
 export default defineConfig({
-  project: 'proj_fxjnzqesxsicrpeuepzv',
+  project: process.env.TRIGGER_PROJECT_REF ?? 'proj_your_project_ref',
   runtime: 'node',
   dirs: ['./src/trigger'],
   retries: {

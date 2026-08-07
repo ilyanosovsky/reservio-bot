@@ -19,7 +19,7 @@ import {
   type ProfileRow,
 } from '../src/core/repos.js';
 
-const URL_BASE = 'https://kbwmrqoxjlydmwyxirqm.supabase.co';
+const URL_BASE = 'https://example-project.supabase.co';
 const KEY = 'sb_secret_TESTKEY_do_not_leak';
 
 /** Код приглашения того же вида, что выдаёт InvitesRepo.create: 32 hex. */

@@ -17,3 +17,8 @@ coverage/
 
 # os / editor
 .DS_Store
+
+# local AI tooling (not part of the product)
+.mcp.json
+.agents/
+.claude/
