@@ -1,449 +1,456 @@
 # Bot
 
-Входящий Telegram-интерфейс бота (`src/bot/`, grammY, long-polling). Дополняет
-исходящие отчёты о дропе (`core/notify.ts`, см. `Runbook.md` → «Вечерний
-облачный прогон») — теперь профиль может не только получать сообщения, но и
-управлять бронями и расписанием через команды и кнопки.
+The bot's inbound Telegram interface (`src/bot/`, grammY, long polling). It
+complements the outbound drop reports (`core/notify.ts`, see `Runbook.md` →
+"Evening cloud run") — a profile can now not only receive messages but
+also manage its bookings and schedule through commands and buttons.
 
-Статус: фаза 3 (`PLAN.md`). Планировщик автоброней (`daily-planner`) написан,
-но **выключен по умолчанию** — см. `Runbook.md` → «Планировщик».
+Status: all phases implemented (`PLAN.md`). The auto-booking planner
+(`daily-planner`) is **disabled by default in code** and turned on per
+deployment via `settings.planner_enabled` — see `Runbook.md` → "Scheduler".
 
-## Запуск
+## Running
 
 ```bash
 pnpm bot                    # = npx tsx src/bot/index.ts
 ```
 
-Нужны `TELEGRAM_BOT_TOKEN` (тот же, что и для исходящих отчётов) и
-`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` (репозитории профилей,
-расписаний, скипов и настроек — `src/core/repos.ts`). Перед первым запуском —
-сид профиля-владельца: `npx tsx scripts/seed-profiles.ts` (подробности —
+You need `TELEGRAM_BOT_TOKEN` (the same one used for outbound reports) and
+`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` (the repositories for profiles,
+schedules, skips, and settings — `src/core/repos.ts`). Before the first run,
+seed the owner profile: `npx tsx scripts/seed-profiles.ts` (details in
 `Runbook.md`).
 
-Бот работает long-polling'ом (не webhook): процесс должен быть постоянно
-запущен, иначе входящие команды теряются молча. Варианты постоянного
-хостинга — `Hosting.md`.
+The bot runs on long polling (not webhooks): the process must stay up
+continuously, otherwise inbound commands are lost silently. Options for
+always-on hosting are in `Hosting.md`.
 
-## Авторизация: allowlist по chat_id
+## Authorization: chat_id allowlist
 
-`src/bot/auth.ts` — первый middleware в цепочке. На каждый апдейт:
+`src/bot/auth.ts` is the first middleware in the chain. On every update:
 
 ```
 profile = await profiles.getByChatId(String(ctx.chat.id))
 ```
 
-Нет профиля с таким `telegram_chat_id` в таблице `profiles` → бот отвечает
-**полной тишиной**: ни одного сообщения, только debug-лог без chat_id в
-проде. Так и задумано (`CLAUDE.md` → «Мультипрофили»): бота можно найти в
-поиске Telegram, но воспользоваться им может только тот, чей chat_id заранее
-занесён администратором. Есть профиль → он кладётся в `ctx.state.profile` и
-доступен всем хендлерам ниже по цепочке.
+No profile with that `telegram_chat_id` in the `profiles` table → the bot
+answers with **complete silence**: not a single message, only a debug log with
+no chat_id in production. This is by design (`CLAUDE.md` → «Мультипрофили»):
+the bot can be found in Telegram search, but only someone whose chat_id an
+admin has entered in advance can actually use it. If a profile exists, it is
+placed in `ctx.state.profile` and is available to every handler further down
+the chain.
 
-Никаких паролей, кодов подтверждения или OAuth — единственный «секрет»
-системы это сам `telegram_chat_id`, который администратор получает от
-человека лично (вне бота) и заносит командой `/add_profile`.
+No passwords, confirmation codes, or OAuth — the only "secret" in the system is
+the `telegram_chat_id` itself, which the admin obtains from the person in
+person (outside the bot) and enters with `/add_profile`.
 
-**Команды принимаются только из личного чата.** Апдейт из группы/супергруппы
-бот игнорирует, даже если id этой группы лежит в `profiles.telegram_chat_id`:
-под ним пишет любой из её участников, то есть как удостоверение личности он не
-годится. Это важно потому, что с фазы 2 `TELEGRAM_CHAT_ID` — адрес ИСХОДЯЩИХ
-отчётов, и там вполне может стоять группа; `scripts/seed-profiles.ts` кладёт то
-же значение в профиль владельца и предупреждает, если оно групповое. Слать
-отчёты и напоминания в группу при этом можно как обычно.
+**Commands are accepted only from a private chat.** The bot ignores updates
+from a group/supergroup even if that group's id is in
+`profiles.telegram_chat_id`: any member of the group can post under it, so it is
+no good as proof of identity. This matters because since phase 2
+`TELEGRAM_CHAT_ID` is the address for OUTBOUND reports, and that may well be a
+group; `scripts/seed-profiles.ts` writes the same value into the owner profile
+and warns if it is a group. Sending reports and reminders to a group still
+works as usual.
 
-Порядок сборки («auth первым, хендлеры после») зафиксирован в
-`src/bot/setup.ts` и проверяется тестами `tests/bot-auth.test.ts`: хендлер,
-зарегистрированный до middleware, отвечал бы чужому чату.
+The assembly order ("auth first, handlers after") is fixed in
+`src/bot/setup.ts` and checked by the `tests/bot-auth.test.ts` tests: a handler
+registered before the middleware would answer a stranger's chat.
 
-## Меню
+## Menu
 
-Reply-клавиатура (`src/bot/menu.ts`):
+Reply keyboard (`src/bot/menu.ts`):
 
 ```
-[📅 Мои брони]   [🔍 Слоты]
-[📆 Бронировать] [❌ Отменить бронь]
-[⏭ Скип]         [⏰ Расписание]
-                  [👤 Профили]      ← только у is_admin
+[📅 My bookings] [🔍 Slots]
+[📆 Book]        [❌ Cancel]
+[⏭ Skip]        [⏰ Schedule]
+                 [👤 Profiles]     ← is_admin only
 ```
 
-У обычного (не-админского) профиля кнопки «Профили» нет вовсе; если такой
-профиль всё же пришлёт `/add_profile` руками, команда молчит — точно так же,
-как если бы её прислал вообще чужой chat_id.
+A regular (non-admin) profile has no Profiles button at all; if such a profile
+nonetheless sends `/add_profile` by hand, the command stays silent — exactly as
+if a completely unknown chat_id had sent it.
 
-## Хендлеры
+## Handlers
 
-Форматирование сообщений и разбор команд — чистые функции (`src/bot/format.ts`,
-`src/bot/parse.ts`) с тестами vitest; хендлеры (`src/bot/handlers/*.ts`) —
-тонкая склейка grammY-контекста с этими функциями и вызовами
-`ReservioClient`/репозиториев.
+Message formatting and command parsing are pure functions (`src/bot/format.ts`,
+`src/bot/parse.ts`) with vitest tests; the handlers (`src/bot/handlers/*.ts`)
+are a thin glue layer between the grammY context and those functions plus calls
+to `ReservioClient`/the repositories.
 
-**📅 Мои брони** — `listBookings(profileId)` из state, только записи с
-`state !== 'canceled'` и только будущие (дата+время ≥ сейчас в Asia/Tbilisi).
-Формат строки: `дата время корт`.
+**📅 My bookings** — `listBookings(profileId)` from state, only records with
+`state !== 'canceled'` and only future ones (date+time ≥ now in Asia/Tbilisi).
+Row format: `date time court`.
 
-**🔍 Слоты** — inline-цепочка: дата (сегодня…T+7) → корт (все шесть кортов
-клуба из `BOOKABLE_COURTS` — 4 падел-корта и Park Court 1/2) → список
-свободных слотов этого дня/корта из `ReservioClient.getAvailability`. Только
-просмотр, без брони.
+**🔍 Slots** — inline chain: date (today…T+7) → court (all six club courts from
+`BOOKABLE_COURTS` — 4 padel courts and Park Court 1/2) → the list of free slots
+for that day/court from `ReservioClient.getAvailability`. View only, no booking.
 
-**📆 Бронировать** — дата → корт → время (уже из реально свободных слотов
-этого корта/дня, а не из всех возможных часов) → подтверждение (inline
-«да»/«нет») → `bookNow(profile, {date, time, court}, deps)`
-(`src/core/book-now.ts`) → ответ с итогом: успех с номером брони (и
-автоматически запланированным напоминанием за 2 часа) либо человекочитаемая
-причина отказа — слот уже занят или на него уже есть активная бронь того же
-профиля.
+**📆 Book** — date → court → time (already drawn from the court/day's actually
+free slots, not from every possible hour) → confirmation (inline "yes"/"no") →
+`bookNow(profile, {date, time, court}, deps)` (`src/core/book-now.ts`) → a reply
+with the outcome: success with the booking number (and a reminder automatically
+scheduled 2 hours ahead) or a human-readable reason for refusal — the slot is
+already taken, or the same profile already has an active booking for it.
 
-**❌ Отменить бронь** — список будущих `confirmed` броней профиля → выбор →
-подтверждение → `client.cancelBooking(bookingId, token)` (`token` берётся из
-сохранённой записи в state, в чат никогда не выводится) → `state.markCanceled`
-+ ответ. Дедлайн отмены — за час до начала слота (`docs/PROTOCOL.md`); если
-он уже прошёл, бот показывает это по-человечески («отменить уже нельзя — до
-игры меньше часа»), а не сырую ошибку API.
+**❌ Cancel** — the list of the profile's future `confirmed` bookings → pick →
+confirm → `client.cancelBooking(bookingId, token)` (`token` comes from the
+stored record in state and is never shown in chat) → `state.markCanceled` +
+reply. The cancellation deadline is one hour before the slot starts
+(`docs/PROTOCOL.md`); if it has already passed, the bot says so in human terms
+("can't cancel anymore — less than an hour to game time") rather than a raw API
+error.
 
-**⏭ Скип** — ближайшие 7 дат с пометкой, скипнут ли у профиля этот день
-(таблица `skips`, скип целого дня, не отдельного слота). Тап переключает:
-скипнут → снять (`SkipsRepo.remove`), не скипнут → поставить
-(`SkipsRepo.add`). Пока цикл ручной (фаза 3), кнопка — заготовка под
-автопланировщик: когда `daily-planner` включат (фаза 4), точно такая же
-кнопка будет приходить сама в pre-drop сообщении каждый вечер.
+**⏭ Skip** — the next 7 dates, each marked with whether the profile skips that
+day (the `skips` table; a skip covers a whole day, not a single slot). A tap
+toggles it: skipped → clear (`SkipsRepo.remove`), not skipped → set
+(`SkipsRepo.add`). While the loop is still manual (phase 3), the button is a
+placeholder for the auto-planner: once `daily-planner` is enabled (phase 4), the
+very same button will arrive on its own in the pre-drop message every evening.
 
-### ⏰ Расписание: конструктор сценариев
+### ⏰ Schedule: scenario builder
 
-Было (фаза 3): плоский список правил профиля, вкл/выкл тапом. Стало (этот
-PR): полноценный CRUD-мастер с крошками и «⬅️ Назад» — тот же паттерн UX, что
-и у «📆 Бронировать» (шаг мастера — редактируемое состояние в
-`callback_data`, БЕЗ серверного state; стиль мастеров зафиксирован коммитом
-`a08faa8` «хлебные крошки на каждом шаге + кнопка Назад»).
+Before (phase 3): a flat list of the profile's rules, toggled on/off with a tap.
+Now (this PR): a full CRUD wizard with breadcrumbs and a "⬅️ Back" button — the
+same UX pattern as "📆 Book" (a wizard step is editable state carried in
+`callback_data`, with NO server-side state; the wizard style was fixed by commit
+`a08faa8` "breadcrumbs on every step + Back button").
 
-**Список сценариев** (`SchedulesRepo.listByProfile`) — по каждому: `label`
-(имя сценария), дни недели, времена, корты, режим, вкл/выкл. Кнопки на
-сценарий: `[вкл/выкл]` `[✏️]` `[🗑 удалить]` (удаление — с промежуточным
-подтверждением, как «❌ Отменить бронь»). Кнопка `[➕ Новый сценарий]` —
-запускает тот же мастер, что и редактирование, с пустым состоянием.
+**Scenario list** (`SchedulesRepo.listByProfile`) — for each: `label` (the
+scenario name), days of week, times, courts, mode, on/off. Per-scenario buttons:
+`[on/off]` `[✏️]` `[🗑 delete]` (deletion goes through an intermediate
+confirmation, like "❌ Cancel"). The `[➕ New scenario]` button launches the same
+wizard as editing, with empty state.
 
-**Мастер (создание и редактирование — общий флоу)**, 5 шагов, крошки на
-каждом («Шаг N из 5: …») и «⬅️ Назад» на любом шаге кроме первого:
+**Wizard (create and edit share one flow)**, 5 steps, breadcrumbs on each
+("Step N of 5: …") and "⬅️ Back" on every step but the first:
 
-1. **Дни недели** — мультивыбор с галочками (0=вс … 6=сб) + «каждый день»
-   (эквивалент пустого `days_of_week`, брони каждый день) + «Готово».
-2. **Времена** — мультивыбор из сетки часовых слотов 07:00–23:00 + «Готово».
-   Если у правки отмечен час вне этой сетки (правило заведено `/add_rule`,
-   который принимает любой `HH:MM`), мастер дорисовывает кнопку и для него —
-   иначе такую галочку нельзя было бы снять и правка молча возвращала бы
-   лишний час в базу.
-3. **Корты** — мультивыбор из `BOOKABLE_COURTS` (все шесть кортов клуба — 4
-   падел-корта и Park Court 1/2, тот же набор, что и в «🔍 Слоты»/«📆
-   Бронировать») + «Готово».
-4. **Режим**: «первый доступный по приоритету» (`mode: 'priority'`, порядок
-   = порядок выбора кортов на шаге 3, старое поведение) / «бронировать все
-   появившиеся» (`mode: 'all'`, вахта по набору — см. `Runbook.md` →
-   «Мультикорт-вечер»).
-5. **Подтверждение** — сводка (дни, времена, корты, режим, label) + кнопка
-   сохранить. Под сводкой — пояснение для владельца: «бронь ловится в момент
-   дропа: слот часа H открывается в H:59:00 за 7 суток» (то же число, что и
-   в `docs/PROTOCOL.md`) — чтобы было видно, откуда берётся тайминг гонки.
+1. **Days of week** — multi-select with checkmarks (0=Sun … 6=Sat) + "every day"
+   (equivalent to an empty `days_of_week`, book every day) + "Done".
+2. **Times** — multi-select from the grid of hourly slots 07:00–23:00 + "Done".
+   If an edit has an hour checked outside this grid (a rule created via
+   `/add_rule`, which accepts any `HH:MM`), the wizard also renders a button for
+   it — otherwise that checkmark could not be cleared and the edit would
+   silently put the extra hour back in the database.
+3. **Courts** — multi-select from `BOOKABLE_COURTS` (all six club courts — 4
+   padel courts and Park Court 1/2, the same set as in "🔍 Slots"/"📆 Book") +
+   "Done".
+4. **Mode**: "first available by priority" (`mode: 'priority'`, order = the order
+   the courts were selected in step 3, the old behavior) / "book every one that
+   appears" (`mode: 'all'`, the watch set — see `Runbook.md` →
+   "Multi-court evening").
+5. **Confirmation** — a summary (days, times, courts, mode, label) + a Save
+   button. Below the summary, a note for the owner: "a booking is caught at the
+   moment of the drop: the slot for hour H opens at H:59:00, 7 days out" (the
+   same figure as in `docs/PROTOCOL.md`) — so the source of the race timing is
+   visible.
 
-**Кодирование состояния мастера в `callback_data`** (лимит Telegram — 64
-байта, серверного состояния мастер не хранит): мультивыборы — битмасками:
-дни недели 7 бит, корты 6 бит (по числу кортов в `BOOKABLE_COURTS`), времена
-24 бита (по числу часовых слотов) — в hex. Шаг мастера, `ruleId` (для
-edit-флоу) и все битмаски едут вместе в одном `callback_data` — тот же
-принцип, что и у даты/корта в мастере «📆 Бронировать».
+**Encoding the wizard state in `callback_data`** (Telegram's 64-byte limit; the
+wizard keeps no server-side state): the multi-selects are bitmasks — 7 bits for
+days of week, 6 bits for courts (one per court in `BOOKABLE_COURTS`), 24 bits for
+times (one per hourly slot) — in hex. The wizard step, the `ruleId` (for the
+edit flow), and all the bitmasks ride together in a single `callback_data` — the
+same principle as the date/court in the "📆 Book" wizard.
 
-**Label** — имя сценария. Мастер его не спрашивает и в колонку `label` НЕ
-пишет: подпись считается на лету из времён и кортов —
-`«20:00+21:00 · C3,C4,C1»` (времена через `+`, корты сокращённо через
-запятую). Так она всегда соответствует содержимому: сохранённое автоимя
-осталось бы прежним после правки, и кнопка в списке врала бы (владелец
-выключает сценарий тапом по названию). Имя, заданное человеком напрямую в
-БД, правка не затирает — оно продолжает показываться вместо автоимени.
+**Label** — the scenario name. The wizard does not ask for it and does NOT write
+the `label` column: the caption is computed on the fly from the times and
+courts — `"20:00+21:00 · C3,C4,C1"` (times joined with `+`, courts abbreviated
+and comma-separated). That way it always matches the content: a stored
+auto-name would stay the same after an edit and the button in the list would lie
+(the owner turns a scenario off by tapping its name). A name a human set
+directly in the DB is not overwritten by an edit — it keeps showing instead of
+the auto-name.
 
-**Двойной тап «💾 Сохранить»** дубля не создаёт: кнопка stateless (у нового
-сценария `ruleId` в `callback_data` пустой), поэтому перед вставкой хендлер
-ищет среди сценариев профиля точное совпадение по времени/кортам/дням/режиму
-и обновляет его — та же защита, что у `/add_rule`. Иначе получились бы два
-одинаковых включённых сценария: два pre-drop сообщения за вечер и лишний ран.
+**A double tap on "💾 Save"** creates no duplicate: the button is stateless (a
+new scenario has an empty `ruleId` in `callback_data`), so before inserting, the
+handler looks among the profile's scenarios for an exact match on
+times/courts/days/mode and updates it — the same protection as `/add_rule`.
+Otherwise you would get two identical enabled scenarios: two pre-drop messages
+per evening and one extra run.
 
-**Выключение и удаление сценария не отменяют дроп, уже поставленный на
-сегодня** (`daily-planner` шлёт ран в 20:30 со всеми параметрами в payload, а
-`book-slot-drop` перечитывает только скипы). Экраны говорят об этом прямо:
-единственный рычаг на текущий вечер — «⏭ Скип» на дату игры.
+**Turning off or deleting a scenario does not cancel a drop already scheduled
+for today** (`daily-planner` sends a run at 20:30 with all parameters in the
+payload, and `book-slot-drop` re-reads only the skips). The screens say this
+outright: the only lever for the current evening is "⏭ Skip" on the game date.
 
-**Совместимость и авторизация**: старые `callback_data` (плоский список с
-одним вкл/выкл на правило, до этого PR) продолжают работать без миграции
-клиентов; чужой `chat_id` на любом шаге мастера — тишина, как и везде в боте
-(«Авторизация» выше).
+**Compatibility and authorization**: old `callback_data` (the flat list with one
+on/off per rule, before this PR) keeps working with no client migration; an
+unknown `chat_id` at any wizard step gets silence, as everywhere else in the bot
+("Authorization" above).
 
-**`/add_rule`** остаётся admin-фолбэком для ручного ввода без мастера,
-формат дополнен режимом (необязательный последний сегмент, по умолчанию
-`priority` — старые вызовы без него не ломаются):
+**`/add_rule`** remains the admin fallback for manual entry without the wizard;
+the format is extended with a mode (an optional last segment, defaulting to
+`priority` — old calls without it don't break):
 
 ```
 /add_rule profile_id;20:00,21:00;Padel Court 3,Padel Court 4,Padel Court 1;1,2,3,4,5;all
 ```
 
-⚠️ Контакт (`name/email/phone`) по-прежнему берётся движком ТОЛЬКО из
-env-профиля (`CLIENT_*`/`PROFILE_<K>_*`, см. «Профиль в БД vs профиль
-движка» ниже) — это не изменилось этим PR. А вот `courts`/`mode` — уже НЕ
-только текст pre-drop сообщения: `book-slot-drop` принимает их прямо в
-payload (`courts?: string[]`, `mode?: 'priority' | 'all'`) — и `daily-planner`
-шлёт их ЯВНО вместе с `force: true`; если payload их не содержит (ручной ран,
-старые раны), таск подтягивает их из `schedule_rule` профиля в БД. Набор
-кортов и режим, настроенные в мастере
-«⏰ Расписание», теперь реально управляют дропом, а не только текстом
-уведомления — старое расхождение «сообщение обещает один корт, а бот займёт
-другой» для `courts`/`mode` закрыто. Контакт для нового игрока всё ещё нужно
-заводить руками в env отдельно от БД-профиля (см. таблицу ниже).
+⚠️ The contact (`name/email/phone`) is still taken by the engine ONLY from the
+env profile (`CLIENT_*`/`PROFILE_<K>_*`, see "DB profile vs engine profile"
+below) — this did not change in this PR. But `courts`/`mode` are no longer just
+the text of the pre-drop message: `book-slot-drop` accepts them straight from the
+payload (`courts?: string[]`, `mode?: 'priority' | 'all'`) — and `daily-planner`
+sends them EXPLICITLY together with `force: true`; if the payload does not carry
+them (a manual run, old runs), the task pulls them from the profile's
+`schedule_rule` in the DB. The court set and mode configured in the "⏰ Schedule"
+wizard now actually drive the drop, not just the notification text — the old
+mismatch "the message promises one court but the bot takes another" for
+`courts`/`mode` is closed. A contact for a new player must still be set up by
+hand in env, separately from the DB profile (see the table below).
 
-**👤 Профили** (только `is_admin`, иначе кнопки нет и сама команда молчит):
+**👤 Profiles** (`is_admin` only; otherwise the button is absent and the command
+itself is silent):
 
-- список всех профилей (`ProfilesRepo.list()`);
-- `/add_profile id;label;name;email;phone;chat_id` — upsert профиля.
-  `chat_id` можно оставить пустым (профиль без доступа к боту, например
-  тестовый). Формат и подсказка при ошибке разбора — прямо в ответе команды;
+- a list of all profiles (`ProfilesRepo.list()`);
+- `/add_profile id;label;name;email;phone;chat_id` — upsert a profile.
+  `chat_id` may be left empty (a profile with no bot access, e.g. a test one).
+  The format and the hint on a parse error are right in the command's reply;
 - `/add_rule profile_id;20:00,21:00;Padel Court 3,Padel Court 4,Padel Court 1;1,2,3,4,5;all` —
-  upsert правила расписания. Дни недели (пусто = каждый день) и режим
-  (`priority`/`all`, по умолчанию `priority`) — последние два сегмента,
-  оба необязательны. Дни — те же 0–6 (вс=0), что и во всём проекте
-  (`weekdayOf` в `core/scheduler.ts`). Полное описание полей и то же самое
-  через мастер кнопок — «⏰ Расписание: конструктор сценариев» выше.
+  upsert a schedule rule. Days of week (empty = every day) and mode
+  (`priority`/`all`, default `priority`) are the last two segments, both
+  optional. Days use the same 0–6 (Sun=0) as everywhere in the project
+  (`weekdayOf` in `core/scheduler.ts`). The full field description, and the same
+  thing via the button wizard, is in "⏰ Schedule: scenario builder" above.
 
-Токены, `SUPABASE_SERVICE_ROLE_KEY`, `TELEGRAM_BOT_TOKEN` и любые другие
-секреты в чат не попадают ни при каком сценарии — их нет ни в форматтерах, ни
-в текстах ошибок хендлеров. chat_id чужих профилей не логируется даже в debug
-(см. «Авторизация» выше).
+Tokens, `SUPABASE_SERVICE_ROLE_KEY`, `TELEGRAM_BOT_TOKEN`, and any other secrets
+never reach the chat under any scenario — they are neither in the formatters nor
+in the handlers' error texts. The chat_id of other profiles is not logged even
+in debug (see "Authorization" above).
 
-### Добавление игрока: мастер + invite-ссылка
+### Adding a player: wizard + invite link
 
-До этого PR второй профиль заводился только руками — админ спрашивал у
-игрока `chat_id` вне бота и подставлял его в `/add_profile`. Кнопка «➕
-Добавить профиль» в «👤 Профили» (только `is_admin`, как и вся эта ветка)
-убирает этот шаг: `chat_id` игрок привязывает себе сам, перейдя по
-одноразовой ссылке-приглашению.
+Before this PR, a second profile could only be created by hand — the admin asked
+the player for their `chat_id` outside the bot and put it into `/add_profile`.
+The "➕ Add profile" button in "👤 Profiles" (`is_admin` only, like this whole
+branch) removes that step: the player binds their own `chat_id` by following a
+one-time invite link.
 
-**Мастер — пошаговый текстовый ввод** (сообщениями, не inline-кнопками,
-кроме финального подтверждения):
+**The wizard is step-by-step text entry** (via messages, not inline buttons,
+except for the final confirmation):
 
-1. «Имя игрока (видимое в списках)» → `label` и `name`.
-2. «Email аккаунта Reservio игрока» → та же валидация (`EMAIL_RE`), что и в
-   `/add_profile` (`src/bot/parse.ts`).
-3. «Телефон (+995...)» → та же валидация (`PHONE_RE`), что и в
-   `/add_profile`.
-4. Сводка введённых данных + inline-кнопки «✅ Создать» / «❌ Отмена».
+1. "Player name (shown in lists)" → `label` and `name`.
+2. "The player's Reservio account email" → the same validation (`EMAIL_RE`) as
+   in `/add_profile` (`src/bot/parse.ts`).
+3. "Phone (+995...)" → the same validation (`PHONE_RE`) as in `/add_profile`.
+4. A summary of the entered data + inline buttons "✅ Create" / "❌ Cancel".
 
-По «✅ Создать»: заводится профиль (`id = 'p' + 8 hex`, `is_admin = false`,
-`telegram_chat_id = null`), для него генерируется код приглашения
-(`InvitesRepo.create(profileId)`), и админу приходит:
+On "✅ Create": a profile is created (`id = 'p' + 8 hex`, `is_admin = false`,
+`telegram_chat_id = null`), an invite code is generated for it
+(`InvitesRepo.create(profileId)`), and the admin receives:
 
-> Профиль создан. Отправь игроку ссылку-приглашение:
-> `https://t.me/{bot_username}?start=inv_{code}` — по ней бот привяжет её
-> чат и откроет меню
+> Profile created. Send the player this invite link:
+> `https://t.me/{bot_username}?start=inv_{code}` — following it, the bot will
+> bind their chat and open the menu
 
-`bot_username` берётся из `ctx.me.username` (не хардкод — тот же бот может
-жить под разными именами в dev/prod).
+`bot_username` comes from `ctx.me.username` (not hardcoded — the same bot can run
+under different names in dev/prod).
 
-**Состояние мастера** — `src/bot/wizard-state.ts`, in-memory `Map` по
-`chat_id` администратора, TTL 15 минут. «❌ Отмена» и команда `/cancel`
-сбрасывают черновик явно. **Рестарт бота черновик теряет** (это
-in-memory, не таблица) — если админ был на середине шага во время
-редеплоя, придётся начать заново. Пока у админа есть активный черновик, его
-обычные текстовые сообщения «ест» мастер (интерпретирует как ответ на
-текущий шаг); кнопки reply-меню при этом продолжают работать как обычно и
-попутно сбрасывают черновик — с явной подсказкой, что он отменён, чтобы
-недописанный ввод не потерялся молча.
+**The wizard state** is in `src/bot/wizard-state.ts`, an in-memory `Map` keyed by
+the admin's `chat_id`, TTL 15 minutes. "❌ Cancel" and the `/cancel` command
+clear the draft explicitly. **A bot restart loses the draft** (it is in-memory,
+not a table) — if the admin was mid-step during a redeploy, they have to start
+over. While the admin has an active draft, the wizard "eats" their ordinary text
+messages (interpreting them as the answer to the current step); the reply-menu
+buttons keep working as usual meanwhile and also clear the draft along the way —
+with an explicit note that it was canceled, so unfinished input isn't lost
+silently.
 
-Истёкший черновик объясняется ровно один раз («живёт 15 минут, начни
-заново») и только владельцу — на его СЛЕДУЮЩЕЕ сообщение. Чистка памяти при
-этом проходит по всем черновикам сразу (чужой брошенный мастер иначе висел
-бы в процессе вечно вместе с email и телефоном игрока), но подсказка
-закрепляется за владельцем каждого выметенного черновика: при двух админах
-активность одного не должна оставлять другого без ответа на его же ввод.
-Инициативных сообщений бот при этом не шлёт — только отвечает.
+An expired draft is explained exactly once ("it lives 15 minutes, start over")
+and only to its owner — on their NEXT message. The memory sweep, however, runs
+over all drafts at once (otherwise a stranger's abandoned wizard would hang in
+the process forever, along with the player's email and phone), but the hint is
+tied to the owner of each swept draft: with two admins, one's activity must not
+leave the other without a reply to their own input. The bot sends no unprompted
+messages while doing this — it only replies.
 
-Email и телефон — персональные данные, поэтому их не логируют (см.
-«Приватность» в `src/bot/handlers/profiles.ts`), но на шаге 4 сводка
-показывает их админу полностью: он их только что сам ввёл, это не утечка.
+Email and phone are personal data, so they are not logged (see the privacy note
+in `src/bot/handlers/profiles.ts`), but at step 4 the summary shows them to the
+admin in full: they just entered them themselves, so it is not a leak.
 
-**Приём ссылки** (`src/bot/auth.ts`) — единственное осознанное исключение
-из «чужому chat_id — полная тишина» (см. «Авторизация» выше): приватный чат
-без своего профиля, текст ровно `/start inv_<code>`.
+**Accepting the link** (`src/bot/auth.ts`) is the one deliberate exception to
+"unknown chat_id gets complete silence" (see "Authorization" above): a private
+chat with no profile of its own, text exactly `/start inv_<code>`.
 
-1. `InvitesRepo.claim(code, chatId)` — атомарный `PATCH … used_at
-   WHERE code=eq AND used_at=is.null`. Пустой ответ (кода нет ИЛИ он уже
-   использован — снаружи это неразличимо) → **тишина**: чужому не палим
-   даже то, что бот жив.
-2. Успех → профиль по `profileId`. Если у него УЖЕ есть `telegram_chat_id`
-   (ссылку переслали не тому или использовали повторно после того, как её
-   отдали игроку) → тоже **тишина**: инвайт к занятому профилю мёртв.
-3. Иначе — `telegram_chat_id` профиля ставится в текущий `chatId`, и в ответ
-   уходит приветствие по-русски (имя профиля, короткое «что умеет бот») и
-   обычное меню («📅 Мои брони» / «🔍 Слоты» / «📆 Бронировать» и т.д., без
-   «👤 Профили» — новый профиль не админ).
+1. `InvitesRepo.claim(code, chatId)` — an atomic `PATCH … used_at
+   WHERE code=eq AND used_at=is.null`. An empty response (the code doesn't exist
+   OR it is already used — indistinguishable from the outside) → **silence**: we
+   don't reveal to a stranger even that the bot is alive.
+2. Success → the profile by `profileId`. If it ALREADY has a
+   `telegram_chat_id` (the link was forwarded to the wrong person, or reused
+   after being handed to the player) → also **silence**: an invite to an
+   occupied profile is dead.
+3. Otherwise — the profile's `telegram_chat_id` is set to the current `chatId`,
+   and the reply is a greeting (the profile name, a short "what the bot does")
+   plus the ordinary menu ("📅 My bookings" / "🔍 Slots" / "📆 Book" etc., with
+   no "👤 Profiles" — a new profile is not an admin).
 
-Если `chat_id` уже привязан к какому-то профилю и присылает `/start
-inv_<code>` — инвайт игнорируется, это обычный `/start` (повторная
-активация чужой ссылки из своего чата ничего не меняет, профиль не
-переезжает). В `src/bot/setup.ts` invite-ветка стоит ДО общей проверки
-allowlist — иначе до чат-специфичного кода никогда не доходило бы.
+If a `chat_id` already bound to some profile sends `/start inv_<code>`, the
+invite is ignored — it is an ordinary `/start` (re-triggering someone else's
+link from your own chat changes nothing, the profile does not move). In
+`src/bot/setup.ts` the invite branch sits BEFORE the general allowlist check —
+otherwise the chat-specific code would never be reached.
 
-Код одноразовый (`used_at` выставляется атомарно при первом успешном
-`claim`): двойной тап по одной и той же ссылке-приглашению — то же самое
-состояние гонки, что `claim` и решает, — приводит ровно к одной привязке,
-второй тап видит `used_at` уже занятым и получает тишину, как в п.1.
+The code is one-time (`used_at` is set atomically on the first successful
+`claim`): a double tap on the same invite link — the very race `claim` resolves —
+leads to exactly one binding; the second tap sees `used_at` already set and gets
+silence, as in point 1.
 
-**Перевыпуск ссылки.** В списке «👤 Профили» у каждого профиля БЕЗ
-привязанного чата есть кнопка «🔗 Ссылка для &lt;имя&gt;»
-(`handlers/profiles.ts` → `reissueInvite`): она выпускает тому же профилю
-новый код и присылает готовую ссылку отдельным сообщением — его удобно
-переслать игроку целиком. Заводить человека заново не нужно.
+**Reissuing the link.** In the "👤 Profiles" list, every profile WITHOUT a bound
+chat has a "🔗 Link for &lt;name&gt;" button (`handlers/profiles.ts` →
+`reissueInvite`): it issues the same profile a new code and sends the ready link
+as a separate message — convenient to forward to the player whole. There is no
+need to create the person again.
 
-Это не удобство, а починка трёх реальных случаев:
+This is not a convenience but a fix for three real cases:
 
-- ссылку потеряли (сообщение удалили, чат почистили) до первого перехода;
-- игрок открыл ссылку, `claim` уже погасил код, а запись
-  `telegram_chat_id` не прошла (Supabase отвалился по таймауту): код мёртв,
-  профиль остался без чата, игроку при этом ушла тишина — узнать об этом
-  можно только по логу процесса и по строке «chat не привязан» в списке;
-- профиль записался, а выпуск кода следом упал — тогда админ видит
-  «⚠️ Не получилось…», а профиль уже в базе.
+- the link was lost (the message deleted, the chat cleared) before the first
+  visit;
+- the player opened the link, `claim` already consumed the code, but the
+  `telegram_chat_id` write did not go through (Supabase timed out): the code is
+  dead, the profile is left with no chat, and the player got silence — you can
+  learn this only from the process log and from the "chat not bound" row in the
+  list;
+- the profile was written but the code issuance right after it failed — then the
+  admin sees "⚠️ Couldn't…", while the profile is already in the database.
 
-Профилю с УЖЕ привязанным чатом кнопка не рисуется, и нажатая из старого
-сообщения кода не выпускает (ответ «чат уже привязан»): приглашение к
-занятому профилю всё равно мёртвое, а лишний живой код — лишний секрет.
-Прежняя ссылка, если её ещё не открывали, остаётся рабочей: сработает та,
-которую откроют первой, вторая после привязки мертва.
+A profile with a chat ALREADY bound gets no button rendered, and one pressed from
+an old message issues no code (the reply is "chat already bound"): an invite to
+an occupied profile is dead anyway, and an extra live code is an extra secret.
+The previous link, if not yet opened, stays valid: whichever is opened first
+wins, the second is dead after the binding.
 
-После привязки игрок настраивает себя сам, без участия админа: время и
-корты — кнопкой «⏰ Расписание» (мастер сценариев выше), пропуск конкретного
-дня — «⏭ Скип». Админ на этом этапе больше не нужен — разве что для
-контакта в env, см. следующий раздел.
+After binding, the player configures themselves without the admin: times and
+courts via the "⏰ Schedule" button (the scenario wizard above), skipping a
+specific day via "⏭ Skip". The admin is no longer needed at this stage — except
+for the env contact, see the next section.
 
-## Свободные запросы
+## Free-form queries
 
-Фаза 5 (`PLAN.md`), базовая часть. Помимо меню и мастеров, авторизованный
-профиль может писать боту обычным текстом — «найди 2 часа подряд в субботу
-днём», «есть 20:00 в пятницу на четвёртом?» — и получать те же экраны поиска
-и подтверждения, что и из кнопок. Путь A из `CLAUDE.md`: LLM здесь — ТОЛЬКО
-парсер текста в структуру, никакого текста от модели пользователю и никаких
-решений модели о брони. Бронь по-прежнему создаётся только через
-человеческое подтверждение кнопкой на СУЩЕСТВУЮЩЕМ экране («📆 Бронировать»
-выше) — свободный текст — это ещё один способ до него дойти, а не новый
-способ бронировать.
+Phase 5 (`PLAN.md`), the base part. Besides the menu and wizards, an authorized
+profile can write to the bot in plain text — "find 2 hours in a row on Saturday
+afternoon", "is there a 20:00 on Friday on court 4?" — and get the same search
+and confirmation screens as from the buttons. Path A from `CLAUDE.md`: the LLM
+here is ONLY a parser of text into structure, no text from the model to the user
+and no booking decisions by the model. A booking is still created only through a
+human confirmation button on an EXISTING screen ("📆 Book" above) — free-form
+text is one more way to reach it, not a new way to book.
 
-**Приоритет обработки входящего текста** (`src/bot/handlers/index.ts`):
+**Priority for handling inbound text** (`src/bot/handlers/index.ts`):
 
-1. активный черновик мастера (профиля или сценария расписания) — он «ест»
-   любой текст первым, свободный запрос в это время не парсится;
-2. команды и кнопки reply-меню — как раньше;
-3. всё остальное — кандидат на свободный запрос.
+1. an active wizard draft (a profile or a schedule scenario) — it "eats" any text
+   first; a free-form query is not parsed while it is active;
+2. commands and reply-menu buttons — as before;
+3. everything else — a candidate free-form query.
 
-**Разбор текста в структуру** — `src/core/intent.ts`, `parseIntent(text,
-ctx, opts)`. Чистый `fetch` на `https://api.anthropic.com/v1/messages`
-(без Anthropic SDK — та же логика, что и у отказа от `@supabase/supabase-js`
-в `core/repos.ts`: ради одного вызова тянуть SDK в core незачем), модель
-`claude-haiku-4-5`, форсированный tool-use (`tool_choice: {type: 'tool',
-name: 'set_intent'}`) — модель физически не может ответить свободным
-текстом вместо структуры `BookingIntent`. В `system` уходят только
-сегодняшняя дата и день недели в Asia/Tbilisi, список кортов и горизонт T+7
-— текст пользователя едет ИСКЛЮЧИТЕЛЬНО в `user`-сообщении, а персональные
-данные профиля (имя/email/телефон) в запрос к Anthropic не попадают вообще.
-Таймаут 5 c, любая ошибка или ответ без tool-use → `null`. Ключ
-(`ANTHROPIC_API_KEY`) никогда не логируется — та же дисциплина, что у
-токена бота и Supabase-ключа.
+**Parsing text into structure** — `src/core/intent.ts`, `parseIntent(text, ctx,
+opts)`. A plain `fetch` to `https://api.anthropic.com/v1/messages` (no Anthropic
+SDK — the same reasoning as dropping `@supabase/supabase-js` in
+`core/repos.ts`: pulling an SDK into core for a single call is not worth it),
+model `claude-haiku-4-5`, forced tool use (`tool_choice: {type: 'tool', name:
+'set_intent'}`) — the model physically cannot answer with free text instead of a
+`BookingIntent` structure. The `system` prompt carries only today's date and day
+of week in Asia/Tbilisi, the court list, and the T+7 horizon — the user's text
+rides EXCLUSIVELY in the `user` message, and the profile's personal data
+(name/email/phone) never reaches the request to Anthropic at all. Timeout 5 s;
+any error or a response without tool use → `null`. The key
+(`ANTHROPIC_API_KEY`) is never logged — the same discipline as the bot token and
+the Supabase key.
 
-Ответ модели — не источник истины: код перепроверяет каждое поле
-(`courtIndexOf` для имён кортов, границы горизонта для дат, формат времени)
-и чистит или обнуляет то, что не проходит проверку, вплоть до `null` на
-явно негодном ответе.
+The model's response is not the source of truth: the code re-checks every field
+(`courtIndexOf` for court names, the horizon bounds for dates, the time format)
+and sanitizes or nulls out whatever fails the check, down to `null` for a plainly
+unusable response.
 
-**Лимит** — 20 запросов в день на профиль, ключ настроек
-`llm_quota:{profileId}:{dateTbilisi}` в той же таблице `settings`, что и
-`planner_enabled` (`SettingsRepo`, счётчик инкрементится на каждый запрос,
-сбрасывается сменой даты в ключе). Превышение — вежливый отказ без
-обращения к Anthropic API вообще. Счётчик читается и пишется двумя вызовами
-(`get` → `set`), и это корректно ровно потому, что апдейты бот разбирает
-последовательно (встроенный long-polling grammY, `bot.start()`). Переезд на
-webhooks или `@grammyjs/runner` (кандидаты хостинга в `CLAUDE.md`) даёт
-параллельную обработку — тогда вместе с ним нужен `sequentialize` по
-`chat_id` либо атомарный инкремент в хранилище, иначе бёрст сообщений обходит
-суточный потолок.
+**The limit** is 20 queries per day per profile, settings key
+`llm_quota:{profileId}:{dateTbilisi}` in the same `settings` table as
+`planner_enabled` (`SettingsRepo`; the counter is incremented on each query and
+resets when the date in the key changes). Going over → a polite refusal without
+touching the Anthropic API at all. The counter is read and written with two calls
+(`get` → `set`), and that is correct precisely because the bot processes updates
+sequentially (grammY's built-in long polling, `bot.start()`). Moving to webhooks
+or `@grammyjs/runner` (the hosting candidates in `CLAUDE.md`) brings parallel
+processing — then, together with it, you need `sequentialize` by `chat_id` or an
+atomic increment in storage, otherwise a burst of messages slips past the daily
+cap.
 
-**`ANTHROPIC_API_KEY` не задан** — свободные запросы молча выключены:
-профиль получает дружелюбное «свободные запросы не настроены, используй
-кнопки» один раз в день, дальше на этот день бот на свободный текст просто
-не отвечает (тот же принцип «не долбить одним и тем же», что у истёкшего
-черновика мастера).
+**`ANTHROPIC_API_KEY` not set** — free-form queries are silently disabled: the
+profile gets a friendly "free-form queries aren't configured, use the buttons"
+once a day, and after that the bot simply does not respond to free text for the
+rest of the day (the same "don't nag with the same thing" principle as the
+expired wizard draft).
 
-**Дальше по результату `parseIntent`:**
+**Then, based on the `parseIntent` result:**
 
-- `null`/`kind: 'unknown'` — подсказка с 2–3 примерами запросов;
-- `kind: 'find'` — availability нужных кортов/дат через
-  `client.getAvailability` (параллельно, не больше 14 запросов — дни×корты,
-  которые задал сам интент; при более широком запросе бот просит его
-  сузить), затем чистый поиск `src/core/slot-search.ts` (`searchSlots`):
-  фильтрует по датам/времени/кортам/длительности, связки часов **подряд на
-  одном корте** собирает в `SlotOption` (переход через полночь, например
-  23:00→00:00, связкой не считается), сортирует — связки раньше одиночек,
-  раньше по дате/времени — и режет на максимум 8 вариантов («и ещё N»
-  строкой). Каждый вариант — отдельная inline-кнопка «Забронировать»,
-  ведущая на тот же экран подтверждения, что и «📆 Бронировать»;
-- `kind: 'book'` — сразу экран подтверждения для конкретных
-  (дата, время, корт) с предварительной проверкой доступности, тот же
-  флоу, что при ручном выборе через кнопки.
+- `null`/`kind: 'unknown'` — a hint with 2–3 example queries;
+- `kind: 'find'` — availability for the required courts/dates via
+  `client.getAvailability` (in parallel, no more than 14 requests — days×courts
+  that the intent itself set; on a broader request the bot asks to narrow it),
+  then a pure search `src/core/slot-search.ts` (`searchSlots`): it filters by
+  dates/time/courts/duration, gathers runs of consecutive hours **on the same
+  court** into a `SlotOption` (crossing midnight, e.g. 23:00→00:00, does not
+  count as a run), sorts — runs before singles, earlier by date/time first — and
+  trims to at most 8 options (an "and N more" line). Each option is a separate
+  inline "Book" button leading to the same confirmation screen as "📆 Book";
+- `kind: 'book'` — straight to the confirmation screen for a specific
+  (date, time, court) with a preliminary availability check, the same flow as a
+  manual choice through the buttons.
 
-Ошибки Reservio API на любом из путей — обычный человекочитаемый текст, как
-и везде в боте (`errors.ts`); ни при одном исходе LLM бронь не совершает —
-финальный шаг всегда `bookNow` по нажатой кнопке.
+Reservio API errors on any of these paths are ordinary human-readable text, as
+everywhere in the bot (`errors.ts`); at no LLM outcome does it make a booking —
+the final step is always `bookNow` from a pressed button.
 
-**Приватность.** В Anthropic API уходит только текст сообщения плюс
-служебный контекст (дата/день недели/список кортов/горизонт) — email,
-телефон, `chat_id`, токены броней и прочие персональные данные профиля в
-запрос не попадают ни в system, ни в user-сообщении.
+**Privacy.** Only the message text plus service context (date/day of
+week/court list/horizon) goes to the Anthropic API — email, phone, `chat_id`,
+booking tokens, and other personal profile data reach the request neither in the
+system nor in the user message.
 
-Отдельная защита — на сам текст: сообщение, которое выглядит как **почта или
-телефон**, до модели не доходит вовсе (`looksLikeContact` в
-`src/bot/handlers/free-query.ts`), человек получает подсказку. Так закрыт
-неочевидный путь: про истёкший черновик мастера «➕ Добавить профиль» бот
-объясняет ровно один раз, и следующую строку админа — а мастер собирает имя,
-email и телефон ТРЕТЬЕГО человека — уже никто не «ест», она стала бы обычным
-свободным запросом. Запросом про корты одинокий адрес или `+995…` не бывает,
-так что отказ ничего не ломает.
+A separate guard is on the text itself: a message that looks like an **email or a
+phone** does not reach the model at all (`looksLikeContact` in
+`src/bot/handlers/free-query.ts`); the person gets a hint. This closes a
+non-obvious path: the bot explains the expired "➕ Add profile" wizard draft
+exactly once, and the admin's next line — while the wizard collects a THIRD
+person's name, email, and phone — is no longer "eaten" by anyone, and would
+become an ordinary free-form query. A lone address or `+995…` is never a query
+about courts, so the refusal breaks nothing.
 
-## Профиль в БД vs профиль движка — важная развилка
+## DB profile vs engine profile — an important fork
 
-Это два независимых конфига с одним и тем же `id`, их нужно вести синхронно:
+These are two independent configs with the same `id`; they must be kept in sync:
 
-- **Профиль движка** (`core/profiles.ts`, `loadProfiles(env)`) — из
-  `CLIENT_NAME/EMAIL/PHONE` (профиль `ilya`) и `PROFILE_<K>_*` (доп. профили,
-  env). Именно его читает `trigger/book-drop.ts` по `profileId` из payload —
-  это единственный контакт, с которым уходит реальный `POST /bookings`.
-- **Профиль бота** (таблица `profiles`, `src/core/repos.ts`) — источник
-  `telegram_chat_id → профиль`, отображаемых данных и правил расписания
-  (`schedule_rules`) для бота и будущего `daily-planner`.
+- **The engine profile** (`core/profiles.ts`, `loadProfiles(env)`) — from
+  `CLIENT_NAME/EMAIL/PHONE` (the `ilya` profile) and `PROFILE_<K>_*` (extra
+  profiles, env). This is what `trigger/book-drop.ts` reads by `profileId` from
+  the payload — the only contact the real `POST /bookings` goes out with.
+- **The bot profile** (the `profiles` table, `src/core/repos.ts`) — the source of
+  `telegram_chat_id → profile`, the displayed data, and the schedule rules
+  (`schedule_rules`) for the bot and the future `daily-planner`.
 
-Что откуда берётся в автоматическом дропе (`daily-planner` → `book-slot-drop`):
+What comes from where in the automatic drop (`daily-planner` → `book-slot-drop`):
 
-| Поле | Источник | Кто читает |
+| Field | Source | Who reads it |
 |---|---|---|
-| `times` | БД (`schedule_rules.times`) | планировщик, по одному дропу на время |
-| `days_of_week` | БД | планировщик (`ruleAppliesOnDate`); env-проверка дней обойдена `force:true` |
-| `enabled`, `skips` | БД | планировщик + повторная проверка скипа в `book-drop` |
-| `courts`, `mode` | БД (`schedule_rules.courts/mode`), если payload их не передаёт | планировщик подставляет их из правила в payload `book-slot-drop`; explicit payload может переопределить |
-| **контакт** (`name/email/phone`) | **env** (`CLIENT_*` / `PROFILE_<K>_*`) | движок, уходит в реальный `POST /bookings` |
+| `times` | DB (`schedule_rules.times`) | the planner, one drop per time |
+| `days_of_week` | DB | the planner (`ruleAppliesOnDate`); the env day check is bypassed by `force:true` |
+| `enabled`, `skips` | DB | the planner + a re-check of the skip in `book-drop` |
+| `courts`, `mode` | DB (`schedule_rules.courts/mode`), if the payload doesn't pass them | the planner puts them from the rule into the `book-slot-drop` payload; an explicit payload may override |
+| **contact** (`name/email/phone`) | **env** (`CLIENT_*` / `PROFILE_<K>_*`) | the engine, goes out in the real `POST /bookings` |
 
-Важное следствие для мультипрофиля: бронь по запросу («📆 Бронировать» в чате,
-`core/book-now.ts`) берёт контакт из БД-профиля, а автоматический дроп — из
-env. Для профиля, заведённого только через `/add_profile`, ручная бронь
-сработает, а вечерний дроп упадёт с «Профиль не найден».
+An important consequence for multi-profile: an on-demand booking ("📆 Book" in
+the chat, `core/book-now.ts`) takes the contact from the DB profile, while the
+automatic drop takes it from env. For a profile created only via `/add_profile`,
+a manual booking will work, but the evening drop will fail with "Profile not
+found".
 
-`scripts/seed-profiles.ts` заводит профиль `ilya` в БД **из тех же env
-переменных**, что уже читает движок, — поэтому для него оба конфига совпадают
-по построению. Если админ добавит второго живого игрока через `/add_profile`
-(БД) с новым `id`, для реальной брони от его имени всё равно нужен
-соответствующий `PROFILE_<K>_NAME/EMAIL/PHONE/...` в env — причём и в `.env`,
-и (для облачных дропов) в переменных trigger.dev, куда сейчас синкается
-фиксированный список из семи ключей (`trigger.config.ts` → `syncEnvVars`, см.
-`Runbook.md` → «Деплой»). Без этого `book-slot-drop` с `profileId` нового
-игрока упадёт с «Профиль не найден» — список `syncEnvVars` придётся
-расширить отдельным изменением, когда появится второй боевой игрок.
+`scripts/seed-profiles.ts` creates the `ilya` profile in the DB **from the same
+env variables** the engine already reads — so for it both configs match by
+construction. If the admin adds a second live player via `/add_profile` (DB) with
+a new `id`, a real booking on their behalf still needs a matching
+`PROFILE_<K>_NAME/EMAIL/PHONE/...` in env — both in `.env` and (for cloud drops)
+in the trigger.dev variables, where a fixed list of seven keys is currently
+synced (`trigger.config.ts` → `syncEnvVars`, see `Runbook.md` → "Deploy").
+Without this, a `book-slot-drop` with the new player's `profileId` will fail with
+"Profile not found" — the `syncEnvVars` list will have to be extended in a
+separate change once a second production player appears.

@@ -91,7 +91,7 @@ grammY + SQLite (`src/bot/`, `src/core/state.ts`):
 ## [ ] Фаза 4 — Деплой + наблюдаемость (~0.5 дня + неделя наблюдения)
 
 - Cron/джобы: **trigger.dev** (решено; project ref
-  `proj_fxjnzqesxsicrpeuepzv`, ключи в env). State при деплое в облако —
+  `proj_your_project_ref`, ключи в env). State при деплое в облако —
   **Supabase Postgres** (решено 30.07): адаптер SupabaseStateStore,
   общий state для trigger.dev-джоб и Telegram-бота; локальный
   better-sqlite3 остаётся для dev/тестов.
@@ -153,7 +153,7 @@ grammY + SQLite (`src/bot/`, `src/core/state.ts`):
 | Гонка за слот | Polling с H:58:30, шаг 2 c — цель: бронь за < 5 c от появления |
 | Мультипрофили | Профиль = контакт + правила (времена, приоритет кортов, дни); engine параметризован профилем; у девушки свой email/время/корт |
 | Процесс | Только PR; ревью charliecreates с явным резолвом комментов; мерджит пользователь при полном зелёном; main protected; vitest; wiki |
-| Cron | trigger.dev (proj_fxjnzqesxsicrpeuepzv) |
+| Cron | trigger.dev (proj_your_project_ref) |
 | БД / state | Локально SQLite за интерфейсом StateStore; в облаке Supabase Postgres — общая для trigger.dev-джоб и бота (token'ы броней, идемпотентность, skip-флаги) |
 | Авторизация | Только allowlist Telegram chat_id → профиль. Supabase Auth и пароли не используются |
 | Модели разработки | Fable — оркестрация, Opus — сложное, Sonnet — мелочь |

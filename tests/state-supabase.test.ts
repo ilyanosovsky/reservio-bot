@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SupabaseStateError, SupabaseStateStore } from '../src/core/state-supabase.js';
 import type { StoredBooking } from '../src/core/state.js';
 
-const URL_BASE = 'https://kbwmrqoxjlydmwyxirqm.supabase.co';
+const URL_BASE = 'https://example-project.supabase.co';
 const KEY = 'sb_secret_TESTKEY_do_not_leak';
 /** Корт входит в ключ слота с 01.08.2026 (миграция мультикорта). */
 const COURT = 'Padel Court 3';

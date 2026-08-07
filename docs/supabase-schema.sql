@@ -1,4 +1,4 @@
--- Схема state'а padel-bot в Supabase Postgres (project id kbwmrqoxjlydmwyxirqm).
+-- Схема state'а padel-bot в Supabase Postgres (project id your-supabase-project-id).
 --
 -- Как применить: Supabase Dashboard -> SQL Editor -> New query -> вставить целиком -> Run.
 -- Скрипт идемпотентен: повторный запуск ничего не ломает и не трогает данные.

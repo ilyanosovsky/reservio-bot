@@ -1,51 +1,50 @@
 # Dev-Process
 
-Процесс зафиксирован в `PLAN.md` («Решения, зафиксированные заранее»). Ниже —
-как он выглядит по шагам.
+The process is fixed in `PLAN.md` ("Decisions locked in advance"). Below is what
+it looks like step by step.
 
-## Ветки и `main`
+## Branches and `main`
 
-`main` — protected, прямые пуши в него закрыты. Вся работа — в
-feature-ветках, по одной на задачу/фазу (пример текущей: `feat/booking-engine`
-для фазы 2).
+`main` is protected; direct pushes to it are closed. All work happens in feature
+branches, one per task/phase (example of the current one: `feat/booking-engine`
+for phase 2).
 
-## Цикл PR
+## PR cycle
 
-1. **Feature-ветка** от `main` → изменения → пуш.
-2. **PR** в `main`. Описание — что и зачем, ссылка на фазу/пункт `PLAN.md`,
-   если применимо.
-3. **CI** (`.github/workflows/ci.yml`) гоняется автоматически на `pull_request`
-   и `push` в `main`:
+1. **Feature branch** off `main` → changes → push.
+2. **PR** into `main`. The description says what and why, with a link to the
+   `PLAN.md` phase/item where applicable.
+3. **CI** (`.github/workflows/ci.yml`) runs automatically on `pull_request` and
+   `push` to `main`:
    - `pnpm install --frozen-lockfile`
    - `pnpm typecheck` (`tsc --noEmit`)
    - `pnpm test` (`vitest run`)
-   PR не готов к ревью, пока CI не зелёный.
-4. **Ревью — charliecreates.** Комментарии отрабатываются по существу
-   (правка кода, а не просто ответ) и **явно резолвятся** — ни один комментарий
-   не остаётся висеть без reply/resolve.
-5. **Мердж** делает **владелец репозитория** (пользователь), и только когда
-   PR полностью зелёный: CI прошёл + ревью без открытых комментариев.
+   A PR is not ready for review until CI is green.
+4. **Review — charliecreates.** Comments are addressed on the merits (a code
+   fix, not just a reply) and **explicitly resolved** — no comment is left
+   hanging without a reply/resolve.
+5. **Merge** is done by the **repository owner** (the user), and only when the PR
+   is fully green: CI passed + review with no open comments.
 
-## Правила, которые проверяет ревью (из `CLAUDE.md`)
+## Rules the review checks (from `CLAUDE.md`)
 
-- Нет захардкоженных `CLIENT_*`-данных и токенов — только через env.
-- Никакого `new Date()` без явной работы с `+04:00` (Asia/Tbilisi, без DST).
-- Даты в коде — ISO с явным оффсетом (`2026-08-05T20:00:00+04:00`).
-- Polling не превращается в DDoS: интервал ≥ 2 c, окно ≤ 5 мин,
-  экспоненциальный backoff на 429/5xx.
-- Успех брони проверяется только по `booking_id` в ответе API (внешняя
-  валидация), никогда по отсутствию ошибки.
-- Идемпотентность: повторный запуск джобы не создаёт дубль брони.
-- Инвариант наблюдаемости: каждый вечер в 21:0x в Telegram уходит ровно одно
-  сообщение (успех / ошибка / «пропущено по команде»). Молчаливый провал
-  недопустим.
-- `spike-reservio.ts --book` создаёт реальную бронь — в PR/CI не запускается
-  автоматически, только вручную и по явной просьбе пользователя в сессии.
-- Cron/боевые автобронирования выключены до фазы 4 и отдельного явного
-  одобрения пользователя — PR фаз 0–3 не должны его включать.
+- No hardcoded `CLIENT_*` data or tokens — only via env.
+- No `new Date()` without explicit `+04:00` handling (Asia/Tbilisi, no DST).
+- Dates in code are ISO with an explicit offset (`2026-08-05T20:00:00+04:00`).
+- Polling does not turn into a DDoS: interval ≥ 2 s, window ≤ 5 min, exponential
+  backoff on 429/5xx.
+- A booking's success is verified only by the `booking_id` in the API response
+  (external validation), never by the absence of an error.
+- Idempotency: re-running a job creates no duplicate booking.
+- The observability invariant: every evening at 21:0x exactly one message goes to
+  Telegram (success / error / "skipped by command"). A silent failure is not
+  acceptable.
+- `spike-reservio.ts --book` creates a real booking — it is not run automatically
+  in PR/CI, only by hand and on the user's explicit request in the session.
+- Cron / production auto-bookings are disabled until phase 4 and a separate
+  explicit approval from the user — PRs for phases 0–3 must not enable it.
 
-## Стек, который проверяет CI
+## The stack CI checks
 
-TypeScript (strict), Node 20+ (в CI — Node 22), пакетный менеджер — pnpm,
-тесты — vitest. Лишние зависимости в core-модулях не добавляются без
-необходимости.
+TypeScript (strict), Node 20+ (Node 22 in CI), package manager pnpm, tests
+vitest. Extra dependencies are not added to core modules without need.

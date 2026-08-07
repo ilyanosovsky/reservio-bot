@@ -132,9 +132,9 @@ Padel Court 4, Padel Court 1}`: бронируем КАЖДЫЙ появивши
   интерфейс StateStore абстрактный. В облаке — **Supabase Postgres** (решено
   30.07.2026): общий state между trigger.dev-джобами и Telegram-ботом;
   адаптер SupabaseStateStore пишется в фазе 4 (project id
-  `kbwmrqoxjlydmwyxirqm`, env: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`).
+  `your-supabase-project-id`, env: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`).
   Supabase Auth НЕ используется.
-- Cron/джобы: **trigger.dev** (решено), project ref `proj_fxjnzqesxsicrpeuepzv`;
+- Cron/джобы: **trigger.dev** (решено), project ref `proj_your_project_ref`;
   env: `TRIGGER_SECRET_KEY_DEV` / `TRIGGER_SECRET_KEY_PROD`
 - Хостинг Telegram-бота: решается в фазе 4 (кандидаты: Railway, Northflank,
   Vercel webhooks; критерий — бесплатно/дёшево, всегда доступен). Core-модули
