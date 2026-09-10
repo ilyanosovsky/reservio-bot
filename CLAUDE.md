@@ -128,7 +128,11 @@ Padel Court 4, Padel Court 1}`: бронируем КАЖДЫЙ появивши
 
 ## Стек
 
-- TypeScript, Node 20+ (native fetch), pnpm; никаких лишних зависимостей в core
+- TypeScript, Node 22+ (native fetch), pnpm; никаких лишних зависимостей в core.
+  `engines.node` в package.json — `>=22`, и это НЕ формальность: Railway
+  (Railpack) берёт из него МИНИМАЛЬНЫЙ мажор, а на Node 20 `better-sqlite3`
+  уходит в сборку через node-gyp, который на Node 20 уже не запускается
+  (`docs/wiki/Hosting.md` → «Node version on Railway»).
 - Telegram: grammY
 - State: SQLite (`better-sqlite3`) локально — таблицы bookings, settings;
   интерфейс StateStore абстрактный. В облаке — **Supabase Postgres** (решено

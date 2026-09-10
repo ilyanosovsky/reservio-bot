@@ -112,7 +112,7 @@ never decides or performs a booking.
 
 | Concern            | Choice                                                        |
 | ------------------ | ------------------------------------------------------------- |
-| Language / runtime | TypeScript, Node 20+ (native `fetch`), pnpm                   |
+| Language / runtime | TypeScript, Node 22+ (native `fetch`), pnpm                   |
 | Scheduling / jobs  | [trigger.dev](https://trigger.dev) (cron + delayed runs)      |
 | Shared state       | Supabase Postgres (via PostgREST, plain `fetch` — no SDK)     |
 | Telegram           | [grammY](https://grammy.dev) (long-polling)                   |
