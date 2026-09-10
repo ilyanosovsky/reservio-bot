@@ -46,5 +46,5 @@ for phase 2).
 
 ## The stack CI checks
 
-TypeScript (strict), Node 20+ (Node 22 in CI), package manager pnpm, tests
+TypeScript (strict), Node 22+ (Node 22 in CI), package manager pnpm, tests
 vitest. Extra dependencies are not added to core modules without need.

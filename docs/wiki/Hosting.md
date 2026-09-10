@@ -82,3 +82,21 @@ tiers as of the time this document was written.
    "Authorization").
 5. Update this file and `Runbook.md` if the actual process in production
    differs from the plan above.
+
+### Node version on Railway
+
+Railway builds with Railpack, and Railpack takes the Node version from
+`engines.node` in `package.json` — resolving a range like `>=20` to the
+**lowest** matching major (observed: `>=20` → Node 20.20.2). That broke the
+build on 2026-09-10: `better-sqlite3@13` has no prebuilt binary for Node 20, so
+`pnpm install` fell back to `node-gyp rebuild`, and the `node-gyp@13` bundled
+with pnpm depends on `undici@8`, which does not run on Node 20
+(`TypeError: webidl.util.markAsUncloneable is not a function`). The August
+deploys had passed only because pnpm then shipped an older node-gyp — nothing in
+the repo had changed.
+
+Therefore `engines.node` is `>=22` (CI runs Node 22, local machines Node 24):
+Railpack picks Node 22 LTS, `better-sqlite3` installs from a prebuilt binary,
+and node-gyp is never needed. Do not lower it. If the Railway service ever needs
+a different version, set `RAILPACK_NODE_VERSION` in the service variables — it
+takes precedence over `engines` — rather than editing `package.json`.
