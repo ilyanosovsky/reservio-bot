@@ -81,10 +81,12 @@ never decides or performs a booking.
 
 ## Features
 
-- **Autonomous evenings.** A daily planner (20:30 Tbilisi) posts a pre-drop
-  message with a *Skip* button, then schedules the watch runs itself. Every
-  night sends **exactly one** Telegram message — success, failure, or
-  "skipped" — because a silent failure is treated as the worst possible bug.
+- **Autonomous evenings.** An hourly planner (every hour at :30 Tbilisi) posts
+  a pre-drop message with a *Skip* button before a scenario's first drop of the
+  day, then schedules each hour's watch run itself — so a 19:00 rule and a
+  20:00+21:00 rule are both served. Every drop sends **exactly one** Telegram
+  message — success, failure, or "skipped" — because a silent failure is
+  treated as the worst possible bug.
 - **Multi-court watch.** Books every court in the set that drops, one POST per
   court, so a two-hour pack can be assembled on a single court.
 - **Full Telegram UI.** Inline wizards (with breadcrumbs and a *Back* button)

@@ -5,8 +5,8 @@
 // !== 'true' ран не трогает ни schedules/profiles/skips, ни Telegram, ни
 // tasks.trigger.
 import { describe, expect, it, vi } from 'vitest';
-import { weekdayOf } from '../src/core/scheduler.js';
-import { parsePlannerPlan } from '../src/core/heartbeat-logic.js';
+import { dropWatchWindow, weekdayOf } from '../src/core/scheduler.js';
+import { formatPlannerPlan, parsePlannerPlan } from '../src/core/heartbeat-logic.js';
 
 // dailyPlannerTask регистрируется через schedules.task при импорте модуля —
 // подменяем SDK на «верни конфиг как есть», как в tests/book-drop.test.ts.
@@ -41,7 +41,12 @@ type PlannerRule = import('../src/trigger/daily-planner.js').PlannerRule;
 // ---- фикстуры ----
 
 const DATE = '2026-08-07'; // T+7 относительно NOW ниже
-const NOW = new Date('2026-07-31T16:30:00.000Z'); // 20:30 Тбилиси 31.07 — момент крон-рана
+// Планировщик почасовой: ран H:30 ставит дроп часа H. NOW — ран 20:30 Тбилиси
+// 31.07 (ставит 20:00), NOW_2130 — следующий ран (ставит 21:00), NOW_1930 — ран,
+// которого при одном кроне в 20:30 не существовало (ставит 19:00).
+const NOW = new Date('2026-07-31T16:30:00.000Z');
+const NOW_2130 = new Date('2026-07-31T17:30:00.000Z');
+const NOW_1930 = new Date('2026-07-31T15:30:00.000Z');
 const DAY_T = '2026-07-31'; // день наблюдения дропа = сегодня по Тбилиси
 
 function profile(patch: Partial<PlannerProfile> = {}): PlannerProfile {
@@ -303,7 +308,7 @@ describe('runDailyPlanner', () => {
     expect(summary.enabled).toBe(false);
   });
 
-  it('счастливый путь: сообщение + два триггера (20:00, 21:00) с верными delay/idempotencyKey', async () => {
+  it('счастливый путь, ран 20:30: сообщение со всем планом + ОДИН триггер (20:00) с верными delay/idempotencyKey', async () => {
     const deps = fakeDeps();
 
     const summary = await runDailyPlanner(deps, NOW);
@@ -312,7 +317,7 @@ describe('runDailyPlanner', () => {
       enabled: true,
       targetDate: DATE,
       messagesSent: 1,
-      dropsTriggered: 2,
+      dropsTriggered: 1,
       skippedProfiles: [],
       errors: [],
     });
@@ -321,9 +326,11 @@ describe('runDailyPlanner', () => {
     const [sentProfile, sentText, sentDate] = deps.sendPreDropMock.mock.calls[0]!;
     expect(sentProfile).toEqual(profile());
     expect(sentText).toContain(DATE);
+    // В сообщении — весь оставшийся план сценария, а не только час этого рана.
+    expect(sentText).toContain('20:00, 21:00');
     expect(sentDate).toBe(DATE);
 
-    expect(deps.triggerDropMock).toHaveBeenCalledTimes(2);
+    expect(deps.triggerDropMock).toHaveBeenCalledTimes(1);
     const [payload1, opts1] = deps.triggerDropMock.mock.calls[0]!;
     // courts/mode обязаны быть в payload: без них book-drop.ts переспрашивает
     // правило у БД по времени и на профиле с несколькими сценариями может
@@ -344,8 +351,17 @@ describe('runDailyPlanner', () => {
       // выстраиваться в затылок друг другу (concurrencyLimit book-slot-drop = 1)
       concurrencyKey: 'ilya',
     });
+  });
 
-    const [payload2, opts2] = deps.triggerDropMock.mock.calls[1]!;
+  it('ран 21:30 того же сценария: повторного сообщения нет, ОДИН триггер (21:00)', async () => {
+    const deps = fakeDeps();
+
+    const summary = await runDailyPlanner(deps, NOW_2130);
+
+    expect(summary).toMatchObject({ messagesSent: 0, dropsTriggered: 1, errors: [] });
+    expect(deps.sendPreDropMock).not.toHaveBeenCalled();
+    expect(deps.triggerDropMock).toHaveBeenCalledTimes(1);
+    const [payload2, opts2] = deps.triggerDropMock.mock.calls[0]!;
     expect(payload2).toEqual({
       profileId: 'ilya',
       date: DATE,
@@ -362,11 +378,28 @@ describe('runDailyPlanner', () => {
     });
   });
 
+  it('регрессия: сценарий на 19:00 (пн–пт) ставится раном 19:30 — при одном кроне в 20:30 он не отрабатывал никогда', async () => {
+    // Ровно сценарий второго профиля из боевой БД: 19:00, будни, все корты.
+    const rules = [rule({ id: 'r-19', profileId: 'vera', times: ['19:00'], daysOfWeek: [1, 2, 3, 4, 5], mode: 'all' })];
+    const deps = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
+
+    const summary = await runDailyPlanner(deps, NOW_1930);
+
+    expect(summary).toMatchObject({ messagesSent: 1, dropsTriggered: 1, errors: [] });
+    const [payload, opts] = deps.triggerDropMock.mock.calls[0]!;
+    expect(payload).toMatchObject({ profileId: 'vera', date: DATE, time: '19:00', live: true, force: true, mode: 'all' });
+    expect(opts).toEqual({
+      delay: dropTriggerDelay(DAY_T, '19:00'),
+      idempotencyKey: 'drop-vera-2026-08-07-19:00-r-19',
+      concurrencyKey: 'vera',
+    });
+  });
+
   it('режим и корты сценария уезжают в payload как есть (вечерняя вахта)', async () => {
     const rules = [rule({ id: 'watch', times: ['21:00'], courts: ['Padel Court 4', 'Padel Court 1'], mode: 'all' })];
     const deps = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
 
-    await runDailyPlanner(deps, NOW);
+    await runDailyPlanner(deps, NOW_2130);
 
     const [payload] = deps.triggerDropMock.mock.calls[0]!;
     expect(payload).toMatchObject({ time: '21:00', courts: ['Padel Court 4', 'Padel Court 1'], mode: 'all' });
@@ -401,23 +434,26 @@ describe('runDailyPlanner', () => {
     expect(opts.idempotencyKey).toBe('drop-ilya-2026-08-07-20:00-r-prio+r-all');
   });
 
-  it('сценарии на РАЗНЫЕ часы не схлопываются, а сценарии разных профилей не смешиваются', async () => {
+  it('сценарии на РАЗНЫЕ часы уходят каждый в свой ран, а сценарии разных профилей не смешиваются', async () => {
     const rules = [
       rule({ id: 'r1', profileId: 'ilya', times: ['20:00'], courts: ['Padel Court 3'] }),
       rule({ id: 'r2', profileId: 'ilya', times: ['21:00'], courts: ['Padel Court 4'] }),
       rule({ id: 'r3', profileId: 'anna', times: ['20:00'], courts: ['Padel Court 1'] }),
     ];
-    const deps = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
+    const at2030 = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
+    const at2130 = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
 
-    const summary = await runDailyPlanner(deps, NOW);
+    const first = await runDailyPlanner(at2030, NOW);
+    const second = await runDailyPlanner(at2130, NOW_2130);
 
-    expect(summary.dropsTriggered).toBe(3);
-    expect(
-      deps.triggerDropMock.mock.calls.map(([p]) => [p.profileId, p.time, p.courts]),
-    ).toEqual([
+    expect(first.dropsTriggered).toBe(2);
+    expect(at2030.triggerDropMock.mock.calls.map(([p]) => [p.profileId, p.time, p.courts])).toEqual([
       ['ilya', '20:00', ['Padel Court 3']],
-      ['ilya', '21:00', ['Padel Court 4']],
       ['anna', '20:00', ['Padel Court 1']],
+    ]);
+    expect(second.dropsTriggered).toBe(1);
+    expect(at2130.triggerDropMock.mock.calls.map(([p]) => [p.profileId, p.time, p.courts])).toEqual([
+      ['ilya', '21:00', ['Padel Court 4']],
     ]);
   });
 
@@ -463,7 +499,7 @@ describe('runDailyPlanner', () => {
     const deps = fakeDeps({ sendPreDrop: vi.fn(async () => false) });
     const summary = await runDailyPlanner(deps, NOW);
     expect(summary.messagesSent).toBe(0);
-    expect(summary.dropsTriggered).toBe(2);
+    expect(summary.dropsTriggered).toBe(1);
   });
 
   it('ошибка на одном профиле не останавливает обработку остальных', async () => {
@@ -481,58 +517,84 @@ describe('runDailyPlanner', () => {
     const summary = await runDailyPlanner(deps, NOW);
 
     expect(summary.errors).toEqual(['ilya: trigger.dev недоступен']);
-    // ilya упал на первом же time (20:00) — второй time того же профиля не пытаемся;
-    // anna (второй профиль) обработан полностью: 2 успешных триггера.
-    expect(triggerDropMock).toHaveBeenCalledTimes(3);
-    expect(summary.dropsTriggered).toBe(2);
+    // ilya упал на своём единственном в этот час time (20:00); anna (второй
+    // профиль) обработан полностью: её триггер прошёл.
+    expect(triggerDropMock).toHaveBeenCalledTimes(2);
+    expect(summary.dropsTriggered).toBe(1);
     expect(summary.messagesSent).toBe(2);
   });
 
-  it('несколько времён одного правила — по одному триггеру на время, delay растёт вместе с часом', async () => {
-    const deps = fakeDeps({ schedules: { listEnabled: vi.fn(async () => [rule({ times: ['20:00', '21:00', '22:00'] })]) } });
-    const summary = await runDailyPlanner(deps, NOW);
-    expect(summary.dropsTriggered).toBe(3);
-    const delays = deps.triggerDropMock.mock.calls.map(([, opts]: [unknown, { delay: Date }]) => opts.delay.getTime());
-    expect(delays).toEqual([...delays].sort((a, b) => a - b));
+  it('несколько времён одного правила — каждый час ставит СВОЙ ран, и только его', async () => {
+    const rules = [rule({ times: ['20:00', '21:00', '22:00'] })];
+    const at2230 = new Date('2026-07-31T18:30:00.000Z');
+    const planned: string[] = [];
+    for (const at of [NOW, NOW_2130, at2230]) {
+      const deps = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
+      const summary = await runDailyPlanner(deps, at);
+      expect(summary.dropsTriggered).toBe(1);
+      planned.push(deps.triggerDropMock.mock.calls[0]![0].time);
+    }
+    expect(planned).toEqual(['20:00', '21:00', '22:00']);
   });
 
-  it('время, чей дроп сегодня уже прошёл, НЕ планируется и попадает в summary.errors', async () => {
-    // Крон в 20:30, дроп слота 19:00 был бы в 19:57 — момент в прошлом.
-    // tasks.trigger с прошедшим delay выполняется немедленно, ран приходит в
-    // закрытое окно и возвращает Timeout: человек получал бы ❌ каждый вечер.
+  it('прошедший час — норма почасовой модели, а не ошибка: ран 20:30 молча пропускает 19:00 и не трогает 21:00', async () => {
     const deps = fakeDeps({ schedules: { listEnabled: vi.fn(async () => [rule({ times: ['19:00', '21:00'] })]) } });
 
     const summary = await runDailyPlanner(deps, NOW);
 
-    expect(summary.dropsTriggered).toBe(1);
-    const times = deps.triggerDropMock.mock.calls.map(([payload]: [{ time: string }, unknown]) => payload.time);
-    expect(times).toEqual(['21:00']);
-    expect(summary.errors.join(' ')).toContain('19:00');
-    // в pre-drop сообщении тоже только то, что реально будет забронировано
-    expect(String(deps.sendPreDropMock.mock.calls[0]![1])).not.toContain('19:00');
+    expect(summary).toMatchObject({ messagesSent: 0, dropsTriggered: 0, errors: [] });
+    expect(deps.sendPreDropMock).not.toHaveBeenCalled();
+    expect(deps.triggerDropMock).not.toHaveBeenCalled();
   });
 
-  it('все времена правила уже в прошлом — ни сообщения, ни триггеров', async () => {
+  it('pre-drop сообщение уходит один раз в день — перед ПЕРВЫМ дропом сценария, а не в каждый его час', async () => {
+    const rules = [rule({ times: ['19:00', '21:00'] })];
+    const at1930 = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
+    const at2130 = fakeDeps({ schedules: { listEnabled: vi.fn(async () => rules) } });
+
+    const first = await runDailyPlanner(at1930, NOW_1930);
+    const second = await runDailyPlanner(at2130, NOW_2130);
+
+    expect(first).toMatchObject({ messagesSent: 1, dropsTriggered: 1 });
+    // В сообщении — весь план дня, включая час, который поставит другой ран.
+    expect(String(at1930.sendPreDropMock.mock.calls[0]![1])).toContain('19:00, 21:00');
+    expect(second).toMatchObject({ messagesSent: 0, dropsTriggered: 1 });
+    expect(at2130.sendPreDropMock).not.toHaveBeenCalled();
+  });
+
+  it('все времена правила уже в прошлом — ни сообщения, ни триггеров, ни ошибок', async () => {
     const deps = fakeDeps({ schedules: { listEnabled: vi.fn(async () => [rule({ times: ['08:00', '19:00'] })]) } });
 
     const summary = await runDailyPlanner(deps, NOW);
 
-    expect(summary.dropsTriggered).toBe(0);
+    expect(summary).toMatchObject({ messagesSent: 0, dropsTriggered: 0, errors: [] });
     expect(deps.sendPreDropMock).not.toHaveBeenCalled();
   });
 });
 
 describe('splitTimesByDrop', () => {
-  it('делит времена по моменту отправки дропа относительно «сейчас»', () => {
+  it('раскладывает времена относительно рана: прошедший час, свой час, будущий', () => {
     expect(splitTimesByDrop(['19:00', '20:00', '21:00'], DAY_T, NOW)).toEqual({
-      planned: ['20:00', '21:00'],
       past: ['19:00'],
+      due: ['20:00'],
+      later: ['21:00'],
     });
   });
 
-  it('дроп ровно в момент «сейчас» считается прошедшим (ждать уже нечего)', () => {
+  it('час прошёл, когда закрылось ОКНО дропа, а не когда прошёл момент отправки', () => {
+    // Крон опоздал до 20:57 — дроп 20:00 всё ещё свой: окно закрывается в 21:03:30,
+    // триггер с прошедшим delay выполняется немедленно и успевает в окно.
     const at2057 = dropTriggerDelay(DAY_T, '20:00');
-    expect(splitTimesByDrop(['20:00'], DAY_T, at2057)).toEqual({ planned: [], past: ['20:00'] });
+    expect(splitTimesByDrop(['20:00'], DAY_T, at2057).due).toEqual(['20:00']);
+    const deadline = dropWatchWindow(DAY_T, '20:00').deadline;
+    expect(splitTimesByDrop(['20:00'], DAY_T, new Date(deadline.getTime() - 1)).due).toEqual(['20:00']);
+    expect(splitTimesByDrop(['20:00'], DAY_T, deadline).past).toEqual(['20:00']);
+  });
+
+  it('горизонт рана — 60 минут: 20:30 не видит 21:00, а опоздавший до 20:58 видит (дубль отсечёт idempotencyKey)', () => {
+    expect(splitTimesByDrop(['21:00'], DAY_T, NOW).later).toEqual(['21:00']);
+    const at2058 = new Date(NOW.getTime() + 28 * 60_000);
+    expect(splitTimesByDrop(['20:00', '21:00'], DAY_T, at2058).due).toEqual(['20:00', '21:00']);
   });
 });
 
@@ -577,10 +639,10 @@ describe('makeTriggerDrop: ключ идемпотентности ГЛОБАЛ�
 });
 
 describe('dailyPlannerTask — регистрация', () => {
-  it('id и cron соответствуют контракту (крон = 20:30 Тбилиси = 16:30 UTC)', () => {
+  it('id и cron соответствуют контракту (каждый час в :30 UTC = :30 Тбилиси, ран H:30 ставит час H)', () => {
     const config = dailyPlannerTask as unknown as { id: string; cron: string };
     expect(config.id).toBe('daily-planner');
-    expect(config.cron).toBe('30 16 * * *');
+    expect(config.cron).toBe('30 * * * *');
   });
 });
 
@@ -639,7 +701,7 @@ describe('planner_last_run: отметка «планировщик сегодн
     await runDailyPlanner(deps, NOW);
 
     // План — тоже после дропов: в него попадает то, что реально поставлено.
-    expect(order).toEqual(['message', 'drop', 'drop', 'plan', 'mark']);
+    expect(order).toEqual(['message', 'drop', 'plan', 'mark']);
   });
 
   it('сбой записи отметки не роняет ран: сообщения и дропы уже ушли', async () => {
@@ -654,7 +716,7 @@ describe('planner_last_run: отметка «планировщик сегодн
 
     const summary = await runDailyPlanner(deps, NOW);
 
-    expect(summary.dropsTriggered).toBe(2);
+    expect(summary.dropsTriggered).toBe(1);
     expect(summary.errors).toEqual([]); // это не проблема профиля, а проблема отметки
   });
 
@@ -671,7 +733,7 @@ describe('planner_last_run: отметка «планировщик сегодн
     expect(deps.settingsSetMock).toHaveBeenCalledWith(PLANNER_LAST_RUN_KEY, plannerLastRunValue(NOW, true));
   });
 
-  it('план вечера записан вместе с отметкой: heartbeat сверяет квитанции с ним', async () => {
+  it('план дня записан вместе с отметкой: heartbeat сверяет квитанции с ним', async () => {
     const deps = fakeDeps();
 
     await runDailyPlanner(deps, NOW);
@@ -682,11 +744,68 @@ describe('planner_last_run: отметка «планировщик сегодн
     expect(plan).toEqual({
       date: DATE,
       at: '2026-07-31T20:30:00.000+04:00',
+      slots: [{ profileId: 'ilya', time: '20:00' }],
+    });
+  });
+
+  it('план дня копится по ранам: 21:30 дописывает 21:00 к записанному раном 20:30', async () => {
+    const stored = formatPlannerPlan({
+      date: DATE,
+      at: '2026-07-31T20:30:00.000+04:00',
+      slots: [{ profileId: 'ilya', time: '20:00' }],
+    });
+    const deps = fakeDeps({
+      settings: { get: vi.fn(async (key: string) => (key === PLANNER_LAST_PLAN_KEY ? stored : 'true')) },
+    });
+
+    await runDailyPlanner(deps, NOW_2130);
+
+    const call = deps.settingsSetMock.mock.calls.find(([key]) => key === PLANNER_LAST_PLAN_KEY);
+    expect(parsePlannerPlan(String(call![1]))).toEqual({
+      date: DATE,
+      at: '2026-07-31T21:30:00.000+04:00',
       slots: [
         { profileId: 'ilya', time: '20:00' },
         { profileId: 'ilya', time: '21:00' },
       ],
     });
+  });
+
+  it('записанный план за другую дату (вчерашний) заменяется, а не дописывается', async () => {
+    const stored = formatPlannerPlan({
+      date: '2026-08-06',
+      at: '2026-07-30T21:30:00.000+04:00',
+      slots: [{ profileId: 'ilya', time: '21:00' }],
+    });
+    const deps = fakeDeps({
+      settings: { get: vi.fn(async (key: string) => (key === PLANNER_LAST_PLAN_KEY ? stored : 'true')) },
+    });
+
+    await runDailyPlanner(deps, NOW);
+
+    const call = deps.settingsSetMock.mock.calls.find(([key]) => key === PLANNER_LAST_PLAN_KEY);
+    expect(parsePlannerPlan(String(call![1]))).toEqual({
+      date: DATE,
+      at: '2026-07-31T20:30:00.000+04:00',
+      slots: [{ profileId: 'ilya', time: '20:00' }],
+    });
+  });
+
+  it('записанный план не прочитан — свой час не пишем (не стирать прошлые часы), отметка рана всё равно ставится', async () => {
+    const deps = fakeDeps({
+      settings: {
+        get: vi.fn(async (key: string) => {
+          if (key === PLANNER_LAST_PLAN_KEY) throw new Error('PostgREST 500');
+          return 'true';
+        }),
+      },
+    });
+
+    const summary = await runDailyPlanner(deps, NOW);
+
+    expect(summary.dropsTriggered).toBe(1);
+    expect(summary.errors).toEqual([]);
+    expect(deps.settingsSetMock.mock.calls.map(([key]) => key)).toEqual([PLANNER_LAST_RUN_KEY]);
   });
 
   it('скипнутый профиль в план не попадает — сторож не ждёт по нему отчётов', async () => {
@@ -710,10 +829,7 @@ describe('planner_last_run: отметка «планировщик сегодн
     await runDailyPlanner(deps, NOW);
 
     const call = deps.settingsSetMock.mock.calls.find(([key]) => key === PLANNER_LAST_PLAN_KEY);
-    expect(parsePlannerPlan(String(call![1]))?.slots).toEqual([
-      { profileId: 'ilya', time: '20:00' },
-      { profileId: 'ilya', time: '21:00' },
-    ]);
+    expect(parsePlannerPlan(String(call![1]))?.slots).toEqual([{ profileId: 'ilya', time: '20:00' }]);
   });
 
   it('сбой записи плана не роняет ран и не мешает отметке', async () => {
@@ -728,7 +844,7 @@ describe('planner_last_run: отметка «планировщик сегодн
 
     const summary = await runDailyPlanner(deps, NOW);
 
-    expect(summary.dropsTriggered).toBe(2);
+    expect(summary.dropsTriggered).toBe(1);
     expect(summary.errors).toEqual([]);
     expect(deps.settingsSetMock).toHaveBeenCalledWith(PLANNER_LAST_RUN_KEY, plannerLastRunValue(NOW, true));
   });

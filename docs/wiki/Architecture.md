@@ -195,24 +195,37 @@ check); the `token` is never printed to stdout — only the fact that it was sav
 to state. Details and examples in `Runbook.md`.
 
 **`trigger/daily-planner.ts`** — the trigger.dev cron task `daily-planner`, the
-**only** place in the project where `schedules.task` is allowed. It runs every day
-at **20:30 Tbilisi** (16:30 UTC, no DST) and, when enabled, it:
+**only** place in the project where `schedules.task` is allowed. The model is
+**hourly**: a slot for hour H opens at `H:59` on day T (see the drop model), so
+the cron ticks **every hour at :30 Tbilisi** (`30 * * * *` UTC — the +04:00
+offset is whole hours, no DST), and the run at `H:30` schedules the drops of hour
+H only. (Until 2026-09-10 there was a single run at 20:30; any hour before 20:00
+was silently unschedulable, which is how a second profile's 19:00 scenario never
+fired.) When enabled, each run:
 
 1. computes the target game date T+7 (`scheduler.targetDate`) from the run's
    timestamp (not `Date.now()`, for determinism);
 2. takes the enabled `schedule_rule`s whose profile has a `telegram_chat_id`,
    whose `daysOfWeek` allows T+7, and for whom there is no `skip` on T+7;
-3. sends each profile a pre-drop message (the plan: date/times/courts) with inline
-   "Skip" and "Book" buttons;
-4. for each (profile, hour) enqueues `trigger/book-drop.ts` via
+3. splits each rule's times relative to the run (`splitTimesByDrop`): `past`
+   (the drop window already closed — nothing to do, not an error), `due` (the
+   send moment `H:57` is within the next 60 minutes — scheduled by this run) and
+   `later` (another run's job). A rule with nothing `due` is skipped quietly;
+4. sends the profile a pre-drop message (the plan: date / all remaining times of
+   the day / courts) with inline "Skip" and "Book" buttons — **once per rule per
+   day**, in the run before the rule's first drop (`past` is empty), so a
+   20:00+21:00 scenario still gets a single message at 20:30;
+5. for each `due` (profile, hour) enqueues `trigger/book-drop.ts` via
    `tasks.trigger('book-slot-drop', …, { delay, idempotencyKey, concurrencyKey })`
-   — `delay` = `H:57:00` on day T, a global `idempotencyKey` so a re-run does not
-   create a duplicate drop, and `concurrencyKey = profileId`. The courts and mode
-   from **those** rules travel in the payload — the scenario choice is made here,
-   not re-derived by time in `book-drop.ts`;
-5. records the enqueued drops in `settings.planner_last_plan` and, on a successful
-   run, stamps `settings.planner_last_run` — the two markers the 22:12 heartbeat
-   reconciles against.
+   — `delay` = `H:57:00` on day T, a global `idempotencyKey` so a re-run (or a
+   late cron that also caught the next hour) does not create a duplicate drop,
+   and `concurrencyKey = profileId`. The courts and mode from **those** rules
+   travel in the payload — the scenario choice is made here, not re-derived by
+   time in `book-drop.ts`;
+6. appends the enqueued drops to `settings.planner_last_plan` (the day's plan
+   accumulates across runs — `mergePlannerPlan`; a new date starts a new plan)
+   and, on a successful run, stamps `settings.planner_last_run` — the two markers
+   the 22:12 heartbeat reconciles against.
 
 Activation is gated by `settings.planner_enabled`: while it is not `'true'` the
 task reads the flag and exits quietly (the cron ticks but books nothing and messages

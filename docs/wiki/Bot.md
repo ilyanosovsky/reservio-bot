@@ -170,10 +170,12 @@ times/courts/days/mode and updates it — the same protection as `/add_rule`.
 Otherwise you would get two identical enabled scenarios: two pre-drop messages
 per evening and one extra run.
 
-**Turning off or deleting a scenario does not cancel a drop already scheduled
-for today** (`daily-planner` sends a run at 20:30 with all parameters in the
-payload, and `book-slot-drop` re-reads only the skips). The screens say this
-outright: the only lever for the current evening is "⏭ Skip" on the game date.
+**Turning off or deleting a scenario does not cancel a drop the planner has
+already scheduled** (`daily-planner` is hourly: the run at `H:30` sends the
+`book-slot-drop` run for hour H with all parameters in the payload, and
+`book-slot-drop` re-reads only the skips). Later hours are affected — each is
+scheduled by its own run. The screens say this outright: the only lever for an
+already-scheduled hour is "⏭ Skip" on the game date.
 
 **Compatibility and authorization**: old `callback_data` (the flat list with one
 on/off per rule, before this PR) keeps working with no client migration; an
