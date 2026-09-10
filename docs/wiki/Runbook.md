@@ -735,9 +735,10 @@ button of the "⏭ Skip" menu is exactly this date) or create a new scenario in
 the "⏰ Schedule" wizard — and the watchdog, reconstructing the plan from the
 live rules at 22:12, would demand reports for drops that nobody set.
 
-If there is no plan for the needed date and no enabled run was recorded today
-(the deploy is older than this branch, the cron never fired — the latter is its
-own finding) → the heartbeat goes to a FALLBACK path: it reconstructs the plan
+If there is no plan for the needed date, there is **no `planner_last_run` mark
+for today at all** and `planner_enabled` is `'true'` (the deploy is older than
+this branch, the cron never fired — the latter is its own finding) → the
+heartbeat goes to a FALLBACK path: it reconstructs the plan
 from the live `schedule_rules`/`skips` with the same selection logic as the
 scheduler (`selectEligibleRules` — the applicability rules are not duplicated as
 a separate copy) and expects a receipt for every rule hour whose drop has
@@ -746,7 +747,11 @@ the finding. (A scenario created mid-day for an hour that had already passed
 gives a false "no report" on this path — which is why it is the fallback.) In
 the run output this shows up as a check line for `planner_last_plan` with status
 `skipped` and the reason; the same reconstruction runs, in addition to the
-plan's own slots, whenever the plan-integrity finding above fires.
+plan's own slots, whenever the plan-integrity finding above fires. A today's
+mark with the `disabled@` prefix (and no plan with slots) never enters the
+fallback: the last run was disabled and set nothing, so the receipts check is
+skipped with that reason — an enabled mark with no plan is the integrity
+finding above, not the fallback.
 
 ### Receipts (`drop_reports`)
 
