@@ -223,9 +223,13 @@ fired.) When enabled, each run:
    travel in the payload — the scenario choice is made here, not re-derived by
    time in `book-drop.ts`;
 6. appends the enqueued drops to `settings.planner_last_plan` (the day's plan
-   accumulates across runs — `mergePlannerPlan`; a new date starts a new plan)
-   and, on a successful run, stamps `settings.planner_last_run` — the two markers
-   the 22:12 heartbeat reconciles against.
+   accumulates across runs — `mergePlannerPlan`; a new date starts a new plan; a
+   stored value that cannot be parsed is never overwritten, and a plan that lags
+   behind the previous enabled run's mark is flagged `incomplete` —
+   `planLagsBehindRun`) and, on a successful run, stamps
+   `settings.planner_last_run` — the two markers the 22:12 heartbeat reconciles
+   against. Runs are serialized (`queue.concurrencyLimit = 1`) so the
+   read-merge-write of the plan cannot race a manual Replay.
 
 Activation is gated by `settings.planner_enabled`: while it is not `'true'` the
 task reads the flag and exits quietly (the cron ticks but books nothing and messages

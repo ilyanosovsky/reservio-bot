@@ -61,7 +61,9 @@ import {
   expectedFromPlan,
   expectedReceipts,
   formatHeartbeatAlert,
+  mergeExpectedReceipts,
   parsePlannerPlan,
+  planLagsBehindRun,
   plannerRunProblem,
   receiptProblems,
   BOT_ALIVE_KEY,
@@ -291,9 +293,32 @@ export async function runHeartbeat(deps: HeartbeatDeps, now: Date): Promise<Hear
   const todaysPlan = plan !== null && plan.date === date ? plan : null;
   const labelOf = (profileId: string): string => profilesRead.value.find((p) => p.id === profileId)?.label ?? profileId;
 
+  // Плану верят только целому: он прочитался, догнал последний включённый ран
+  // (ран пишет план и отметку из одного `now` — planLagsBehindRun) и не помечен
+  // планировщиком как неполный. Иначе это находка, а не тихий запасной путь:
+  // ран поставил дропы, которых в плане нет, и сверять квитанции по одному
+  // такому списку значило бы промолчать про них.
+  const integrityProblem: string | null =
+    planRead.error !== null
+      ? `план дня не прочитан: ${planRead.error}`
+      : planLagsBehindRun(todaysPlan, lastRun.value, today)
+        ? todaysPlan === null
+          ? `план дня не записан, хотя планировщик сегодня отработал включённым (отметка ${lastRun.value ?? ''})`
+          : `план дня отстал от последнего рана планировщика (план от ${todaysPlan.at}, отметка ${lastRun.value ?? ''}) — ран не записал свои дропы`
+        : todaysPlan?.incomplete === true
+          ? 'план дня помечен планировщиком как неполный — один из ранов не записал свои дропы'
+          : null;
+
   let expected: ExpectedReceipt[] = [];
   let receiptsExpected = true;
-  if (todaysPlan !== null && (todaysPlan.slots.length > 0 || evening.expectReceipts)) {
+  if (integrityProblem !== null) {
+    // Слоты плана — нижняя граница; остальное восстанавливаем по живым правилам.
+    record(PLANNER_LAST_PLAN_KEY, `${integrityProblem} — квитанции сверены и по живым правилам расписания`);
+    expected = mergeExpectedReceipts(
+      todaysPlan === null ? [] : expectedFromPlan(todaysPlan.slots, date, labelOf, now),
+      await rebuildExpected(),
+    );
+  } else if (todaysPlan !== null && (todaysPlan.slots.length > 0 || evening.expectReceipts)) {
     // Основной путь — ЗАПИСАННЫЙ планировщиком план: сверяем квитанции с тем,
     // что реально было поставлено, а не с состоянием расписания на 22:12
     // (скипы и сценарии владелец правит и вечером — см. PLANNER_LAST_PLAN_KEY).
@@ -307,16 +332,14 @@ export async function runHeartbeat(deps: HeartbeatDeps, now: Date): Promise<Hear
     receiptsExpected = false;
     skipCheck('drop_reports', evening.reason);
   } else {
-    // Запасной путь: плана за эту дату нет (планировщик упал до записи или
-    // деплой старее). Восстанавливаем его по живым правилам — той же логикой
-    // отбора, что у планировщика, — и честно помечаем это в output рана.
+    // Запасной путь: плана за эту дату нет, а включённого рана сегодня не было
+    // (деплой старее, планировщик не тикал — об этом скажет своя находка).
+    // Восстанавливаем план по живым правилам и честно помечаем это в output.
     skipCheck(
       PLANNER_LAST_PLAN_KEY,
-      planRead.error !== null
-        ? `план дня не прочитан: ${planRead.error} — восстанавливаем по живым правилам`
-        : plan === null
-          ? 'записанного плана дня нет (или он нечитаем) — восстанавливаем по живым правилам расписания'
-          : `записанный план на другую дату (${plan.date}, а нужна ${date}) — восстанавливаем по живым правилам`,
+      plan === null
+        ? 'записанного плана дня нет (или он нечитаем) — восстанавливаем по живым правилам расписания'
+        : `записанный план на другую дату (${plan.date}, а нужна ${date}) — восстанавливаем по живым правилам`,
     );
     expected = await rebuildExpected();
   }

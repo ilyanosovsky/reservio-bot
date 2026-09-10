@@ -17,9 +17,11 @@ import {
   expectedReceipts,
   formatHeartbeatAlert,
   formatPlannerPlan,
+  mergeExpectedReceipts,
   mergePlannerPlan,
   parsePlannerPlan,
   parseTbilisiStamp,
+  planLagsBehindRun,
   plannerRunProblem,
   receiptProblems,
   BOT_STALE_MS,
@@ -94,11 +96,17 @@ interface FakeWorld {
 }
 
 /** Значение settings.planner_last_plan: те же слоты, что стоят в правилах фикстуры. */
-function planValue(times: string[] = ['20:00', '21:00'], patch: { date?: string; profileId?: string } = {}): string {
+function planValue(
+  times: string[] = ['20:00', '21:00'],
+  patch: { date?: string; profileId?: string; at?: string; incomplete?: boolean } = {},
+): string {
   return formatPlannerPlan({
     date: patch.date ?? DATE,
-    at: stampAgo(102),
+    // Ран пишет план и отметку planner_last_run из одного `now`: по умолчанию
+    // план «догнал» последний ран фикстуры (21:30).
+    at: patch.at ?? stampAgo(42),
     slots: times.map((time) => ({ profileId: patch.profileId ?? 'ilya', time })),
+    ...(patch.incomplete === true ? { incomplete: true } : {}),
   });
 }
 
@@ -107,9 +115,10 @@ function world(patch: Partial<FakeWorld> = {}): FakeWorld {
     settings: {
       planner_enabled: 'true',
       planner_last_run: stampAgo(42), // 21:30 Тбилиси — последний почасовой ран того же дня
-      // planner_last_plan в базовой фикстуре НЕТ намеренно: так проверяется
-      // запасной путь (восстановление плана по живым правилам). Основной путь —
-      // отдельный describe «план вечера из settings» ниже.
+      // Записанный план дня — основной путь сторожа. Запасной путь (плана нет)
+      // проверяется отдельным describe «план потерян» ниже: при включённом ране
+      // отсутствие плана — находка, а не тихий fallback.
+      planner_last_plan: planValue(),
       // Хостинг бота уже поднят — иначе проверка живости выключена (см. тесты
       // «тумблер проверки живости» ниже).
       bot_alive_required: 'true',
@@ -232,6 +241,46 @@ describe('mergePlannerPlan', () => {
   it('ран, которому нечего было ставить, записанное не стирает', () => {
     expect(mergePlannerPlan(stored, { date: DATE, at: 'later', slots: [] })).toEqual({ ...stored, at: 'later' });
   });
+
+  it('флаг неполноты не снимается в течение дня и берётся от любого из двух', () => {
+    expect(mergePlannerPlan({ ...stored, incomplete: true }, { date: DATE, at: 'later', slots: [] }).incomplete).toBe(true);
+    expect(mergePlannerPlan(stored, { date: DATE, at: 'later', slots: [], incomplete: true }).incomplete).toBe(true);
+    expect(mergePlannerPlan(stored, { date: DATE, at: 'later', slots: [] }).incomplete).toBeUndefined();
+    // Новый день — чистый лист.
+    expect(mergePlannerPlan({ ...stored, incomplete: true }, { date: '2026-08-12', at: 'x', slots: [] }).incomplete).toBeUndefined();
+  });
+});
+
+describe('planLagsBehindRun', () => {
+  const run = '2026-08-04T21:30:00.000+04:00';
+  const plan = (at: string) => ({ date: DATE, at, slots: [] });
+
+  it('план старше отметки включённого рана за сегодня или отсутствует — отстал', () => {
+    expect(planLagsBehindRun(plan('2026-08-04T20:30:00.000+04:00'), run, TODAY)).toBe(true);
+    expect(planLagsBehindRun(null, run, TODAY)).toBe(true);
+    expect(planLagsBehindRun(plan('мусор'), run, TODAY)).toBe(true);
+  });
+
+  it('план от того же рана или новее — не отстал (отметка могла не записаться, план — нет)', () => {
+    expect(planLagsBehindRun(plan(run), run, TODAY)).toBe(false);
+    expect(planLagsBehindRun(plan('2026-08-04T22:30:00.000+04:00'), run, TODAY)).toBe(false);
+  });
+
+  it('отметки нет, она вчерашняя, нечитаемая или от выключенного рана — сравнивать не с чем', () => {
+    expect(planLagsBehindRun(null, null, TODAY)).toBe(false);
+    expect(planLagsBehindRun(null, '2026-08-03T21:30:00.000+04:00', TODAY)).toBe(false);
+    expect(planLagsBehindRun(null, 'вчера', TODAY)).toBe(false);
+    expect(planLagsBehindRun(null, `disabled@${run}`, TODAY)).toBe(false);
+  });
+});
+
+describe('mergeExpectedReceipts', () => {
+  it('объединяет без дублей, первый список впереди', () => {
+    const a = { profileId: 'ilya', label: 'Ilya', date: DATE, time: '20:00' };
+    const b = { profileId: 'ilya', label: 'Ilya', date: DATE, time: '21:00' };
+    expect(mergeExpectedReceipts([a], [{ ...a, label: 'другая подпись' }, b])).toEqual([a, b]);
+    expect(mergeExpectedReceipts([], [b])).toEqual([b]);
+  });
 });
 
 describe('eveningWasPlanned', () => {
@@ -275,6 +324,13 @@ describe('formatPlannerPlan / parsePlannerPlan', () => {
 
   it('туда-обратно без потерь', () => {
     expect(parsePlannerPlan(formatPlannerPlan(plan))).toEqual(plan);
+    expect(parsePlannerPlan(formatPlannerPlan({ ...plan, incomplete: true }))).toEqual({ ...plan, incomplete: true });
+    // false не пишется и не читается как флаг: в JSON его просто нет.
+    expect(formatPlannerPlan({ ...plan, incomplete: false })).not.toContain('incomplete');
+  });
+
+  it('incomplete не-boolean — чужая форма', () => {
+    expect(parsePlannerPlan(`{"date":"${DATE}","at":"x","slots":[],"incomplete":"да"}`)).toBeNull();
   });
 
   it('пустой план (все профили скипнуты) — это факт, а не отсутствие плана', () => {
@@ -484,14 +540,6 @@ describe('runHeartbeat: вечер прошёл по плану', () => {
     expect(summary.checks.every((c) => c.status !== 'problem')).toBe(true);
   });
 
-  it('скип на дату игры снимает ожидания (дропов в этот день не было)', async () => {
-    const { deps, spies } = makeDeps(world({ skipped: ['ilya'], receipts: [] }));
-    const summary = await runHeartbeat(deps, NOW);
-    expect(summary.expected).toEqual([]);
-    expect(summary.problems).toEqual([]);
-    expect(spies.alertAdmins).not.toHaveBeenCalled();
-  });
-
   it('планировщик почасовой: правило на 19:00 ждёт квитанцию наравне с остальными часами', async () => {
     // Раньше (один крон в 20:30) 19:00 планировщик поставить не мог, и сторож
     // этот час не ждал — так сценарий второго профиля молчал неделями. Теперь
@@ -500,6 +548,7 @@ describe('runHeartbeat: вечер прошёл по плану', () => {
       rules: [rule({ times: ['19:00', '20:00'] })],
       receipts: [receipt({ time: '19:00' }), receipt({ time: '20:00' })],
     });
+    w.settings['planner_last_plan'] = planValue(['19:00', '20:00']);
     const { deps, spies } = makeDeps(w);
     const summary = await runHeartbeat(deps, NOW);
     expect(summary.expected).toEqual([
@@ -509,35 +558,130 @@ describe('runHeartbeat: вечер прошёл по плану', () => {
     expect(summary.problems).toEqual([]);
     expect(spies.alertAdmins).not.toHaveBeenCalled();
 
-    const silent = makeDeps(world({ rules: [rule({ times: ['19:00', '20:00'] })], receipts: [receipt({ time: '20:00' })] }));
-    const found = await runHeartbeat(silent.deps, NOW);
+    const silent = world({ rules: [rule({ times: ['19:00', '20:00'] })], receipts: [receipt({ time: '20:00' })] });
+    silent.settings['planner_last_plan'] = planValue(['19:00', '20:00']);
+    const found = await runHeartbeat(makeDeps(silent).deps, NOW);
     expect(found.problems).toEqual([expect.stringContaining('нет отчёта по 19:00 (профиль Ilya)')]);
   });
+});
 
-  it('правило на другой день недели ожиданий не создаёт', async () => {
-    const otherDay = (weekdayOf(DATE) + 1) % 7;
-    const { deps } = makeDeps(world({ rules: [rule({ daysOfWeek: [otherDay] })], receipts: [] }));
-    const summary = await runHeartbeat(deps, NOW);
-    expect(summary.expected).toEqual([]);
-    expect(summary.problems).toEqual([]);
-  });
+describe('runHeartbeat: план потерян — находка и восстановление по живым правилам', () => {
+  // Планировщик отметился включённым, а плана за дату нет: ран поставил дропы,
+  // но записать их не смог (planLagsBehindRun). Это НАХОДКА, а не тихий
+  // запасной путь, — и ожидания восстанавливаются по живым правилам той же
+  // логикой отбора, что у планировщика (selectEligibleRules).
+  const LOST = expect.stringContaining('план дня не записан');
 
-  it('мусорное время в правиле сторожа не роняет: остальные часы проверяются как обычно', async () => {
-    const { deps } = makeDeps(world({ rules: [rule({ times: ['вечером', '20:00', '21:00'] })] }));
+  function lost(patch: Partial<FakeWorld> = {}): FakeWorld {
+    const w = world(patch);
+    delete w.settings['planner_last_plan'];
+    return w;
+  }
+
+  it('плана нет при включённом ране — находка, ожидания по правилам, алерт админам', async () => {
+    const { deps, spies } = makeDeps(lost());
     const summary = await runHeartbeat(deps, NOW);
     expect(summary.expected).toEqual([
       { profileId: 'ilya', time: '20:00' },
       { profileId: 'ilya', time: '21:00' },
     ]);
+    expect(summary.problems).toEqual([LOST]);
+    expect(summary.checks.find((c) => c.name === 'planner_last_plan')?.status).toBe('problem');
+    expect(spies.alertAdmins).toHaveBeenCalledTimes(1);
+  });
+
+  it('скип на дату игры снимает ожидания (дропов в этот день не ставили)', async () => {
+    const { deps } = makeDeps(lost({ skipped: ['ilya'], receipts: [] }));
+    const summary = await runHeartbeat(deps, NOW);
+    expect(summary.expected).toEqual([]);
+    expect(summary.problems).toEqual([LOST]);
+  });
+
+  it('правило на 19:00 ждёт квитанцию наравне с остальными часами', async () => {
+    const rules = [rule({ times: ['19:00', '20:00'] })];
+    const ok = await runHeartbeat(makeDeps(lost({ rules, receipts: [receipt({ time: '19:00' }), receipt({ time: '20:00' })] })).deps, NOW);
+    expect(ok.expected.map((e) => e.time)).toEqual(['19:00', '20:00']);
+    expect(ok.problems).toEqual([LOST]);
+
+    const silent = await runHeartbeat(makeDeps(lost({ rules, receipts: [receipt({ time: '20:00' })] })).deps, NOW);
+    expect(silent.problems).toEqual([LOST, expect.stringContaining('нет отчёта по 19:00 (профиль Ilya)')]);
+  });
+
+  it('правило на другой день недели ожиданий не создаёт', async () => {
+    const otherDay = (weekdayOf(DATE) + 1) % 7;
+    const { deps } = makeDeps(lost({ rules: [rule({ daysOfWeek: [otherDay] })], receipts: [] }));
+    const summary = await runHeartbeat(deps, NOW);
+    expect(summary.expected).toEqual([]);
+    expect(summary.problems).toEqual([LOST]);
+  });
+
+  it('мусорное время в правиле сторожа не роняет: остальные часы проверяются как обычно', async () => {
+    const { deps } = makeDeps(lost({ rules: [rule({ times: ['вечером', '20:00', '21:00'] })] }));
+    const summary = await runHeartbeat(deps, NOW);
+    expect(summary.expected.map((e) => e.time)).toEqual(['20:00', '21:00']);
+    expect(summary.problems).toEqual([LOST]);
+  });
+
+  it('профиль без chat_id планировщиком не бронируется — квитанций с него не ждём', async () => {
+    const w = lost({
+      profiles: [profile(), profile({ id: 'anna', label: 'Anna', telegramChatId: null, isAdmin: false })],
+      rules: [rule({ id: 'r-anna', profileId: 'anna' })],
+      receipts: [],
+    });
+    const summary = await runHeartbeat(makeDeps(w).deps, NOW);
+    expect(summary.expected).toEqual([]);
+    expect(summary.problems).toEqual([LOST]);
+  });
+
+  it('два сценария на один час — ОДНА ожидаемая квитанция и одна строка находки', async () => {
+    const w = lost({ rules: [rule({ id: 'r1', times: ['20:00'] }), rule({ id: 'r2', times: ['20:00'] })], receipts: [] });
+    const summary = await runHeartbeat(makeDeps(w).deps, NOW);
+    expect(summary.expected).toEqual([{ profileId: 'ilya', time: '20:00' }]);
+    expect(summary.problems).toEqual([LOST, expect.stringContaining('нет отчёта по 20:00')]);
+  });
+
+  it('план отстал от последнего рана — находка, слоты плана дополняются правилами', async () => {
+    // Ран 20:30 записал план, ран 21:30 отметился, но план записать не смог:
+    // 21:00 в плане нет, а дроп был.
+    const w = world({ receipts: [receipt({ time: '20:00' })] });
+    w.settings['planner_last_plan'] = planValue(['20:00'], { at: stampAgo(102) });
+    const summary = await runHeartbeat(makeDeps(w).deps, NOW);
+    expect(summary.expected.map((e) => e.time)).toEqual(['20:00', '21:00']);
+    expect(summary.problems).toEqual([
+      expect.stringContaining('план дня отстал от последнего рана планировщика'),
+      expect.stringContaining('нет отчёта по 21:00 (профиль Ilya)'),
+    ]);
+  });
+
+  it('план помечен планировщиком как неполный — та же сверка по правилам', async () => {
+    const w = world({ receipts: [receipt({ time: '20:00' })] });
+    w.settings['planner_last_plan'] = planValue(['20:00'], { incomplete: true });
+    const summary = await runHeartbeat(makeDeps(w).deps, NOW);
+    expect(summary.problems).toEqual([
+      expect.stringContaining('неполный'),
+      expect.stringContaining('нет отчёта по 21:00 (профиль Ilya)'),
+    ]);
+  });
+
+  it('план НОВЕЕ отметки (не записалась отметка, а не план) — плану верим, находки нет', async () => {
+    const w = world();
+    w.settings['planner_last_plan'] = planValue(['20:00', '21:00'], { at: stampAgo(12) });
+    const summary = await runHeartbeat(makeDeps(w).deps, NOW);
     expect(summary.problems).toEqual([]);
   });
 
-  it('профиль без chat_id не бронируется планировщиком — квитанций с него не ждём', async () => {
-    const { deps } = makeDeps(world({ profiles: [profile({ telegramChatId: null })], receipts: [] }));
-    const summary = await runHeartbeat(deps, NOW).catch((err: Error) => err);
-    // Админ-чатов не осталось, но и находок нет — ран проходит молча.
-    expect(summary).not.toBeInstanceOf(Error);
-    expect((summary as Awaited<ReturnType<typeof runHeartbeat>>).problems).toEqual([]);
+  it('включённого рана сегодня не было и плана нет — прежний запасной путь, помеченный skipped', async () => {
+    // Единственная находка — «планировщик сегодня не отработал»: план тут ни при чём.
+    const w = lost({ receipts: [] });
+    w.settings['planner_last_run'] = '2026-08-03T21:30:00.000+04:00';
+    const summary = await runHeartbeat(makeDeps(w).deps, NOW);
+    expect(summary.checks.find((c) => c.name === 'planner_last_plan')?.status).toBe('skipped');
+    expect(summary.expected.map((e) => e.time)).toEqual(['20:00', '21:00']);
+    expect(summary.problems).toEqual([
+      expect.stringContaining('планировщик сегодня не отработал'),
+      expect.stringContaining('нет отчёта по 20:00'),
+      expect.stringContaining('нет отчёта по 21:00'),
+    ]);
   });
 });
 
@@ -582,23 +726,16 @@ describe('runHeartbeat: находки', () => {
     expect(text).toContain('нет отчёта по 21:00');
   });
 
-  it('два сценария на один час дают ОДНУ строку находки', async () => {
-    const w = world({
-      rules: [rule({ id: 'r1', times: ['20:00'] }), rule({ id: 'r2', times: ['20:00'] })],
-      receipts: [],
-    });
-    const { deps } = makeDeps(w);
-    const summary = await runHeartbeat(deps, NOW);
-    expect(summary.problems).toEqual([expect.stringContaining('нет отчёта по 20:00')]);
-  });
 });
 
 describe('runHeartbeat: живость бота не зависит от планировщика', () => {
   it('планировщик выключен — отчёты не проверяем, но мёртвого бота находим', async () => {
     const w = world({ receipts: [] });
     w.settings['planner_enabled'] = 'false';
-    // Выключенный планировщик всё равно отмечается — с префиксом disabled@.
+    // Выключенный планировщик всё равно отмечается — с префиксом disabled@,
+    // а плана не пишет: весь день выключен — плана за дату нет.
     w.settings['planner_last_run'] = `disabled@${stampAgo(102)}`;
+    delete w.settings['planner_last_plan'];
     w.settings['bot_alive_at'] = stampAgo(60);
     const { deps, spies } = makeDeps(w);
     const summary = await runHeartbeat(deps, NOW);
@@ -613,6 +750,7 @@ describe('runHeartbeat: живость бота не зависит от пла�
     const w = world({ receipts: [] });
     w.settings['planner_enabled'] = 'false';
     delete w.settings['planner_last_run'];
+    delete w.settings['planner_last_plan'];
     const { deps, spies } = makeDeps(w);
     const summary = await runHeartbeat(deps, NOW);
     expect(summary.problems).toEqual([]);
@@ -627,6 +765,7 @@ describe('runHeartbeat: живость бота не зависит от пла�
     const w = world({ receipts: [] });
     w.settings['planner_enabled'] = 'false';
     w.settings['planner_last_run'] = `disabled@${stampAgo(102)}`;
+    delete w.settings['planner_last_plan'];
     const { deps, spies } = makeDeps(w);
     const summary = await runHeartbeat(deps, NOW);
     expect(summary.problems).toEqual([]);
@@ -682,6 +821,7 @@ describe('runHeartbeat: флаг планировщика переключили
     const w = world({ receipts: [] });
     w.settings['planner_enabled'] = 'true';
     w.settings['planner_last_run'] = `disabled@${stampAgo(102)}`;
+    delete w.settings['planner_last_plan']; // выключенные раны плана не пишут
     const { deps, spies } = makeDeps(w);
     const summary = await runHeartbeat(deps, NOW);
     expect(summary.problems).toEqual([]);
@@ -743,19 +883,20 @@ describe('runHeartbeat: план вечера берётся из settings, а �
     expect((await runHeartbeat(deps, NOW)).problems).toEqual([]);
   });
 
-  it('план на другую дату или нечитаемый — запасной путь по живым правилам, помеченный в output', async () => {
+  it('план на другую дату или нечитаемый при включённом ране — находка, ожидания по живым правилам', async () => {
     for (const value of [planValue(['20:00'], { date: '2026-08-10' }), '{битый json']) {
-      const w = world({ receipts: [] });
+      const w = world();
       w.settings['planner_last_plan'] = value;
       const { deps } = makeDeps(w);
       const summary = await runHeartbeat(deps, NOW);
-      expect(summary.checks.find((c) => c.name === 'planner_last_plan')?.status).toBe('skipped');
-      // Ожидания восстановлены по правилам фикстуры (20:00 и 21:00).
+      expect(summary.checks.find((c) => c.name === 'planner_last_plan')?.status).toBe('problem');
+      expect(summary.problems).toEqual([expect.stringContaining('план дня не записан')]);
+      // Ожидания восстановлены по правилам фикстуры (20:00 и 21:00) — квитанции есть.
       expect(summary.expected).toHaveLength(2);
     }
   });
 
-  it('план не прочитался из-за сбоя Supabase — тоже запасной путь, причина в detail', async () => {
+  it('план не прочитался из-за сбоя Supabase — находка с причиной, ожидания по живым правилам', async () => {
     const w = world();
     const settingsGet = vi.fn(async (key: string) => {
       if (key === 'planner_last_plan') throw new Error('PostgREST 500');
@@ -763,8 +904,9 @@ describe('runHeartbeat: план вечера берётся из settings, а �
     });
     const { deps } = makeDeps(w, { settings: { get: settingsGet } });
     const summary = await runHeartbeat(deps, NOW);
-    expect(summary.problems).toEqual([]);
-    expect(summary.checks.find((c) => c.name === 'planner_last_plan')?.detail).toContain('PostgREST 500');
+    expect(summary.problems).toEqual([expect.stringContaining('план дня не прочитан: PostgREST 500')]);
+    expect(summary.checks.find((c) => c.name === 'planner_last_plan')?.status).toBe('problem');
+    expect(summary.expected).toHaveLength(2);
   });
 });
 
@@ -827,8 +969,13 @@ describe('runHeartbeat: отказ самих проверок — тоже на
     expect(alertText(spies)).toContain('HTTP 500');
   });
 
-  it('правила расписания не прочитались — план вечера сверить не с чем', async () => {
-    const { deps } = makeDeps(world(), {
+  // Живые правила и скипы сторож читает только на запасном пути — когда плана
+  // дня нет (что при включённом ране само по себе находка, см. describe
+  // «план потерян»). Поэтому в двух тестах ниже план из фикстуры убран.
+  it('правила расписания не прочитались — план дня сверить не с чем', async () => {
+    const w = world();
+    delete w.settings['planner_last_plan'];
+    const { deps } = makeDeps(w, {
       schedules: {
         listEnabled: async () => {
           throw new Error('нет таблицы schedule_rules');
@@ -836,11 +983,16 @@ describe('runHeartbeat: отказ самих проверок — тоже на
       },
     });
     const summary = await runHeartbeat(deps, NOW);
-    expect(summary.problems).toEqual([expect.stringContaining('правила расписания не прочитаны')]);
+    expect(summary.problems).toEqual([
+      expect.stringContaining('план дня не записан'),
+      expect.stringContaining('правила расписания не прочитаны'),
+    ]);
   });
 
   it('скип не проверился — отдельная строка (иначе получилось бы ложное «нет отчёта»)', async () => {
-    const { deps } = makeDeps(world(), {
+    const w = world();
+    delete w.settings['planner_last_plan'];
+    const { deps } = makeDeps(w, {
       skips: {
         isSkipped: async () => {
           throw new Error('таймаут Supabase');
@@ -848,7 +1000,10 @@ describe('runHeartbeat: отказ самих проверок — тоже на
       },
     });
     const summary = await runHeartbeat(deps, NOW);
-    expect(summary.problems).toEqual([expect.stringContaining('скип профиля "ilya" на 2026-08-11 не проверен')]);
+    expect(summary.problems).toEqual([
+      expect.stringContaining('план дня не записан'),
+      expect.stringContaining('скип профиля "ilya" на 2026-08-11 не проверен'),
+    ]);
   });
 
   it('настройки не прочитались — планировщик считается выключенным, но находка есть', async () => {
@@ -867,6 +1022,8 @@ describe('runHeartbeat: отказ самих проверок — тоже на
       expect.stringContaining('planner_enabled не прочитана'),
       expect.stringContaining('bot_alive_at не прочитана'),
       expect.stringContaining('planner_last_run не прочитана'),
+      // Непрочитанный план — тоже находка: квитанции при этом сверяются по правилам.
+      expect.stringContaining('план дня не прочитан'),
     ]);
   });
 });

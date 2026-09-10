@@ -261,6 +261,21 @@ type SettingsSetMock = ReturnType<typeof vi.fn<PlannerDeps['settings']['set']>>;
  */
 type DepsOverrides = Partial<Omit<PlannerDeps, 'settings'>> & { settings?: Partial<PlannerDeps['settings']> };
 
+/**
+ * settings.get фейков: планировщик включён, остальные ключи — из `values`
+ * (по умолчанию пусто). Одна строка 'true' на любой ключ не годится: для
+ * planner_last_plan она была бы нечитаемым значением, которое ран не перезаписывает.
+ */
+function settingsGet(values: Record<string, string | null> = {}) {
+  return vi.fn(async (key: string) => (key === 'planner_enabled' ? 'true' : (values[key] ?? null)));
+}
+
+/** План дня, который ран записал в settings (null — не записывал). */
+function planWritten(deps: { settingsSetMock: SettingsSetMock }) {
+  const call = deps.settingsSetMock.mock.calls.find(([key]) => key === PLANNER_LAST_PLAN_KEY);
+  return call === undefined ? null : parsePlannerPlan(String(call[1]));
+}
+
 function fakeDeps(overrides: DepsOverrides = {}): PlannerDeps & {
   sendPreDropMock: SendPreDropMock;
   triggerDropMock: TriggerDropMock;
@@ -278,7 +293,7 @@ function fakeDeps(overrides: DepsOverrides = {}): PlannerDeps & {
     profiles: { getById: vi.fn(async (id: string) => profile({ id })) },
     skips: { isSkipped: vi.fn(async () => false) },
     ...overrides,
-    settings: { get: overrides.settings?.get ?? vi.fn(async () => 'true'), set: settingsSetMock },
+    settings: { get: overrides.settings?.get ?? settingsGet(), set: settingsSetMock },
     sendPreDrop: sendPreDropMock,
     triggerDrop: triggerDropMock,
   };
@@ -640,9 +655,12 @@ describe('makeTriggerDrop: ключ идемпотентности ГЛОБАЛ�
 
 describe('dailyPlannerTask — регистрация', () => {
   it('id и cron соответствуют контракту (каждый час в :30 UTC = :30 Тбилиси, ран H:30 ставит час H)', () => {
-    const config = dailyPlannerTask as unknown as { id: string; cron: string };
+    const config = dailyPlannerTask as unknown as { id: string; cron: string; queue?: { concurrencyLimit?: number } };
     expect(config.id).toBe('daily-planner');
     expect(config.cron).toBe('30 * * * *');
+    // План дня дописывается через read-merge-write: два рана одновременно
+    // (крон + ручной Replay) затёрли бы друг другу слоты.
+    expect(config.queue).toEqual({ concurrencyLimit: 1 });
   });
 });
 
@@ -691,7 +709,7 @@ describe('planner_last_run: отметка «планировщик сегодн
         order.push('drop');
       },
       settings: {
-        get: vi.fn(async () => 'true'),
+        get: settingsGet(),
         set: async (key: string) => {
           order.push(key === PLANNER_LAST_PLAN_KEY ? 'plan' : 'mark');
         },
@@ -707,7 +725,7 @@ describe('planner_last_run: отметка «планировщик сегодн
   it('сбой записи отметки не роняет ран: сообщения и дропы уже ушли', async () => {
     const deps = fakeDeps({
       settings: {
-        get: vi.fn(async () => 'true'),
+        get: settingsGet(),
         set: async () => {
           throw new Error('PostgREST 503');
         },
@@ -755,15 +773,93 @@ describe('planner_last_run: отметка «планировщик сегодн
       slots: [{ profileId: 'ilya', time: '20:00' }],
     });
     const deps = fakeDeps({
-      settings: { get: vi.fn(async (key: string) => (key === PLANNER_LAST_PLAN_KEY ? stored : 'true')) },
+      settings: { get: settingsGet({ [PLANNER_LAST_PLAN_KEY]: stored, [PLANNER_LAST_RUN_KEY]: '2026-07-31T20:30:00.000+04:00' }) },
     });
 
     await runDailyPlanner(deps, NOW_2130);
 
-    const call = deps.settingsSetMock.mock.calls.find(([key]) => key === PLANNER_LAST_PLAN_KEY);
-    expect(parsePlannerPlan(String(call![1]))).toEqual({
+    expect(planWritten(deps)).toEqual({
       date: DATE,
       at: '2026-07-31T21:30:00.000+04:00',
+      slots: [
+        { profileId: 'ilya', time: '20:00' },
+        { profileId: 'ilya', time: '21:00' },
+      ],
+    });
+  });
+
+  it('нечитаемое значение плана не перезаписывается: свой час не пишем, отметка рана ставится', async () => {
+    // Иначе одна битая строка стёрла бы дропы прошлых часов; чинится руками.
+    const deps = fakeDeps({ settings: { get: settingsGet({ [PLANNER_LAST_PLAN_KEY]: '{битый json' }) } });
+
+    const summary = await runDailyPlanner(deps, NOW);
+
+    expect(summary.dropsTriggered).toBe(1);
+    expect(deps.settingsSetMock.mock.calls.map(([key]) => key)).toEqual([PLANNER_LAST_RUN_KEY]);
+  });
+
+  it('предыдущий включённый ран отметился, а его дропов в плане нет — план помечается неполным', async () => {
+    // Ран 20:30 поставил 20:00 и записал отметку, но план записать не смог.
+    const lastRun = '2026-07-31T20:30:00.000+04:00';
+    const noPlan = fakeDeps({ settings: { get: settingsGet({ [PLANNER_LAST_RUN_KEY]: lastRun }) } });
+    await runDailyPlanner(noPlan, NOW_2130);
+    expect(planWritten(noPlan)).toEqual({
+      date: DATE,
+      at: '2026-07-31T21:30:00.000+04:00',
+      slots: [{ profileId: 'ilya', time: '21:00' }],
+      incomplete: true,
+    });
+
+    // То же, если план есть, но от более раннего рана (19:30): его слоты остаются.
+    const stale = formatPlannerPlan({
+      date: DATE,
+      at: '2026-07-31T19:30:00.000+04:00',
+      slots: [{ profileId: 'vera', time: '19:00' }],
+    });
+    const stalePlan = fakeDeps({
+      settings: { get: settingsGet({ [PLANNER_LAST_RUN_KEY]: lastRun, [PLANNER_LAST_PLAN_KEY]: stale }) },
+    });
+    await runDailyPlanner(stalePlan, NOW_2130);
+    expect(planWritten(stalePlan)).toEqual({
+      date: DATE,
+      at: '2026-07-31T21:30:00.000+04:00',
+      slots: [
+        { profileId: 'vera', time: '19:00' },
+        { profileId: 'ilya', time: '21:00' },
+      ],
+      incomplete: true,
+    });
+  });
+
+  it('план не помечается неполным, если он от того же рана, что отметка, отметка вчерашняя или от выключенного рана', async () => {
+    const at2030 = '2026-07-31T20:30:00.000+04:00';
+    const cases: Record<string, string | null>[] = [
+      {
+        [PLANNER_LAST_RUN_KEY]: at2030,
+        [PLANNER_LAST_PLAN_KEY]: formatPlannerPlan({ date: DATE, at: at2030, slots: [{ profileId: 'ilya', time: '20:00' }] }),
+      },
+      { [PLANNER_LAST_RUN_KEY]: '2026-07-30T21:30:00.000+04:00' },
+      { [PLANNER_LAST_RUN_KEY]: `disabled@${at2030}` },
+    ];
+    for (const values of cases) {
+      const deps = fakeDeps({ settings: { get: settingsGet(values) } });
+      await runDailyPlanner(deps, NOW_2130);
+      expect(planWritten(deps)?.incomplete).toBeUndefined();
+      expect(planWritten(deps)?.slots).toContainEqual({ profileId: 'ilya', time: '21:00' });
+    }
+  });
+
+  it('флаг неполноты доезжает до конца дня', async () => {
+    const at2030 = '2026-07-31T20:30:00.000+04:00';
+    const stored = formatPlannerPlan({ date: DATE, at: at2030, slots: [{ profileId: 'ilya', time: '20:00' }], incomplete: true });
+    const deps = fakeDeps({
+      settings: { get: settingsGet({ [PLANNER_LAST_RUN_KEY]: at2030, [PLANNER_LAST_PLAN_KEY]: stored }) },
+    });
+
+    await runDailyPlanner(deps, NOW_2130);
+
+    expect(planWritten(deps)).toMatchObject({
+      incomplete: true,
       slots: [
         { profileId: 'ilya', time: '20:00' },
         { profileId: 'ilya', time: '21:00' },
@@ -777,14 +873,11 @@ describe('planner_last_run: отметка «планировщик сегодн
       at: '2026-07-30T21:30:00.000+04:00',
       slots: [{ profileId: 'ilya', time: '21:00' }],
     });
-    const deps = fakeDeps({
-      settings: { get: vi.fn(async (key: string) => (key === PLANNER_LAST_PLAN_KEY ? stored : 'true')) },
-    });
+    const deps = fakeDeps({ settings: { get: settingsGet({ [PLANNER_LAST_PLAN_KEY]: stored }) } });
 
     await runDailyPlanner(deps, NOW);
 
-    const call = deps.settingsSetMock.mock.calls.find(([key]) => key === PLANNER_LAST_PLAN_KEY);
-    expect(parsePlannerPlan(String(call![1]))).toEqual({
+    expect(planWritten(deps)).toEqual({
       date: DATE,
       at: '2026-07-31T20:30:00.000+04:00',
       slots: [{ profileId: 'ilya', time: '20:00' }],
@@ -835,7 +928,7 @@ describe('planner_last_run: отметка «планировщик сегодн
   it('сбой записи плана не роняет ран и не мешает отметке', async () => {
     const deps = fakeDeps({
       settings: {
-        get: vi.fn(async () => 'true'),
+        get: settingsGet(),
         set: vi.fn(async (key: string) => {
           if (key === PLANNER_LAST_PLAN_KEY) throw new Error('PostgREST 503');
         }),

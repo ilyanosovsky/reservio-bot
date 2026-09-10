@@ -89,6 +89,7 @@ import {
   formatPlannerPlan,
   mergePlannerPlan,
   parsePlannerPlan,
+  planLagsBehindRun,
   PLANNER_DISABLED_PREFIX,
   PLANNER_ENABLED_KEY,
   PLANNER_ENABLED_VALUE,
@@ -389,9 +390,16 @@ async function markPlannerRun(deps: PlannerDeps, now: Date, enabled: boolean): P
  *
  * Планировщик почасовой, поэтому план КОПИТСЯ: ран часа H дописывает свои дропы
  * к уже записанным (mergePlannerPlan), а первый ран нового дня T — с новым
- * date — начинает план заново. Если прочитать записанное не удалось, свой кусок
- * НЕ пишем: перезапись стёрла бы дропы прошлых часов, а сторож, не найдя плана
- * за эту дату, честно уходит на восстановление по живым правилам.
+ * date — начинает план заново. Записанное не прочиталось или нечитаемо (не
+ * JSON, чужая форма) — свой кусок НЕ пишем: перезапись стёрла бы дропы прошлых
+ * часов, а сторож, не найдя плана за эту дату, уходит на восстановление по
+ * живым правилам. Нечитаемое значение чинится руками (удалить ключ).
+ *
+ * Потерянный кусок не должен пропасть молча: если предыдущий включённый ран
+ * сегодня отметился (planner_last_run), а план старше его отметки — тот ран
+ * дропы поставил, но записать не смог. Тогда план помечается `incomplete`
+ * (planLagsBehindRun), флаг доезжает до конца дня, и сторож сверяет квитанции
+ * ещё и по живым правилам, а не только по неполному списку.
  *
  * В план попадают ВСЕ схлопнутые дропы, включая те, чей triggerDrop сорвался:
  * несостоявшийся ран — ровно тот случай, о котором сторож обязан сказать вслух,
@@ -403,17 +411,17 @@ async function markPlannerRun(deps: PlannerDeps, now: Date, enabled: boolean): P
 async function markPlannerPlan(
   deps: PlannerDeps,
   date: string,
+  dayT: string,
   now: Date,
   drops: readonly PlannedDrop[],
 ): Promise<void> {
-  const next = {
-    date,
-    at: tbilisiStamp(now),
-    slots: drops.map((d) => ({ profileId: d.profileId, time: d.time })),
-  };
-  let existing;
+  let rawPlan: string | null;
+  let lastRun: string | null;
   try {
-    existing = parsePlannerPlan(await deps.settings.get(PLANNER_LAST_PLAN_KEY));
+    [rawPlan, lastRun] = await Promise.all([
+      deps.settings.get(PLANNER_LAST_PLAN_KEY),
+      deps.settings.get(PLANNER_LAST_RUN_KEY),
+    ]);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.error(
@@ -422,6 +430,29 @@ async function markPlannerPlan(
     );
     return;
   }
+  const existing = parsePlannerPlan(rawPlan);
+  if (existing === null && rawPlan !== null && rawPlan.trim() !== '') {
+    logger.error(
+      `daily-planner: значение ${PLANNER_LAST_PLAN_KEY} нечитаемо — свой час не дописываем, чтобы не стереть ` +
+        'дропы прошлых часов; удали ключ в settings, следующий ран запишет план заново',
+    );
+    return;
+  }
+
+  // Предыдущий включённый ран отметился, а его дропов в плане нет — план неполный.
+  const lags = planLagsBehindRun(existing !== null && existing.date === date ? existing : null, lastRun, dayT);
+  if (lags) {
+    logger.warn(
+      `daily-planner: план дня отстал от отметки ${PLANNER_LAST_RUN_KEY} — предыдущий ран не записал свои дропы; ` +
+        'помечаем план как неполный, heartbeat сверит квитанции и по живым правилам',
+    );
+  }
+  const next = {
+    date,
+    at: tbilisiStamp(now),
+    slots: drops.map((d) => ({ profileId: d.profileId, time: d.time })),
+    ...(lags ? { incomplete: true } : {}),
+  };
   try {
     await deps.settings.set(PLANNER_LAST_PLAN_KEY, formatPlannerPlan(mergePlannerPlan(existing, next)));
   } catch (err) {
@@ -571,7 +602,7 @@ export async function runDailyPlanner(deps: PlannerDeps, now: Date): Promise<Pla
 
   // План пишем ПОСЛЕ постановки дропов и ДО отметки о ране: heartbeat сверяет
   // квитанции именно с этим списком, а не с расписанием на момент своей проверки.
-  await markPlannerPlan(deps, date, now, drops);
+  await markPlannerPlan(deps, date, dayT, now, drops);
 
   // Отметка ставится в конце УСПЕШНОГО рана: если планировщик рухнул раньше
   // (не отвечает Supabase, отвалился trigger.dev), отметки за сегодня не будет
@@ -711,6 +742,10 @@ export const dailyPlannerTask = schedules.task({
   // ран H:30 ставит дропы часа H (см. шапку файла). Id таска исторический —
   // менять его значит потерять расписание в дашборде trigger.dev.
   cron: '30 * * * *',
+  // План дня дописывается через read-merge-write (markPlannerPlan): два рана
+  // планировщика одновременно (крон + ручной Replay) затёрли бы друг другу
+  // слоты, и сторож не ждал бы квитанций по потерянным.
+  queue: { concurrencyLimit: 1 },
   run: async (payload) => {
     const deps = await buildDeps();
     return runDailyPlanner(deps, payload.timestamp);

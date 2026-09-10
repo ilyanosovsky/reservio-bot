@@ -128,14 +128,21 @@ export interface PlannedSlot {
   time: string;
 }
 
-/** План вечера, каким его записал планировщик (settings.planner_last_plan). */
+/** План дня, каким его записал планировщик (settings.planner_last_plan). */
 export interface PlannerPlan {
   /** Дата игры (T+7), на которую ставились дропы. */
   date: string;
-  /** tbilisiStamp момента, когда планировщик принимал решения. */
+  /** tbilisiStamp последнего рана планировщика, дописавшего план. */
   at: string;
   /** Поставленные раны (профиль, час) — уже схлопнутые mergePlannedDrops. */
   slots: PlannedSlot[];
+  /**
+   * Хотя бы один включённый ран сегодня НЕ смог записать свои дропы (упал на
+   * записи плана): slots — нижняя граница, и сторож обязан сверять квитанции
+   * ещё и по живым правилам. Ставит следующий ран (см. planLagsBehindRun),
+   * снимается только с новым днём.
+   */
+  incomplete?: boolean;
 }
 
 /** Разобранная отметка времени в зоне клуба. */
@@ -192,6 +199,7 @@ export function formatPlannerPlan(plan: PlannerPlan): string {
     date: plan.date,
     at: plan.at,
     slots: plan.slots.map((s) => ({ profileId: s.profileId, time: s.time })),
+    ...(plan.incomplete === true ? { incomplete: true } : {}),
   });
 }
 
@@ -209,10 +217,16 @@ export function parsePlannerPlan(raw: string | null | undefined): PlannerPlan | 
     return null;
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-  const { date, at, slots } = parsed as { date?: unknown; at?: unknown; slots?: unknown };
+  const { date, at, slots, incomplete } = parsed as {
+    date?: unknown;
+    at?: unknown;
+    slots?: unknown;
+    incomplete?: unknown;
+  };
   if (typeof date !== 'string' || !DATE_RE.test(date)) return null;
   if (typeof at !== 'string' || at === '') return null;
   if (!Array.isArray(slots)) return null;
+  if (incomplete !== undefined && typeof incomplete !== 'boolean') return null;
   const out: PlannedSlot[] = [];
   for (const slot of slots) {
     if (typeof slot !== 'object' || slot === null) return null;
@@ -221,19 +235,21 @@ export function parsePlannerPlan(raw: string | null | undefined): PlannerPlan | 
     if (typeof time !== 'string' || time === '') return null;
     out.push({ profileId, time });
   }
-  return { date, at, slots: out };
+  return { date, at, slots: out, ...(incomplete === true ? { incomplete: true } : {}) };
 }
 
 /**
  * Слияние плана дня. Планировщик почасовой: ран в H:30 ставит дропы часа H и
  * дописывает их к записанному плану. Тот же `date` — объединение слотов без
- * дублей (в порядке появления), `at` — момент последнего рана; другой `date`
- * (первый ран нового дня T, план от старого деплоя) — новый план целиком.
+ * дублей (в порядке появления), `at` — момент последнего рана, флаг
+ * `incomplete` не снимается; другой `date` (первый ран нового дня T, план от
+ * старого деплоя) — новый план целиком.
  */
 export function mergePlannerPlan(existing: PlannerPlan | null, next: PlannerPlan): PlannerPlan {
+  const sameDay = existing !== null && existing.date === next.date;
   const slots: PlannedSlot[] = [];
   const seen = new Set<string>();
-  const source = existing !== null && existing.date === next.date ? [...existing.slots, ...next.slots] : next.slots;
+  const source = sameDay ? [...existing.slots, ...next.slots] : next.slots;
   for (const slot of source) {
     // Разделитель — пробел: его нет ни в id профиля, ни в HH:MM (см. mergePlannedDrops).
     const key = `${slot.profileId} ${slot.time}`;
@@ -241,7 +257,45 @@ export function mergePlannerPlan(existing: PlannerPlan | null, next: PlannerPlan
     seen.add(key);
     slots.push({ profileId: slot.profileId, time: slot.time });
   }
-  return { date: next.date, at: next.at, slots };
+  const incomplete = (sameDay && existing.incomplete === true) || next.incomplete === true;
+  return { date: next.date, at: next.at, slots, ...(incomplete ? { incomplete: true } : {}) };
+}
+
+/**
+ * Отстал ли записанный план дня от последнего ВКЛЮЧЁННОГО рана планировщика.
+ *
+ * Ран пишет план и отметку planner_last_run из одного `now`, поэтому в здоровом
+ * состоянии `plan.at` равен отметке до миллисекунды. План старше отметки (или
+ * плана за эту дату нет вовсе) — ран поставил дропы, а записать их не смог:
+ * слоты плана — нижняя граница, сверять квитанции только по нему нельзя.
+ * Отметка вчерашняя, нечитаемая или с префиксом 'disabled@' — сравнивать не с
+ * чем (выключенный ран плана не касается). План НОВЕЕ отметки — отстала
+ * отметка, не план: это не повод не верить плану.
+ *
+ * `plan` — план именно за сегодняшнюю дату игры (иначе null), `today` — день T.
+ */
+export function planLagsBehindRun(plan: PlannerPlan | null, lastRun: string | null, today: string): boolean {
+  const run = parseTbilisiStamp(lastRun);
+  if (run === null || run.date !== today || run.disabled) return false;
+  if (plan === null) return true;
+  const at = parseTbilisiStamp(plan.at);
+  return at === null || at.at.getTime() < run.at.getTime();
+}
+
+/** Объединение ожидаемых квитанций без дублей: сначала первый список, затем недостающие из второго. */
+export function mergeExpectedReceipts(
+  primary: readonly ExpectedReceipt[],
+  extra: readonly ExpectedReceipt[],
+): ExpectedReceipt[] {
+  const out: ExpectedReceipt[] = [];
+  const seen = new Set<string>();
+  for (const slot of [...primary, ...extra]) {
+    const key = `${slot.profileId} ${slot.time}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(slot);
+  }
+  return out;
 }
 
 // ------------------------------- проверки -----------------------------------
