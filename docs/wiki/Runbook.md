@@ -562,18 +562,30 @@ The court set and the mode (`priority`/`all`) are configured in the bot itself �
 "⏰ Schedule" → the scenario create/edit wizard, step 3 (courts) and step 4
 (mode). Screen details are in `Bot.md` → "⏰ Schedule: scenario builder".
 
-⚠️ Disabling or deleting a scenario does NOT cancel a run already set for today:
-the scheduler sends `book-slot-drop` at 20:30 with all parameters in the payload,
-and the run itself re-reads only the skips. To not book today — "⏭ Skip" on the
-game date (or cancel the run in the trigger.dev dashboard).
+⚠️ Disabling or deleting a scenario does NOT cancel a run the scheduler has
+already set: the scheduler is hourly — the run at `H:30` sends `book-slot-drop`
+for hour H with all parameters in the payload, and the run itself re-reads only
+the skips. Later hours are picked up by their own runs. To not book today — "⏭
+Skip" on the game date (or cancel the run in the trigger.dev dashboard).
 
 ## Scheduler (`daily-planner`, disabled by default)
 
 `src/trigger/daily-planner.ts` — the trigger.dev task `daily-planner`, scheduled
-on cron `30 16 * * *` (UTC) = **20:30 Tbilisi time**. Conceived as an automatic
-replacement for the manual setup of two deferred runs from the section above:
-every evening it finds the applicable `schedule_rule`s itself and sets
-`book-slot-drop` with the needed `delay` itself.
+on cron `30 * * * *` (UTC) = **every hour at :30 Tbilisi time** (the +04:00
+offset is whole hours, no DST). Conceived as an automatic replacement for the
+manual setup of deferred runs from the section above: the run at `H:30` finds
+the applicable `schedule_rule`s itself and sets `book-slot-drop` for **hour H**
+with the needed `delay` itself — the times whose send moment (`H:57`) falls
+within the next 60 minutes. Hours whose drop window has already closed are
+skipped quietly (that is how every past hour looks to every later run); later
+hours belong to their own runs.
+
+History: until 2026-09-10 the cron ran once a day at 20:30 and silently skipped
+any hour earlier than 20:00 (its send moment had already passed) — the only
+trace was a `warn` line in the run log and a `summary.errors` entry nobody
+reads. A second profile's 19:00 Mon–Fri scenario therefore never fired. The
+hourly model is the fix; the task id stayed `daily-planner` so the schedule in
+the trigger.dev dashboard is preserved.
 
 **By default — a no-op.** The first line of `run()`: if
 `SettingsRepo.get('planner_enabled') !== 'true'` — the task logs "scheduler
@@ -585,11 +597,14 @@ in the `settings` table (Supabase SQL Editor:
 row if it isn't there yet); there is no separate bot command for this yet.
 
 When the flag is enabled, for each `enabled` rule whose profile has a
-`telegram_chat_id`, which applies to date T+7 (`ruleAppliesOn`) and for which
-there is no `skip`, the task: (1) sends a pre-drop message to the profile's
-Telegram with the plan and the buttons "⏭ Skip" / "✅ Book" (the buttons are
-handled by `src/bot/handlers/*.ts` — "Skip" writes a `skip`, "Book" does
-nothing, that's already the default behavior); (2) for each (profile, hour) sets
+`telegram_chat_id`, which applies to date T+7 (`ruleAppliesOn`), for which
+there is no `skip` and which has a time due in this hour, the task: (1) sends a
+pre-drop message to the profile's Telegram with the plan (all of the rule's
+remaining times for today) and the buttons "⏭ Skip" / "✅ Book" — **once per
+rule per day**, in the run before the rule's first drop, so a 20:00+21:00
+scenario still gets one message at 20:30 (the buttons are handled by
+`src/bot/handlers/*.ts` — "Skip" writes a `skip`, "Book" does nothing, that's
+already the default behavior); (2) for each due (profile, hour) sets
 `tasks.trigger('book-slot-drop', {profileId, date, time, live: true, force:
 true, courts, mode}, {delay: ..., idempotencyKey:
 'drop-{profileId}-{date}-{time}-{ruleIds}', concurrencyKey: profileId})` — the
@@ -653,19 +668,19 @@ night until the table is created.
    nothing). No mark for today's date → "the scheduler didn't run today". The
    check is skipped only if the scheduler is disabled AND there is no today's
    mark at all (there was nothing to book).
-2. **Expected reports of the evening.** Whether to expect receipts is decided NOT
-   by the current value of `planner_enabled` (the flag is toggled by hand at any
-   hour, including between 20:30 and 22:12) but by today's `planner_last_run`
-   mark: with the `disabled@` prefix — the evening was not planned, the check
-   stays silent; without the prefix — the evening was planned, and receipts must
-   exist even if the flag has since been removed (a removed flag does not
-   withdraw a SET run — it will run and book a court). If there is no today's
-   mark at all → we go by the flag.
-   The list of expected `(profile, time)` is taken from
-   `settings.planner_last_plan` — that is what the scheduler ACTUALLY set at
-   20:30 (see below). From the plan, the hours whose drop hasn't closed by 22:12
-   are dropped (computed from the time, not hardcoded as a list — right now that
-   is effectively `20:00`/`21:00`).
+2. **Expected reports of the evening.** The first source of truth is the
+   recorded day plan `settings.planner_last_plan` (see below): if it has slots
+   for today's game date, receipts for them are expected no matter what
+   `planner_enabled` says now — the flag is toggled by hand at any hour,
+   including between the hourly planner runs, and a removed flag does not
+   withdraw a SET run (it will run and book a court). Without such a plan the
+   decision falls to today's `planner_last_run` mark (written by EVERY hourly
+   run): with the `disabled@` prefix — the last run was disabled, the check
+   stays silent; without the prefix — receipts are expected. If there is no
+   today's mark at all → we go by the flag.
+   From the plan, the hours whose drop hasn't closed by 22:12 are dropped
+   (computed from the time, not hardcoded as a list — a 22:00 or 23:00 rule is
+   never checked by the 22:12 watchdog).
    - No row in `drop_reports` for `targetDate` on an expected `(profile, time)` →
      "no report for {time} (profile {label})".
    - The row exists, but `telegram_ok = false` → "the report for {time} was not
@@ -687,13 +702,32 @@ night until the table is created.
    to `api.telegram.org` stays alive (grammY retries `getUpdates` forever) and
    would report "alive" while being deaf.
 
-### The evening plan (`planner_last_plan`)
+### The day plan (`planner_last_plan`)
 
 `daily-planner`, after setting the drops, writes to `settings` the key
 `planner_last_plan` — a compact JSON `{date, at, slots:[{profileId,time}]}` with
 the list of set runs (including those whose `tasks.trigger` failed: it is exactly
-about those that the watchdog is obliged to speak). The heartbeat reconciles the
-receipts against precisely it.
+about those that the watchdog is obliged to speak). The planner is hourly, so
+the plan **accumulates** over the day: each run reads the stored plan and merges
+its own hour in (`mergePlannerPlan` — same `date` → union of slots, `at` = the
+last run; a new `date` → a fresh plan). If the stored value cannot be read or is
+not a valid plan, the run does not write at all rather than wipe the earlier
+hours (a malformed value is fixed by hand: delete the key, the next run writes a
+fresh plan). Concurrent planner runs (cron + a manual Replay) are serialized by
+`queue: { concurrencyLimit: 1 }` on the task, so the read-merge-write cannot
+lose slots. The heartbeat reconciles the receipts against precisely it.
+
+**Plan integrity.** A run writes the plan and then `planner_last_run` from the
+same `now`, so in a healthy state `plan.at` equals the run mark exactly. If a
+run set drops but failed to record them, the next run sees the stored plan
+older than the enabled mark (`planLagsBehindRun`) and flags the plan
+`incomplete: true` for the rest of the day; the heartbeat applies the same
+comparison to the last run. A plan that is missing, unreadable, lagging or
+flagged incomplete while an enabled run was recorded today is a **finding**
+("the day plan … — receipts also reconciled against the live rules"): the
+watchdog then expects the union of the plan's slots and the hours rebuilt from
+the live rules, so a lost hour is not silently excused. A plan that is newer
+than the mark means the mark failed to write, not the plan — it is trusted.
 
 Why, given there are `schedule_rules`: the schedule and the skips are edited by
 the owner the WHOLE evening. Remove a skip from date T+7 at 21:00 (the first
@@ -701,13 +735,23 @@ button of the "⏭ Skip" menu is exactly this date) or create a new scenario in
 the "⏰ Schedule" wizard — and the watchdog, reconstructing the plan from the
 live rules at 22:12, would demand reports for drops that nobody set.
 
-If there is no plan for the needed date (the scheduler crashed before recording,
-the deploy is older than this branch, the value is unreadable) → the heartbeat
-goes to a FALLBACK path: it reconstructs the plan from the live
-`schedule_rules`/`skips` with the same selection logic as the scheduler
-(`selectEligibleRules` + `splitTimesByDrop` — the applicability rules are not
-duplicated as a separate copy). In the run output this shows up as a check line
-for `planner_last_plan` with status `skipped` and the reason.
+If there is no plan for the needed date, there is **no `planner_last_run` mark
+for today at all** and `planner_enabled` is `'true'` (the deploy is older than
+this branch, the cron never fired — the latter is its own finding) → the
+heartbeat goes to a FALLBACK path: it reconstructs the plan
+from the live `schedule_rules`/`skips` with the same selection logic as the
+scheduler (`selectEligibleRules` — the applicability rules are not duplicated as
+a separate copy) and expects a receipt for every rule hour whose drop has
+already closed: the planner is hourly, so an hour nobody scheduled is exactly
+the finding. (A scenario created mid-day for an hour that had already passed
+gives a false "no report" on this path — which is why it is the fallback.) In
+the run output this shows up as a check line for `planner_last_plan` with status
+`skipped` and the reason; the same reconstruction runs, in addition to the
+plan's own slots, whenever the plan-integrity finding above fires. A today's
+mark with the `disabled@` prefix (and no plan with slots) never enters the
+fallback: the last run was disabled and set nothing, so the receipts check is
+skipped with that reason — an enabled mark with no plan is the integrity
+finding above, not the fallback.
 
 ### Receipts (`drop_reports`)
 
@@ -744,6 +788,7 @@ message text.
 | "the report for {time} was not delivered to Telegram" | `book-slot-drop` finished (`telegram_ok = false` in `drop_reports`), but the report didn't arrive in any of the three attempts | Check the drop result in the output/log of the specific `book-slot-drop` run (the `DropReport` is always there), not only in Telegram; check `TELEGRAM_BOT_TOKEN` and the availability of the Telegram API |
 | "the Telegram bot shows no signs of life since {stamp}" | The bot process (`src/bot/index.ts`) is not running, crashed, the hosting restarts it in a loop — or the process is alive but lost its connection to `api.telegram.org` (the `getMe` probe doesn't pass, and the mark is deliberately not updated) | Check the status of the bot's process/deploy at the hosting (`Hosting.md`) and the logs: the line "Telegram not responding…" means a host network problem, not a crash. After recovery `bot_alive_at` will update within the first seconds. If the bot is deliberately kept off — remove `settings.bot_alive_required` instead of enduring a nightly alert |
 | "receipts for {date} could not be read … PGRST205" | The migration `20260804140000_heartbeat.sql` was not applied — there is no `drop_reports` table in Supabase | Apply the migration (see "Before the first run: migration" above) and check that the evening `book-slot-drop` runs stopped writing "the evening receipt was not recorded" to the log |
+| "the day plan is not recorded / lags behind the last planner run / is flagged incomplete / could not be read … — receipts also reconciled against the live rules" | An hourly `daily-planner` run set its drops but failed to write `settings.planner_last_plan` (Supabase error, or a malformed value it refuses to overwrite), so the plan is a lower bound; the receipts were checked against the union of the plan and the live rules — any real "no report" line comes separately | Check the `daily-planner` runs for today for the "план дня не записан / нечитаем" error line; if the stored value is malformed, delete the `planner_last_plan` row in `settings` — the next run writes a fresh plan. "No report" lines in the same alert may be false positives for scenarios created mid-day; verify them against the `book-slot-drop` runs |
 | The `heartbeat` run itself `FAILED` in the dashboard, no message in Telegram | Either Telegram is entirely unavailable (all three attempts to deliver the alert failed), or a bug in the task itself | Check the log of the crashed `heartbeat` run in the dashboard — the exception is not swallowed, deliberately for this case |
 
 ## Evening production run checklist

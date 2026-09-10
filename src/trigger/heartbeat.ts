@@ -1,7 +1,7 @@
 // Таск trigger.dev "heartbeat" — сторож инварианта наблюдаемости.
 // Крон '12 18 * * *' (UTC) = 22:12 Asia/Tbilisi (+04:00, круглый год без DST):
-// оба вечерних дропа (20:59 и 21:59) к этому моменту закрыты, отчёты отправлены,
-// квитанции записаны.
+// вечерние дропы (…, 19:59, 20:59, 21:59) к этому моменту закрыты, отчёты
+// отправлены, квитанции записаны. Часы после 22:00 сторож не ждёт (dropIsDue).
 //
 // Зачем он есть. CLAUDE.md: «КАЖДЫЙ вечер в Telegram уходит ровно одно сообщение
 // — успех / ошибка / пропущено по команде. Молчаливый провал — худший баг этого
@@ -18,20 +18,21 @@
 //   2. по каждому ожидавшемуся слоту есть квитанция в drop_reports;
 //   3. у квитанции telegram_ok = true — отчёт реально доехал до человека;
 //   4. bot_alive_at не старше 15 минут — процесс Telegram-бота жив.
-// Пункты 2–3 имеют смысл, только если вечер РЕАЛЬНО планировался, и решает это
-// не текущее значение planner_enabled (флаг переключают руками в любой час, в
-// том числе между 20:30 и 22:12), а сегодняшняя отметка planner_last_run:
-// с префиксом 'disabled@' — вечер не планировался, без префикса — планировался,
-// и поставленный ран отработает даже после выключения флага (см.
-// eveningWasPlanned). Пункт 4 от планировщика не зависит вовсе, но включается
-// явным тумблером bot_alive_required: пока процесс бота живёт на ноутбуке
-// владельца, а не на хостинге, эта проверка алертила бы каждую ночь.
+// Пункты 2–3 имеют смысл, только если день РЕАЛЬНО планировался. Первый
+// источник правды — записанный план дня (settings.planner_last_plan): это
+// список ранов, которые почасовой планировщик (ран в H:30 ставит дропы часа H)
+// реально поставил, и если в нём есть слоты — квитанции по ним обязаны быть,
+// что бы ни говорил флаг planner_enabled сейчас (его переключают руками в любой
+// час, в том числе между ранами планировщика). Плана нет — решает сегодняшняя
+// отметка planner_last_run: с префиксом 'disabled@' — последний ран отработал
+// выключенным, без префикса — включённым (см. eveningWasPlanned). Пункт 4 от
+// планировщика не зависит вовсе, но включается явным тумблером
+// bot_alive_required: пока процесс бота живёт на ноутбуке владельца, а не на
+// хостинге, эта проверка алертила бы каждую ночь.
 //
-// План вечера берётся из settings.planner_last_plan — списка ранов, которые
-// планировщик реально поставил в 20:30. Восстановление плана из живых
-// schedule_rules/skips осталось запасным путём: расписание и скипы владелец
-// правит и вечером (снял скип с даты T+7 в 21:00 — и сторож ждал бы квитанции
-// по дропам, которых никто не ставил).
+// Восстановление плана из живых schedule_rules/skips осталось запасным путём:
+// расписание и скипы владелец правит и вечером (снял скип с даты T+7 в 21:00 —
+// и сторож ждал бы квитанции по дропам, которых никто не ставил).
 //
 // Отдельный принцип: отказ любой из проверок (не прочитались настройки,
 // правила, квитанции) сам становится находкой. Сторож, который молча не смог
@@ -52,7 +53,7 @@
 
 import { logger, schedules } from '@trigger.dev/sdk';
 import { sendTelegram, type TelegramTarget } from '../core/notify.js';
-import { dropDayOf, targetDate, tbilisiDateOf, tbilisiStamp } from '../core/scheduler.js';
+import { targetDate, tbilisiDateOf, tbilisiStamp } from '../core/scheduler.js';
 import {
   adminChatIds,
   botAliveProblem,
@@ -60,8 +61,9 @@ import {
   expectedFromPlan,
   expectedReceipts,
   formatHeartbeatAlert,
+  mergeExpectedReceipts,
   parsePlannerPlan,
-  plannerRunMoment,
+  planLagsBehindRun,
   plannerRunProblem,
   receiptProblems,
   BOT_ALIVE_KEY,
@@ -78,7 +80,7 @@ import {
 // Правила применимости дня и отбор профилей берём У ПЛАНИРОВЩИКА, а не пишем
 // заново: две копии этих правил разъедутся, и сторож начнёт будить админов
 // из-за собственной ошибки.
-import { selectEligibleRules, splitTimesByDrop, type PlannerProfile, type PlannerRule } from './daily-planner.js';
+import { selectEligibleRules, type PlannerProfile, type PlannerRule } from './daily-planner.js';
 
 /** Имена env, значения которых не должны попасть в лог/алерт/output ни при какой ошибке. */
 const SECRET_ENV_NAMES = ['SUPABASE_SERVICE_ROLE_KEY', 'TELEGRAM_BOT_TOKEN', 'CLIENT_NAME', 'CLIENT_EMAIL', 'CLIENT_PHONE'];
@@ -194,16 +196,15 @@ export async function runHeartbeat(deps: HeartbeatDeps, now: Date): Promise<Hear
   };
 
   /**
-   * Запасной способ узнать план вечера, когда записанного плана нет: собрать
-   * его заново по живым правилам — ТОЙ ЖЕ логикой отбора, что у планировщика
-   * (selectEligibleRules + splitTimesByDrop). Слабое место способа в том, что
-   * правила и скипы могли поменяться после 20:30, поэтому он именно запасной.
+   * Запасной способ узнать план дня, когда записанного плана нет: собрать его
+   * заново по живым правилам — ТОЙ ЖЕ логикой отбора, что у планировщика
+   * (selectEligibleRules). Планировщик почасовой, так что ждём квитанцию по
+   * КАЖДОМУ уже закрывшемуся часу правила: ран, который его не поставил, — и
+   * есть повод для тревоги. Слабое место способа в том, что правила и скипы
+   * могли поменяться в течение дня (сценарий на 19:00, заведённый в 20:00,
+   * даст ложное «нет отчёта по 19:00»), поэтому он именно запасной.
    */
-  async function rebuildExpected(lastRunValue: string | null): Promise<ExpectedReceipt[]> {
-    // Момент, в который планировщик принимал решения: по нему отсекаются часы,
-    // дроп по которым он ставить уже не мог (см. plannerRunMoment).
-    const plannedAt = plannerRunMoment(lastRunValue, today);
-
+  async function rebuildExpected(): Promise<ExpectedReceipt[]> {
     const rulesRead = await read<PlannerRule[]>([], () => deps.schedules.listEnabled());
     if (rulesRead.error !== null) {
       record('schedule_rules', `правила расписания не прочитаны: ${rulesRead.error} — план вечера сверить не с чем`);
@@ -223,24 +224,10 @@ export async function runHeartbeat(deps: HeartbeatDeps, now: Date): Promise<Hear
       }
     }
 
-    // Времена прореживаем ФУНКЦИЕЙ ПЛАНИРОВЩИКА: правило на 19:00 он пропускает
-    // (момент отправки H:57 прошёл до крона в 20:30), дропа не было — и ждать по
-    // такому часу квитанцию значило бы будить админов каждый вечер зря.
-    const dayT = dropDayOf(date);
-    const plannableTimes = (times: string[]): string[] => {
-      try {
-        return splitTimesByDrop(times, dayT, plannedAt).planned;
-      } catch {
-        // Мусорное время в правиле роняет расчёт планировщика — тогда не
-        // отсекаем ничего: dropIsDue такой час всё равно отбросит, а падать
-        // сторожу нельзя (упавший сторож никого не разбудит).
-        return times;
-      }
-    };
-    const eligible = selectEligibleRules(rulesRead.value, profilesById, date, skipped).map(({ rule, profile }) => ({
-      rule: { profileId: rule.profileId, times: plannableTimes(rule.times) },
-      profile,
-    }));
+    // Мусорное время в правиле (не HH:MM) сторожа не роняет: dropIsDue внутри
+    // expectedReceipts такой час просто не ждёт — планировщик по нему дроп тоже
+    // не поставил бы.
+    const eligible = selectEligibleRules(rulesRead.value, profilesById, date, skipped);
     return expectedReceipts(eligible, date, now);
   }
 
@@ -296,41 +283,68 @@ export async function runHeartbeat(deps: HeartbeatDeps, now: Date): Promise<Hear
     record(PLANNER_LAST_RUN_KEY, plannerRunProblem(lastRun.value, today), lastRun.value ?? '');
   }
 
-  // ---- 5. план вечера против квитанций ----
+  // ---- 5. план дня против квитанций ----
+  // Записанный план читаем ВСЕГДА, до решения «ждать ли квитанции»: планировщик
+  // почасовой, флаг могли выключить между его ранами — последняя отметка тогда
+  // с префиксом 'disabled@', а дропы прошлых часов поставлены и обязаны
+  // отчитаться. План с поставленными слотами — факт, и он сильнее флага.
+  const planRead = await read<string | null>(null, () => deps.settings.get(PLANNER_LAST_PLAN_KEY));
+  const plan = parsePlannerPlan(planRead.value);
+  const todaysPlan = plan !== null && plan.date === date ? plan : null;
+  const labelOf = (profileId: string): string => profilesRead.value.find((p) => p.id === profileId)?.label ?? profileId;
+
+  // Плану верят только целому: он прочитался, догнал последний включённый ран
+  // (ран пишет план и отметку из одного `now` — planLagsBehindRun) и не помечен
+  // планировщиком как неполный. Иначе это находка, а не тихий запасной путь:
+  // ран поставил дропы, которых в плане нет, и сверять квитанции по одному
+  // такому списку значило бы промолчать про них.
+  const integrityProblem: string | null =
+    planRead.error !== null
+      ? `план дня не прочитан: ${planRead.error}`
+      : planLagsBehindRun(todaysPlan, lastRun.value, today)
+        ? todaysPlan === null
+          ? `план дня не записан, хотя планировщик сегодня отработал включённым (отметка ${lastRun.value ?? ''})`
+          : `план дня отстал от последнего рана планировщика (план от ${todaysPlan.at}, отметка ${lastRun.value ?? ''}) — ран не записал свои дропы`
+        : todaysPlan?.incomplete === true
+          ? 'план дня помечен планировщиком как неполный — один из ранов не записал свои дропы'
+          : null;
+
   let expected: ExpectedReceipt[] = [];
-  if (!evening.expectReceipts) {
+  let receiptsExpected = true;
+  if (integrityProblem !== null) {
+    // Слоты плана — нижняя граница; остальное восстанавливаем по живым правилам.
+    record(PLANNER_LAST_PLAN_KEY, `${integrityProblem} — квитанции сверены и по живым правилам расписания`);
+    expected = mergeExpectedReceipts(
+      todaysPlan === null ? [] : expectedFromPlan(todaysPlan.slots, date, labelOf, now),
+      await rebuildExpected(),
+    );
+  } else if (todaysPlan !== null && (todaysPlan.slots.length > 0 || evening.expectReceipts)) {
+    // Основной путь — ЗАПИСАННЫЙ планировщиком план: сверяем квитанции с тем,
+    // что реально было поставлено, а не с состоянием расписания на 22:12
+    // (скипы и сценарии владелец правит и вечером — см. PLANNER_LAST_PLAN_KEY).
+    expected = expectedFromPlan(todaysPlan.slots, date, labelOf, now);
+    checks.push({
+      name: PLANNER_LAST_PLAN_KEY,
+      status: 'ok',
+      detail: `план от ${todaysPlan.at}: поставлено ${todaysPlan.slots.length}, отчитаться должны ${expected.length}`,
+    });
+  } else if (!evening.expectReceipts) {
+    receiptsExpected = false;
     skipCheck('drop_reports', evening.reason);
   } else {
-    const labelOf = (profileId: string): string =>
-      profilesRead.value.find((p) => p.id === profileId)?.label ?? profileId;
+    // Запасной путь: плана за эту дату нет, а включённого рана сегодня не было
+    // (деплой старее, планировщик не тикал — об этом скажет своя находка).
+    // Восстанавливаем план по живым правилам и честно помечаем это в output.
+    skipCheck(
+      PLANNER_LAST_PLAN_KEY,
+      plan === null
+        ? 'записанного плана дня нет (или он нечитаем) — восстанавливаем по живым правилам расписания'
+        : `записанный план на другую дату (${plan.date}, а нужна ${date}) — восстанавливаем по живым правилам`,
+    );
+    expected = await rebuildExpected();
+  }
 
-    // Основной путь — ЗАПИСАННЫЙ планировщиком план вечера: сверяем квитанции с
-    // тем, что реально было поставлено в 20:30, а не с состоянием расписания на
-    // 22:12 (скипы и сценарии владелец правит и вечером — см. PLANNER_LAST_PLAN_KEY).
-    const planRead = await read<string | null>(null, () => deps.settings.get(PLANNER_LAST_PLAN_KEY));
-    const plan = parsePlannerPlan(planRead.value);
-    if (plan !== null && plan.date === date) {
-      expected = expectedFromPlan(plan.slots, date, labelOf, now);
-      checks.push({
-        name: PLANNER_LAST_PLAN_KEY,
-        status: 'ok',
-        detail: `план от ${plan.at}: поставлено ${plan.slots.length}, отчитаться должны ${expected.length}`,
-      });
-    } else {
-      // Запасной путь: плана за эту дату нет (планировщик упал до записи или
-      // деплой старее). Восстанавливаем его по живым правилам — той же логикой
-      // отбора, что у планировщика, — и честно помечаем это в output рана.
-      skipCheck(
-        PLANNER_LAST_PLAN_KEY,
-        planRead.error !== null
-          ? `план вечера не прочитан: ${planRead.error} — восстанавливаем по живым правилам`
-          : plan === null
-            ? 'записанного плана вечера нет (или он нечитаем) — восстанавливаем по живым правилам расписания'
-            : `записанный план на другую дату (${plan.date}, а нужна ${date}) — восстанавливаем по живым правилам`,
-      );
-      expected = await rebuildExpected(lastRun.value);
-    }
-
+  if (receiptsExpected) {
     const receipts = await read<DropReceipt[]>([], () => deps.dropReports.listForDate(date));
     if (receipts.error !== null) {
       // Сверять не с чем: без этой оговорки сторож выдал бы «нет отчёта» по

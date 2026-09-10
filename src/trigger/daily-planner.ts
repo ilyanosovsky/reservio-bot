@@ -2,54 +2,70 @@
 // разрешён (schedules.task), но САМ ПЛАНИРОВЩИК ВЫКЛЮЧЕН ПО УМОЛЧАНИЮ.
 //
 // Активация — только вручную, установкой settings.planner_enabled = 'true'
-// (Supabase, таблица settings) по явному одобрению пользователя, не раньше
-// фазы 4 (CLAUDE.md: «Пока идёт разработка (фазы 0–3) — никаких автоматических
-// бронирований по cron»). Пока флаг не 'true', run() читает settings и молча
-// выходит — cron тикает, но ничего не бронирует и никому не пишет.
+// (Supabase, таблица settings) по явному одобрению пользователя (включено
+// 04.08.2026, docs/wiki/Runbook.md → «Планировщик»). Пока флаг не 'true',
+// run() читает settings и молча выходит — cron тикает, но ничего не бронирует
+// и никому не пишет.
 //
-// Что делает включённый планировщик каждый день в 20:30 Тбилиси (16:30 UTC,
-// без DST — Asia/Tbilisi = +04:00 круглый год):
+// Модель — ПОЧАСОВАЯ. Слот часа H дня T+7 открывается в H:59 дня T (CLAUDE.md
+// → дроп-модель), поэтому крон тикает КАЖДЫЙ час в :30 Тбилиси (= :30 UTC:
+// оффсет +04:00 целый и без DST), и ран часа H:30 ставит дропы РОВНО на час H —
+// те времена правил, чей момент отправки (H:57) попадает в ближайшие 60 минут
+// (splitTimesByDrop → due). Часы, чьё окно уже закрылось, — past (их ничего не
+// ждёт), более поздние — later (их поставит свой ран). До 10.09.2026 крон был
+// один, в 20:30, и любой час раньше 20:00 он молча пропускал — так сценарий
+// второго профиля на 19:00 не отработал ни разу, а узнать об этом было неоткуда.
+//
+// Что делает включённый ран часа H:30:
 //   1) считает целевую дату игры T+7 (scheduler.targetDate) относительно
 //      момента запуска (payload.timestamp, а не Date.now() — детерминизм);
 //   2) берёт включённые schedule_rule, чей профиль имеет telegram_chat_id,
 //      чьё daysOfWeek допускает T+7 и для кого нет skip на T+7;
-//   3) шлёт профилю pre-drop сообщение (план: дата/времена/корты) с
-//      inline-кнопками «Пропустить» (callback_data 'skip:{date}', ловит
-//      src/bot/handlers — пишет skip) и «Бронируем» (callback_data 'noop' —
-//      ровно CB_NOOP из src/bot/parse.ts, бот гасит спиннер и ничего не делает,
-//      это просто подтверждение без побочных эффектов);
-//   4) на каждый (профиль, час) планирует src/trigger/book-drop.ts через
+//   3) шлёт профилю pre-drop сообщение (план: дата/ВСЕ оставшиеся на сегодня
+//      времена сценария/корты) с inline-кнопками «Пропустить» (callback_data
+//      'skip:{date}', ловит src/bot/handlers — пишет skip) и «Бронируем»
+//      (callback_data 'noop' — ровно CB_NOOP из src/bot/parse.ts, бот гасит
+//      спиннер и ничего не делает). Сообщение уходит ОДИН раз в день на
+//      сценарий — в ран перед его ПЕРВЫМ дропом (past пуст, due не пуст):
+//      сценарий «20:00+21:00» получает одно сообщение в 20:30, как и раньше,
+//      а не по одному на каждый час;
+//   4) на каждый (профиль, час) из due планирует src/trigger/book-drop.ts через
 //      tasks.trigger('book-slot-drop', ..., { delay, idempotencyKey,
 //      concurrencyKey }) — delay = H:57:00 дня T (+04:00), idempotencyKey =
-//      'drop-{profileId}-{date}-{time}-{ruleIds}' — повторный ран планировщика
-//      не создаёт дубль дропа. Несколько сценариев профиля на ОДИН час
-//      схлопываются в ОДИН ран (mergePlannedDrops): у book-slot-drop
-//      concurrencyLimit 1 на concurrencyKey=profileId, поэтому два рана на один
-//      час выстроились бы в затылок — второй пришёл бы в уже закрытое окно, не
-//      сделал бы ни одного опроса и прислал бы второй ❌-отчёт за вечер.
-//      В payload уезжают courts и mode ИМЕННО ЭТИХ правил: выбор сценария
-//      делается здесь, а не повторно в book-drop.ts по времени.
+//      'drop-{profileId}-{date}-{time}-{ruleIds}' — повторный ран (Replay,
+//      опоздавший крон, зацепивший и следующий час) не создаёт дубль дропа.
+//      Несколько сценариев профиля на ОДИН час схлопываются в ОДИН ран
+//      (mergePlannedDrops): у book-slot-drop concurrencyLimit 1 на
+//      concurrencyKey=profileId, поэтому два рана на один час выстроились бы в
+//      затылок — второй пришёл бы в уже закрытое окно, не сделал бы ни одного
+//      опроса и прислал бы второй ❌-отчёт. В payload уезжают courts и mode
+//      ИМЕННО ЭТИХ правил: выбор сценария делается здесь, а не повторно в
+//      book-drop.ts по времени.
 //      Ключ идемпотентности обязан быть ГЛОБАЛЬНЫМ: голая строка,
 //      переданная из тела таска, скоупится ран-айди родителя (см. makeTriggerDrop).
 //      concurrencyKey = profileId: у book-slot-drop concurrencyLimit 1, и без
 //      ключа дроп второго профиля ждал бы, пока первый досидит своё пятиминутное
 //      окно, — то есть не сделал бы ни одного опроса.
-//      Времена, чей момент отправки уже прошёл (правило на час раньше крона),
-//      пропускаются: иначе ран стартовал бы в закрытое окно и профиль получал бы
-//      ❌-отчёт каждый вечер.
 //      Триггерим с force:true: критерий «этот день недели ок» уже проверен
 //      здесь по данным Supabase (schedule_rules) — book-drop.ts второй раз
 //      сверяет это по правилу профиля и без force кинул бы отказ;
-//   5) записывает в settings.planner_last_plan список ПОСТАВЛЕННЫХ дропов
-//      ({date, at, slots:[{profileId,time}]}): по нему heartbeat в 22:12 сверяет
-//      квитанции. Живые schedule_rules для этого не годятся — владелец правит
-//      их и вечером (снятый в 21:00 скип на T+7 заставил бы сторожа ждать
-//      отчёты по дропам, которых никто не ставил);
+//   5) дописывает поставленные дропы в settings.planner_last_plan
+//      ({date, at, slots:[{profileId,time}]}) — план ДНЯ копится по ранам
+//      (mergePlannerPlan: тот же date → объединение слотов, новый date —
+//      замена целиком); по нему heartbeat в 22:12 сверяет квитанции. Живые
+//      schedule_rules для этого не годятся — владелец правит их и вечером
+//      (снятый в 21:00 скип на T+7 заставил бы сторожа ждать отчёты по
+//      дропам, которых никто не ставил);
 //   6) в конце УСПЕШНОГО рана ставит settings.planner_last_run = тбилисский
 //      stamp (у выключенного планировщика — он же с префиксом 'disabled@').
 //      По этой отметке heartbeat в 22:12 понимает, что cron сегодня реально
-//      тикнул: без неё «вечер не спланирован» никак не отличить от «всё
+//      тикал: без неё «день не спланирован» никак не отличить от «всё
 //      спланировано, просто нечего было бронировать».
+//
+// Следствие почасовой модели для правок расписания: выключенный или удалённый
+// сценарий перестаёт бронировать со СЛЕДУЮЩЕГО часа; дроп текущего часа, если
+// его ран уже поставлен (в H:30), отменяет только «⏭ Скип» на дату игры —
+// book-drop.ts перечитывает скипы перед окном.
 //
 // Изоляция от src/core/repos.ts: он живёт в отдельном контракте фазы 3 и на
 // момент написания этого файла может ещё не существовать на диске (агенты
@@ -64,13 +80,16 @@
 
 import { idempotencyKeys, logger, schedules, tasks } from '@trigger.dev/sdk';
 import type { BookSlotDropPayload } from './book-drop.js';
-import { dropDayOf, slotStartISO, targetDate, tbilisiStamp, weekdayOf } from '../core/scheduler.js';
+import { dropDayOf, dropWatchWindow, slotStartISO, targetDate, tbilisiStamp, weekdayOf } from '../core/scheduler.js';
 // Ключи таблицы settings живут в ОДНОМ месте (core/heartbeat-logic.ts): их
 // читает сторож наблюдаемости, и разъехавшаяся строка означала бы, что вечер
 // планируется, а heartbeat считает планировщик мёртвым. Модуль чистый (тянет
 // только core/scheduler.js) — обвязке планировщика он ничего лишнего не приносит.
 import {
   formatPlannerPlan,
+  mergePlannerPlan,
+  parsePlannerPlan,
+  planLagsBehindRun,
   PLANNER_DISABLED_PREFIX,
   PLANNER_ENABLED_KEY,
   PLANNER_ENABLED_VALUE,
@@ -82,6 +101,15 @@ export { PLANNER_DISABLED_PREFIX, PLANNER_LAST_PLAN_KEY, PLANNER_LAST_RUN_KEY };
 
 /** Сколько минут до конца часа H шлём book-slot-drop дню T: H:57:00 +04:00. */
 const TRIGGER_LEAD_MINUTES = 57;
+
+/**
+ * Горизонт одного рана планировщика. Крон тикает в H:30, момент отправки дропа
+ * часа H — H:57, следующего часа — (H+1):57, то есть через 87 минут: 60 минут
+ * берут свой час и не задевают соседний даже при кроне, опоздавшем на полчаса.
+ * А если задели (ручной Replay в конце часа) — от дубля защищает глобальный
+ * idempotencyKey (см. makeTriggerDrop).
+ */
+const PLAN_HORIZON_MS = 60 * 60_000;
 
 // ---- структурные типы (зеркалят src/core/repos.ts, но не импортируют его) ----
 
@@ -235,26 +263,42 @@ export function mergePlannedDrops(requests: readonly DropRequest[]): PlannedDrop
   return [...byKey.values()];
 }
 
+/** Времена одного правила, разложенные относительно момента рана `now`. */
+export interface TimesByDrop {
+  /**
+   * Окно дропа уже закрылось: ставить нечего, и это НЕ ошибка — так для рана
+   * 21:30 выглядит час 20:00, который поставил ран 20:30.
+   */
+  past: string[];
+  /** Момент отправки (H:57) попадает в горизонт этого рана — ставим сейчас. */
+  due: string[];
+  /** Дроп дальше горизонта — его поставит свой ран в H:30. */
+  later: string[];
+}
+
 /**
- * Времена правила, чей дроп сегодня ещё впереди, и те, что уже прошли.
+ * Раскладка времён правила по часам: чей дроп ставит ЭТОТ ран (due), чей уже
+ * прошёл (past) и чей ещё впереди (later).
  *
- * Крон планировщика — 20:30 Тбилиси, а отправка дропа времени H назначается на
- * H:57 того же дня: для правила на 19:00 этот момент прошёл ещё до крона.
- * Триггер с прошедшим delay выполняется немедленно, ран приходит в закрытое
- * окно и возвращает Timeout — то есть человек получал бы ❌-отчёт каждый вечер
- * вместо честного «на сегодня уже поздно».
+ * «Прошёл» считается по закрытию окна наблюдения (dropWatchWindow.deadline),
+ * а не по моменту отправки: крон, опоздавший на несколько минут, всё ещё
+ * обязан поставить свой час — триггер с прошедшим delay выполняется
+ * немедленно, а окно ещё открыто. Ран, пришедший после закрытия окна, час
+ * молча пропускает: ставить его значило бы прислать человеку ❌ Timeout по
+ * дропу, который никто не ловил.
  */
-export function splitTimesByDrop(
-  times: string[],
-  dayT: string,
-  now: Date,
-): { planned: string[]; past: string[] } {
-  const planned: string[] = [];
-  const past: string[] = [];
+export function splitTimesByDrop(times: string[], dayT: string, now: Date): TimesByDrop {
+  const out: TimesByDrop = { past: [], due: [], later: [] };
+  const nowMs = now.getTime();
+  const horizonMs = nowMs + PLAN_HORIZON_MS;
   for (const time of times) {
-    (dropTriggerDelay(dayT, time).getTime() > now.getTime() ? planned : past).push(time);
+    const sendAt = dropTriggerDelay(dayT, time).getTime();
+    const closesAt = dropWatchWindow(dayT, time).deadline.getTime();
+    if (closesAt <= nowMs) out.past.push(time);
+    else if (sendAt <= horizonMs) out.due.push(time);
+    else out.later.push(time);
   }
-  return { planned, past };
+  return out;
 }
 
 /**
@@ -315,7 +359,7 @@ export function formatPreDropMessage(input: {
     `Времена: ${times.map(esc).join(', ')}`,
     courtsLine,
     ...(mode === 'all' ? ['Лишние брони на разных кортах отменишь вручную (не позже чем за час до игры).'] : []),
-    'Бронируем сегодня вечером, в момент дропа. Если игра не нужна — жми «Пропустить».',
+    'Бронируем сегодня, в момент дропа каждого слота. Если игра не нужна — жми «Пропустить».',
   ].join('\n');
 }
 
@@ -339,37 +383,82 @@ async function markPlannerRun(deps: PlannerDeps, now: Date, enabled: boolean): P
 }
 
 /**
- * Записанный план вечера — то, ЧТО планировщик реально поставил. Читает его
+ * Записанный план дня — то, ЧТО планировщик реально поставил. Читает его
  * heartbeat в 22:12: без этой записи ему пришлось бы восстанавливать план из
  * живых schedule_rules/skips, а владелец правит их и вечером (снял скип с даты
- * T+7 после 20:30 — и сторож ждал бы квитанции по дропам, которых не было).
+ * T+7 в 21:00 — и сторож ждал бы квитанции по дропам, которых не было).
+ *
+ * Планировщик почасовой, поэтому план КОПИТСЯ: ран часа H дописывает свои дропы
+ * к уже записанным (mergePlannerPlan), а первый ран нового дня T — с новым
+ * date — начинает план заново. Записанное не прочиталось или нечитаемо (не
+ * JSON, чужая форма) — свой кусок НЕ пишем: перезапись стёрла бы дропы прошлых
+ * часов, а сторож, не найдя плана за эту дату, уходит на восстановление по
+ * живым правилам. Нечитаемое значение чинится руками (удалить ключ).
+ *
+ * Потерянный кусок не должен пропасть молча: если предыдущий включённый ран
+ * сегодня отметился (planner_last_run), а план старше его отметки — тот ран
+ * дропы поставил, но записать не смог. Тогда план помечается `incomplete`
+ * (planLagsBehindRun), флаг доезжает до конца дня, и сторож сверяет квитанции
+ * ещё и по живым правилам, а не только по неполному списку.
  *
  * В план попадают ВСЕ схлопнутые дропы, включая те, чей triggerDrop сорвался:
  * несостоявшийся ран — ровно тот случай, о котором сторож обязан сказать вслух,
  * а не тот, который надо от него спрятать.
  *
  * Best-effort, как и отметка планировщика: цена потерянной записи — запасной
- * путь у сторожа, цена упавшего рана — вечер.
+ * путь у сторожа, цена упавшего рана — час дропа.
  */
 async function markPlannerPlan(
   deps: PlannerDeps,
   date: string,
+  dayT: string,
   now: Date,
   drops: readonly PlannedDrop[],
 ): Promise<void> {
+  let rawPlan: string | null;
+  let lastRun: string | null;
   try {
-    await deps.settings.set(
-      PLANNER_LAST_PLAN_KEY,
-      formatPlannerPlan({
-        date,
-        at: tbilisiStamp(now),
-        slots: drops.map((d) => ({ profileId: d.profileId, time: d.time })),
-      }),
-    );
+    [rawPlan, lastRun] = await Promise.all([
+      deps.settings.get(PLANNER_LAST_PLAN_KEY),
+      deps.settings.get(PLANNER_LAST_RUN_KEY),
+    ]);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.error(
-      `daily-planner: план вечера не записан (${message}) — heartbeat будет восстанавливать его по живым правилам`,
+      `daily-planner: записанный план дня не прочитан (${message}) — свой час не дописываем, ` +
+        'чтобы не стереть дропы прошлых часов; heartbeat сверит квитанции с тем, что записано',
+    );
+    return;
+  }
+  const existing = parsePlannerPlan(rawPlan);
+  if (existing === null && rawPlan !== null && rawPlan.trim() !== '') {
+    logger.error(
+      `daily-planner: значение ${PLANNER_LAST_PLAN_KEY} нечитаемо — свой час не дописываем, чтобы не стереть ` +
+        'дропы прошлых часов; удали ключ в settings, следующий ран запишет план заново',
+    );
+    return;
+  }
+
+  // Предыдущий включённый ран отметился, а его дропов в плане нет — план неполный.
+  const lags = planLagsBehindRun(existing !== null && existing.date === date ? existing : null, lastRun, dayT);
+  if (lags) {
+    logger.warn(
+      `daily-planner: план дня отстал от отметки ${PLANNER_LAST_RUN_KEY} — предыдущий ран не записал свои дропы; ` +
+        'помечаем план как неполный, heartbeat сверит квитанции и по живым правилам',
+    );
+  }
+  const next = {
+    date,
+    at: tbilisiStamp(now),
+    slots: drops.map((d) => ({ profileId: d.profileId, time: d.time })),
+    ...(lags ? { incomplete: true } : {}),
+  };
+  try {
+    await deps.settings.set(PLANNER_LAST_PLAN_KEY, formatPlannerPlan(mergePlannerPlan(existing, next)));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error(
+      `daily-planner: план дня не записан (${message}) — heartbeat будет восстанавливать его по живым правилам`,
     );
   }
 }
@@ -417,42 +506,44 @@ export async function runDailyPlanner(deps: PlannerDeps, now: Date): Promise<Pla
   summary.skippedProfiles = [...skippedProfileIds];
 
   const eligible = selectEligibleRules(rules, profilesById, date, skippedProfileIds);
-  logger.info(`daily-planner: дата ${date}, правил ${rules.length}, план на ${eligible.length} профиль(ей)`);
+  logger.info(
+    `daily-planner: ран ${tbilisiStamp(now)} — дата игры ${date}, правил ${rules.length}, подходящих сценариев ${eligible.length}`,
+  );
 
   /** Заявки на дропы: копятся по всем сценариям и схлопываются ПОСЛЕ цикла. */
   const requests: DropRequest[] = [];
 
   for (const { rule, profile } of eligible) {
     try {
-      const { planned, past } = splitTimesByDrop(rule.times, dayT, now);
-      if (past.length > 0) {
-        // Не ошибка профиля, а несовместимость правила с часом крона — но об
-        // этом обязан узнать человек, а не только логи.
-        const message = `${rule.profileId}: время ${past.join(', ')} — дроп на день T уже прошёл (крон в 20:30), не планируем`;
-        logger.warn(`daily-planner: ${message}`);
-        summary.errors.push(message);
-      }
-      if (planned.length === 0) {
-        logger.warn(`daily-planner: у профиля "${rule.profileId}" на ${date} не осталось времён — пропускаем`);
+      const { past, due, later } = splitTimesByDrop(rule.times, dayT, now);
+      if (due.length === 0) {
+        // Не час этого сценария: прошедшие часы уже ничего не ждут, будущие
+        // поставит их собственный ран. Это штатный исход почти каждого рана.
+        logger.info(`daily-planner: сценарий ${rule.id} (${rule.profileId}) — в этот час дропов нет`);
         continue;
       }
 
-      // В сообщении — только то, что реально будет забронировано.
-      const text = formatPreDropMessage({
-        label: profile.label,
-        date,
-        times: planned,
-        courts: rule.courts,
-        mode: rule.mode,
-      });
-      const sent = await deps.sendPreDrop(profile, text, date);
-      if (sent) {
-        summary.messagesSent += 1;
-      } else {
-        logger.warn(`daily-planner: pre-drop сообщение профилю "${rule.profileId}" не ушло`);
+      // Pre-drop сообщение — ОДИН раз в день на сценарий, в ран перед его первым
+      // дропом: past пуст, значит ни один час сценария сегодня ещё не прошёл. В
+      // сообщении — все оставшиеся на сегодня времена, а не только этот час:
+      // человек видит план целиком, как видел его при одном кроне в 20:30.
+      if (past.length === 0) {
+        const text = formatPreDropMessage({
+          label: profile.label,
+          date,
+          times: [...due, ...later],
+          courts: rule.courts,
+          mode: rule.mode,
+        });
+        const sent = await deps.sendPreDrop(profile, text, date);
+        if (sent) {
+          summary.messagesSent += 1;
+        } else {
+          logger.warn(`daily-planner: pre-drop сообщение профилю "${rule.profileId}" не ушло`);
+        }
       }
 
-      for (const time of planned) {
+      for (const time of due) {
         requests.push({
           profileId: rule.profileId,
           time,
@@ -511,7 +602,7 @@ export async function runDailyPlanner(deps: PlannerDeps, now: Date): Promise<Pla
 
   // План пишем ПОСЛЕ постановки дропов и ДО отметки о ране: heartbeat сверяет
   // квитанции именно с этим списком, а не с расписанием на момент своей проверки.
-  await markPlannerPlan(deps, date, now, drops);
+  await markPlannerPlan(deps, date, dayT, now, drops);
 
   // Отметка ставится в конце УСПЕШНОГО рана: если планировщик рухнул раньше
   // (не отвечает Supabase, отвалился trigger.dev), отметки за сегодня не будет
@@ -647,7 +738,14 @@ async function buildDeps(): Promise<PlannerDeps> {
 
 export const dailyPlannerTask = schedules.task({
   id: 'daily-planner',
-  cron: '30 16 * * *', // UTC; = 20:30 Asia/Tbilisi (+04:00, без DST)
+  // Каждый час в :30 UTC = :30 Asia/Tbilisi (+04:00 — целые часы, без DST):
+  // ран H:30 ставит дропы часа H (см. шапку файла). Id таска исторический —
+  // менять его значит потерять расписание в дашборде trigger.dev.
+  cron: '30 * * * *',
+  // План дня дописывается через read-merge-write (markPlannerPlan): два рана
+  // планировщика одновременно (крон + ручной Replay) затёрли бы друг другу
+  // слоты, и сторож не ждал бы квитанций по потерянным.
+  queue: { concurrencyLimit: 1 },
   run: async (payload) => {
     const deps = await buildDeps();
     return runDailyPlanner(deps, payload.timestamp);
