@@ -93,7 +93,7 @@ function readDotEnv(): Record<string, string> {
 
 export default defineConfig({
   project: process.env.TRIGGER_PROJECT_REF ?? 'proj_your_project_ref',
-  // 'node' у trigger.dev — это Node 21.7.3, и с 05.10.2026 такие деплои падают;
+  // 'node' у trigger.dev — это Node 21.7.3, и с 2026-10-05 такие деплои падают;
   // 'node-22' (22.16.0) совпадает с engines >=22 и Node 22 на Railway.
   runtime: 'node-22',
   dirs: ['./src/trigger'],
