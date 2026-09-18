@@ -4,8 +4,9 @@
 // бронирование как таковое.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DropReport } from '../src/core/booking-engine.js';
-import type { StateStore, StoredBooking } from '../src/core/state.js';
+import { MemoryStateStore, type StateStore, type StoredBooking } from '../src/core/state.js';
 import { bookSlotDropTask, ResilientStateStore } from '../src/trigger/book-drop.js';
+import { SupabaseStateError } from '../src/core/state-supabase.js';
 
 // Публичный тип Task из SDK не отдаёт саму run-функцию, а поднимать воркер ради
 // этих тестов незачем: подменяем task() на «верни конфиг как есть».
@@ -321,6 +322,181 @@ describe('ResilientStateStore', () => {
     await store.listBookings();
     expect(degraded).toHaveLength(1);
   });
+
+  // ---- два режима: терпеливый до окна, горячий в окне ----
+
+  const transient = (): SupabaseStateError => new SupabaseStateError('listBookingsForSlot: таймаут', { code: 'timeout' });
+
+  /** primary, падающий транзиентно первые `failures` раз, потом живой; считает вызовы. */
+  function flakyStub(failures: number, error: () => Error = transient): { store: StateStore; calls: number } {
+    const counter = { calls: 0 };
+    let left = failures;
+    const guard = (): void => {
+      counter.calls += 1;
+      if (left > 0) {
+        left -= 1;
+        throw error();
+      }
+    };
+    const store: StateStore = {
+      getBooking: async () => {
+        guard();
+        return null;
+      },
+      listBookingsForSlot: async () => {
+        guard();
+        return [];
+      },
+      saveBooking: async () => guard(),
+      listBookings: async () => {
+        guard();
+        return [];
+      },
+      markCanceled: async () => guard(),
+    };
+    return Object.assign(counter, { store });
+  }
+
+  const HOT_FROM = 1_000_000;
+
+  it('до окна транзиентный отказ повторяется один раз — деградации нет', async () => {
+    // Сентябрь 2026: один зависший запрос за две минуты до дропа отправлял
+    // ран на память до конца вечера и терял token — хотя следующий запрос
+    // прошёл бы за 200 мс.
+    const patient = flakyStub(1);
+    const hot = flakyStub(0);
+    const log: string[] = [];
+    const store = new ResilientStateStore({ patient: patient.store, hot: hot.store }, () => {}, {
+      hotFromMs: HOT_FROM,
+      now: () => HOT_FROM - 60_000,
+      log: (m) => log.push(m),
+    });
+
+    await expect(store.listBookingsForSlot('ilya', DATE, TIME)).resolves.toEqual([]);
+
+    expect(store.warning).toBeNull();
+    expect(patient.calls).toBe(2);
+    expect(hot.calls).toBe(0);
+    expect(log.some((m) => m.includes('повторяем'))).toBe(true);
+  });
+
+  it('до окна второй подряд отказ — деградация (повтор ровно один)', async () => {
+    const patient = flakyStub(2);
+    const degraded: string[] = [];
+    const store = new ResilientStateStore({ patient: patient.store, hot: flakyStub(0).store }, (r) => degraded.push(r), {
+      hotFromMs: HOT_FROM,
+      now: () => HOT_FROM - 60_000,
+    });
+
+    await store.listBookingsForSlot('ilya', DATE, TIME);
+
+    expect(patient.calls).toBe(2);
+    expect(degraded).toHaveLength(1);
+    expect(store.degradeCause).toContain('listBookingsForSlot');
+  });
+
+  it('до окна НЕтранзиентный отказ (схема/ключ) не повторяется', async () => {
+    const patient = flakyStub(5, () => new SupabaseStateError('нет таблицы', { code: 'PGRST205', status: 404 }));
+    const store = new ResilientStateStore({ patient: patient.store, hot: flakyStub(0).store }, () => {}, {
+      hotFromMs: HOT_FROM,
+      now: () => HOT_FROM - 60_000,
+    });
+
+    await store.getBooking('ilya', DATE, TIME, booking.court);
+
+    expect(patient.calls).toBe(1);
+    expect(store.warning).toContain('PGRST205');
+  });
+
+  it('в окне идёт горячий стор и повторов нет: секунда дороже записи', async () => {
+    const patient = flakyStub(0);
+    const hot = flakyStub(1);
+    const store = new ResilientStateStore({ patient: patient.store, hot: hot.store }, () => {}, {
+      hotFromMs: HOT_FROM,
+      now: () => HOT_FROM,
+    });
+
+    await store.getBooking('ilya', DATE, TIME, booking.court);
+
+    expect(hot.calls).toBe(1);
+    expect(patient.calls).toBe(0);
+    expect(store.warning).not.toBeNull();
+  });
+
+  it('без hotFromMs стор горячий с первого вызова (старое поведение)', async () => {
+    const primary = flakyStub(1);
+    const store = new ResilientStateStore(primary.store, () => {});
+
+    await store.getBooking('ilya', DATE, TIME, booking.court);
+
+    expect(primary.calls).toBe(1);
+    expect(store.warning).not.toBeNull();
+  });
+
+  // ---- досохранение после дропа ----
+
+  it('записи после деградации копятся в очереди и досохраняются flush()', async () => {
+    const primary = primaryStub(true);
+    const store = new ResilientStateStore(primary.store, () => {});
+    await store.getBooking('ilya', DATE, TIME, booking.court); // деградация
+    await store.saveBooking(booking);
+    await store.saveBooking({ ...booking, court: 'Padel Court 4', bookingId: 'booking-2' });
+    expect(store.pendingCount).toBe(2);
+
+    const target = new MemoryStateStore();
+    const result = await store.flush(target, { attempts: 3, pauseMs: 0 });
+
+    expect(result).toEqual({ saved: 2, failed: 0, lastError: undefined });
+    expect(store.pendingCount).toBe(0);
+    await expect(target.listBookings('ilya')).resolves.toHaveLength(2);
+    // token доехал: без него бронь нечем отменить
+    await expect(target.getBooking('ilya', DATE, TIME, booking.court)).resolves.toMatchObject({ token: TOKEN });
+  });
+
+  it('запись, на которой стор упал, тоже попадает в очередь', async () => {
+    // Деградация случилась на самом saveBooking: строка ушла в память, и её
+    // обязаны досохранить так же, как записанные после деградации.
+    const primary = primaryStub(true);
+    const store = new ResilientStateStore(primary.store, () => {});
+
+    await store.saveBooking(booking);
+
+    expect(store.warning).toContain('saveBooking');
+    expect(store.pendingCount).toBe(1);
+  });
+
+  it('flush повторяет неудачные записи и отдаёт остаток с последней ошибкой', async () => {
+    const primary = primaryStub(true);
+    const store = new ResilientStateStore(primary.store, () => {}, { sleep: async () => {} });
+    await store.saveBooking(booking);
+
+    const target = flakyStub(2, () => new SupabaseStateError('saveBooking: таймаут', { code: 'timeout' }));
+    // две попытки падают, третья проходит
+    const ok = await store.flush(target.store, { attempts: 3, pauseMs: 1 });
+    expect(ok).toMatchObject({ saved: 1, failed: 0 });
+    expect(target.calls).toBe(3);
+
+    await store.saveBooking({ ...booking, court: 'Padel Court 2', bookingId: 'booking-3' });
+    const dead = flakyStub(99);
+    const bad = await store.flush(dead.store, { attempts: 2, pauseMs: 1 });
+    expect(bad).toMatchObject({ saved: 0, failed: 1 });
+    expect(bad.lastError).toContain('таймаут');
+    expect(store.pendingCount).toBe(1);
+  });
+
+  it('живой стор: очередь пуста, flush ничего не делает', async () => {
+    const primary = primaryStub(false);
+    const store = new ResilientStateStore(primary.store, () => {});
+    await store.saveBooking(booking);
+
+    const target = flakyStub(0);
+    await expect(store.flush(target.store, { attempts: 3, pauseMs: 0 })).resolves.toEqual({
+      saved: 0,
+      failed: 0,
+      lastError: undefined,
+    });
+    expect(target.calls).toBe(0);
+  });
 });
 
 describe('book-slot-drop: ровно одно сообщение за ран', () => {
@@ -433,6 +609,97 @@ describe('book-slot-drop: state деградировал', () => {
 
     expect(report.ok).toBe(true);
     expect(sendTelegramMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('book-slot-drop: досохранение после дропа', () => {
+  const saved: StoredBooking = {
+    profileId: 'ilya',
+    date: DATE,
+    time: TIME,
+    court: 'Padel Court 3',
+    bookingId: 'booking-1',
+    token: TOKEN,
+    state: 'confirmed',
+    createdAt: '2026-07-09T20:59:02.000+04:00',
+  };
+
+  /** Движок, который реально пишет бронь в state рана — как настоящий после POST. */
+  function engineSaves(): void {
+    bookSlotDropMock.mockImplementation(async (...args: unknown[]) => {
+      const deps = args[2] as { state: StateStore };
+      await deps.state.saveBooking(saved);
+      return okReport();
+    });
+  }
+
+  /**
+   * PostgREST, у которого зависают ЧТЕНИЯ броней (так деградирует стор), а
+   * ЗАПИСЬ проходит — ровно картина сентября 2026: таймаут на проверке до
+   * окна, Supabase при этом жив.
+   */
+  function supabaseReadsDown(): FetchMock {
+    const fetchMock = vi.fn<(input: unknown, init?: unknown) => Promise<Response>>(async (input: unknown, init?: unknown) => {
+      const url = String(input);
+      const method = String((init as { method?: string } | undefined)?.method ?? 'GET');
+      if (url.includes('/rest/v1/bookings')) {
+        if (method === 'GET') throw new Error('network down');
+        return jsonResponse([{ ...saved, profile_id: 'ilya', booking_id: saved.bookingId, created_at: saved.createdAt }]);
+      }
+      if (url.includes('/rest/v1/drop_reports')) return jsonResponse([{ id: 'receipt-1' }]);
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  beforeEach(() => {
+    useSupabaseEnv();
+    engineSaves();
+  });
+
+  it('брони из памяти досохраняются в Supabase, token уходит из output', async () => {
+    const fetchMock = supabaseReadsDown();
+
+    const report = await run(payload());
+
+    expect(report.ok).toBe(true);
+    expect(report.token).not.toBe(TOKEN);
+    const posts = fetchMock.mock.calls.filter(
+      (c) => String(c[0]).includes('/rest/v1/bookings') && (c[1] as { method?: string }).method === 'POST',
+    );
+    expect(posts).toHaveLength(1);
+    expect(JSON.parse(String((posts[0]![1] as { body: string }).body))).toMatchObject({
+      booking_id: 'booking-1',
+      token: TOKEN,
+      court: 'Padel Court 3',
+    });
+  });
+
+  it('в сообщении — история деградации и факт досохранения, без совета про письмо', async () => {
+    supabaseReadsDown();
+
+    await run(payload());
+
+    const text = sentText();
+    expect(text).toContain('⚠️');
+    expect(text).toContain('был недоступен во время дропа');
+    expect(text).toContain('досохранено броней в Supabase: 1');
+    expect(text).not.toContain('token брони НЕ сохранён');
+    expect(text).not.toContain(TOKEN);
+  });
+
+  it('досохранить не удалось — token остаётся в output, сообщение говорит об этом', async () => {
+    supabaseDown();
+
+    const report = await run(payload());
+
+    expect(report.ok).toBe(true);
+    expect(report.token).toBe(TOKEN);
+    const text = sentText();
+    expect(text).toContain('досохранить после дропа не удалось (1 из 1)');
+    expect(text).toContain('token брони НЕ сохранён');
+    expect(text).not.toContain(TOKEN);
   });
 });
 

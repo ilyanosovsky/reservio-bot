@@ -281,9 +281,9 @@ them from the profile's `schedule_rule` (details in "Multi-court evening"
 below). The task is limited to `concurrencyLimit: 1` (two parallel runs won't
 collide) and does not retry automatically; the `token` is NOT printed to the
 logs or the run output while it sits in state (the booking can be managed via the
-link in the confirmation email). There is one exception: if state degraded and
-the token is saved nowhere — then it stays in the run output, otherwise there
-would be nothing to cancel the booking with. In the config (`trigger.config.ts`)
+link in the confirmation email). There is one exception: if state degraded, the
+post-drop flush failed too and the token is saved nowhere — then it stays in the
+run output, otherwise there would be nothing to cancel the booking with. In the config (`trigger.config.ts`)
 there is no `schedules` — this is a deliberate limitation: automatic bookings by
 cron are enabled only in phase 4 after explicit user approval (see `CLAUDE.md`).
 
@@ -445,8 +445,9 @@ The profile's contacts and `token` are not in the message and must not be.
 | In the message | What happened | What to do |
 |---|---|---|
 | `⚠️ state is NOT persistent (Memory)` | There is no `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` in the cloud — the task worked without shared storage | Check the Environment Variables in the dashboard and redeploy. Until then **do not run the task again on the same slot**: there is no protection against a duplicate |
-| `⚠️ Supabase state unavailable (…) — the run finished on memory` | Storage was configured but responded with an error: most often no table (`run the DDL from docs/supabase-schema.sql`) or the wrong key | Run the DDL / check the service key. The booking might have gone through successfully — see the first line of the report |
-| `⚠️ … the booking token was NOT saved` | The booking was created, but state degraded: the token didn't make it into Supabase or anywhere else | Take the `token` from the run output in the dashboard and save it by hand — otherwise the booking can only be canceled via the link in the email to `CLIENT_EMAIL` |
+| `⚠️ Supabase state unavailable (…) — the run finished on memory` | Storage was configured but a request failed and the run switched to memory for the rest of the drop. Before the window the store is "patient" (4 s timeout, one retry on network/timeout), inside it "hot" (1.5 s, no retries) — so this now means either a schema/key error (no table: `run the DDL from docs/supabase-schema.sql`; wrong key) or two hung requests in a row | Run the DDL / check the service key. The booking might have gone through successfully — see the first line of the report. If the line ends with "persisted after the drop", nothing is lost: the bookings and their tokens reached Supabase after the window |
+| `⚠️ Supabase state was unavailable during the drop (…) — … bookings persisted in Supabase after the drop: N; token in state` | State fell over during the run, but the post-drop flush (5 s timeout, 3 attempts) wrote every booking from memory into Supabase | Nothing: idempotency and `/cancel` work as usual. Worth a look at the run logs (`state …: N ms` lines) if it repeats |
+| `⚠️ … the booking token was NOT saved` | The booking was created, state degraded AND the post-drop flush failed (`could not persist after the drop (k of n)`): the token is in the run output only | Take the `token` from the run output in the dashboard and save it by hand — otherwise the booking can only be canceled via the link in the email to `CLIENT_EMAIL` |
 | `Reason: the slot appeared, but we didn't manage to book it` (`SlotTaken`) | We reached the `POST`, but the slot was snatched | Nothing is technically broken — this is a lost race. Verify the timings in the logs |
 | `Reason: didn't wait for the slot before the deadline` (`Timeout`) | The slot didn't appear during the 5-minute window — either a date miss or the drop model shifted | Check the `date`/`time` payload; if it diverges from the model, record the fact in `docs/PROTOCOL.md` |
 | `Reason: looks like the API format changed` (`ApiChanged`) | Reservio replied with something other than what the client expects | Investigate immediately: the phase 1 spike scripts, `docs/PROTOCOL.md` |
@@ -640,9 +641,12 @@ production cron approved by the user — see `CLAUDE.md`, `PLAN.md` → Phase 4)
 
 ## Heartbeat (`heartbeat`)
 
-`src/trigger/heartbeat.ts` — the trigger.dev task `heartbeat`, cron `12 18 * * *`
-(UTC) = **22:12 Tbilisi time**, deliberately after both evening drops
-(~20:59:00 and ~21:59:00) and their Telegram reports. This is the last line of
+`src/trigger/heartbeat.ts` — the trigger.dev task `heartbeat`, cron `12 19 * * *`
+(UTC) = **23:12 Tbilisi time**, deliberately after all evening drops
+(~19:59, ~20:59, ~21:59 and ~22:59) and their Telegram reports. Until
+2026-09-18 it ran at 22:12 — a 22:00 slot (the owner's "21:00+22:00" scenario)
+would never have been checked: not that evening (its drop was still open) and
+not the next one (the day plan is a different date by then). This is the last line of
 the observability invariant from `CLAUDE.md` ("a silent failure is the worst bug
 of this project"): `daily-planner` and `book-slot-drop` try not to go silent on
 their own, and the heartbeat catches the cases where it is precisely they that go
@@ -657,7 +661,7 @@ Supabase BEFORE deploying the tasks** (CLI or SQL Editor: the whole file
 contents, it is idempotent — `create table if not exists` + `notify pgrst`).
 Without it, `book-slot-drop` gets `PGRST205` in `recordReceipt` on every slot
 (bookings and Telegram reports still work: recording the receipt is best-effort),
-and the heartbeat at 22:12 sends "receipts for {date} could not be read …" every
+and the heartbeat at 23:12 sends "receipts for {date} could not be read …" every
 night until the table is created.
 
 ### What is checked every evening
@@ -678,9 +682,9 @@ night until the table is created.
    run): with the `disabled@` prefix — the last run was disabled, the check
    stays silent; without the prefix — receipts are expected. If there is no
    today's mark at all → we go by the flag.
-   From the plan, the hours whose drop hasn't closed by 22:12 are dropped
-   (computed from the time, not hardcoded as a list — a 22:00 or 23:00 rule is
-   never checked by the 22:12 watchdog).
+   From the plan, the hours whose drop hasn't closed by 23:12 are dropped
+   (computed from the time, not hardcoded as a list — a 23:00 rule is never
+   checked by the 23:12 watchdog).
    - No row in `drop_reports` for `targetDate` on an expected `(profile, time)` →
      "no report for {time} (profile {label})".
    - The row exists, but `telegram_ok = false` → "the report for {time} was not
@@ -733,7 +737,7 @@ Why, given there are `schedule_rules`: the schedule and the skips are edited by
 the owner the WHOLE evening. Remove a skip from date T+7 at 21:00 (the first
 button of the "⏭ Skip" menu is exactly this date) or create a new scenario in
 the "⏰ Schedule" wizard — and the watchdog, reconstructing the plan from the
-live rules at 22:12, would demand reports for drops that nobody set.
+live rules at 23:12, would demand reports for drops that nobody set.
 
 If there is no plan for the needed date, there is **no `planner_last_run` mark
 for today at all** and `planner_enabled` is `'true'` (the deploy is older than

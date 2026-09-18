@@ -199,16 +199,23 @@ export async function bookSlotDrop(
    * Непогашенные брони этого часа по ВСЕМ кортам. StateStore асинхронен (в
    * облаке это сетевой Supabase), поэтому проверка стоит десятки–сотни мс.
    * Перед POST мы её всё равно платим: лишняя реальная бронь дороже, чем эта
-   * задержка в гонке за корт.
+   * задержка в гонке за корт. Длительность — в таймлайн: зависший state
+   * должен быть виден в output рана, а не восстанавливаться по косвенным
+   * признакам (сентябрь 2026: где именно ран потерял 1,5 с, вычисляли по
+   * сдвигу события «окно открыто»).
    */
-  const activeSlotBookings = async (): Promise<StoredBooking[]> => {
+  const activeSlotBookings = async (when: string): Promise<StoredBooking[]> => {
+    const started = nowMs();
     const rows = await state.listBookingsForSlot(profile.id, date, time);
+    push(`state: брони часа (${when}) — ${nowMs() - started} мс`);
     return Array.isArray(rows) ? rows.filter((b) => b && b.state !== 'canceled') : [];
   };
 
   /** Непогашенная бронь КОНКРЕТНОГО корта — точечная проверка режима 'all'. */
   const activeCourtBooking = async (court: string): Promise<StoredBooking | null> => {
+    const started = nowMs();
     const b = await state.getBooking(profile.id, date, time, court);
+    push(`state: бронь ${court} (перед POST) — ${nowMs() - started} мс`);
     return b && b.state !== 'canceled' ? b : null;
   };
 
@@ -255,7 +262,7 @@ export async function bookSlotDrop(
    * только соответствующий корт, и ран останавливается, лишь когда закрыты все.
    */
   const stopOnExistingBookings = async (when: string): Promise<DropReport | null> => {
-    const rows = await activeSlotBookings();
+    const rows = await activeSlotBookings(when);
     if (mode === 'priority') {
       const blocking = rows[0];
       if (blocking === undefined) return null;
@@ -402,7 +409,7 @@ export async function bookSlotDrop(
         // В 'priority' блокирует любая бронь часа, в 'all' — только бронь
         // ЭТОГО корта: соседние корты набора от неё не зависят.
         if (mode === 'priority') {
-          const rival = (await activeSlotBookings())[0];
+          const rival = (await activeSlotBookings('перед POST'))[0];
           if (rival !== undefined) {
             return alreadyBooked(
               rival,
@@ -478,6 +485,7 @@ export async function bookSlotDrop(
         if (token.length === 0) push(`ВНИМАНИЕ: в ответе нет token (${court.name}) — отменить бронь через API будет нельзя`);
         push(`бронь ${created.bookingId} (${bookingState}) на ${court.name}, ${msFromSeenToBooked} мс от появления слота`);
 
+        const saveStartedMs = nowMs();
         try {
           await state.saveBooking({
             profileId: profile.id,
@@ -489,6 +497,7 @@ export async function bookSlotDrop(
             state: bookingState,
             createdAt: tbilisiStamp(now()),
           });
+          push(`state: бронь ${court.name} сохранена — ${nowMs() - saveStartedMs} мс`);
         } catch (err) {
           // Бронь в API уже есть — отчёт с token остаётся единственным её следом.
           push(`ВНИМАНИЕ: state.saveBooking упал (${court.name}): ${describeError(err)}`);

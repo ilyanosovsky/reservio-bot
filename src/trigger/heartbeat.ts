@@ -1,7 +1,9 @@
 // Таск trigger.dev "heartbeat" — сторож инварианта наблюдаемости.
-// Крон '12 18 * * *' (UTC) = 22:12 Asia/Tbilisi (+04:00, круглый год без DST):
-// вечерние дропы (…, 19:59, 20:59, 21:59) к этому моменту закрыты, отчёты
-// отправлены, квитанции записаны. Часы после 22:00 сторож не ждёт (dropIsDue).
+// Крон '12 19 * * *' (UTC) = 23:12 Asia/Tbilisi (+04:00, круглый год без DST):
+// вечерние дропы (…, 19:59, 20:59, 21:59, 22:59) к этому моменту закрыты,
+// отчёты отправлены, квитанции записаны. Часы после 23:00 сторож не ждёт
+// (dropIsDue). До 18.09.2026 крон был в 22:12 — слот 22:00 (сценарий
+// владельца «21:00+22:00») он не проверил бы никогда.
 //
 // Зачем он есть. CLAUDE.md: «КАЖДЫЙ вечер в Telegram уходит ровно одно сообщение
 // — успех / ошибка / пропущено по команде. Молчаливый провал — худший баг этого
@@ -320,7 +322,7 @@ export async function runHeartbeat(deps: HeartbeatDeps, now: Date): Promise<Hear
     );
   } else if (todaysPlan !== null && (todaysPlan.slots.length > 0 || evening.expectReceipts)) {
     // Основной путь — ЗАПИСАННЫЙ планировщиком план: сверяем квитанции с тем,
-    // что реально было поставлено, а не с состоянием расписания на 22:12
+    // что реально было поставлено, а не с состоянием расписания на 23:12
     // (скипы и сценарии владелец правит и вечером — см. PLANNER_LAST_PLAN_KEY).
     expected = expectedFromPlan(todaysPlan.slots, date, labelOf, now);
     checks.push({
@@ -456,7 +458,7 @@ async function buildDeps(): Promise<HeartbeatDeps> {
 
 export const heartbeatTask = schedules.task({
   id: 'heartbeat',
-  cron: '12 18 * * *', // UTC; = 22:12 Asia/Tbilisi (+04:00, без DST)
+  cron: '12 19 * * *', // UTC; = 23:12 Asia/Tbilisi (+04:00, без DST)
   run: async (payload) => {
     const deps = await buildDeps();
     return runHeartbeat(deps, payload.timestamp);
