@@ -102,7 +102,7 @@ never decides or performs a booking.
   parsed by Claude Haiku into a validated intent, then answered by a
   deterministic search over live availability — booking still confirmed by a
   human tap.
-- **Reminders & watchdog.** A 2-hour reminder before each game, and a 22:12
+- **Reminders & watchdog.** A 2-hour reminder before each game, and a 23:12
   heartbeat that alerts the owner if the evening didn't run, a report never
   reached Telegram, or the bot went dark.
 
@@ -154,7 +154,7 @@ supabase/migrations/   # schema history
 A few decisions that make this more than a script:
 
 - **Observability invariant.** Every evening produces exactly one message.
-  The 22:12 watchdog cross-checks the planner's actual plan against delivery
+  The 23:12 watchdog cross-checks the planner's actual plan against delivery
   receipts and the bot's pulse — and it's carefully built to avoid the two
   ways a watchdog lies: false alarms *and* false silence.
 - **Idempotency under races.** State is keyed `(profile, date, time, court)`;

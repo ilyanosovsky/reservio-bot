@@ -10,6 +10,12 @@
 // недоступен, таск НЕ падает: он деградирует до MemoryStateStore и явно
 // сообщает об этом в Telegram. Бронь важнее персистентности; защита от дубля
 // в этот момент держится только на concurrencyLimit 1 и отключённых ретраях.
+// Деградация двухфазная (ResilientStateStore): до окна дропа стор терпеливый
+// (щедрый таймаут, один повтор на сеть/таймаут), в окне — горячий (1,5 с, без
+// повторов); брони, записанные в память после деградации, ДОСОХРАНЯЮТСЯ в
+// Supabase уже после дропа, когда гонка за корт позади и ждать можно долго.
+// Сентябрь 2026: 4 из 34 вечеров теряли token из-за одного зависшего запроса
+// за 30 с – 2 мин ДО появления слота, ни разу — в горячей секунде перед POST.
 //
 // Инвариант наблюдаемости (CLAUDE.md): каждый ран отправляет РОВНО ОДНО
 // сообщение в Telegram — успех, неудача, скип или крах самого рана. Молчаливый
@@ -19,7 +25,7 @@
 // пишет строку в drop_reports — «за слот отчитались, доставлено: да/нет».
 // Изнутри рана дыру «рана не было вовсе» не закрыть: если воркер умер или
 // планировщик не сработал, сообщать об этом некому. Сверяет квитанции с планом
-// вечера отдельный таск heartbeat (22:12 Тбилиси). Запись best-effort: её сбой
+// вечера отдельный таск heartbeat (23:12 Тбилиси). Запись best-effort: её сбой
 // логируется, но не роняет ран и ничего не меняет в поведении Telegram —
 // потерянная квитанция стоит ложной тревоги heartbeat'а, а упавший из-за неё
 // ран стоил бы брони.
@@ -44,16 +50,17 @@
 // Приватность: контакт профиля (CLIENT_*), guest-token и значения секретов в
 // логи/output/Telegram не попадают — output рана виден всем, у кого есть
 // доступ к дашборду. Token живёт в state и в письме-подтверждении.
-// Единственное исключение: если state деградировал, token не сохранён НИГДЕ
-// (память умрёт вместе с раном) — тогда он остаётся в output рана, иначе бронь
-// нечем отменить. В Telegram token не уходит никогда.
+// Единственное исключение: если state деградировал И досохранить бронь после
+// дропа не удалось, token не сохранён НИГДЕ (память умрёт вместе с раном) —
+// тогда он остаётся в output рана, иначе бронь нечем отменить. В Telegram
+// token не уходит никогда.
 
 import { task, logger } from '@trigger.dev/sdk';
 import { ReservioClient } from '../reservio/client.js';
 import type { BookingCreated, ClientContact } from '../reservio/types.js';
 import { loadProfiles, ruleAppliesOn, type Profile } from '../core/profiles.js';
 import { MemoryStateStore, type StateStore, type StoredBooking } from '../core/state.js';
-import { SupabaseStateStore } from '../core/state-supabase.js';
+import { SupabaseStateStore, isTransientStateError } from '../core/state-supabase.js';
 import { formatDropReport, sendTelegram, telegramFromEnv, type TelegramTarget } from '../core/notify.js';
 import { bookSlotDrop, type EngineDeps, type DropCourtResult, type DropMode, type DropReport } from '../core/booking-engine.js';
 import { dropDayOf, dropWatchWindow, tbilisiStamp } from '../core/scheduler.js';
@@ -116,13 +123,39 @@ const MAX_WAIT_TO_WINDOW_MS = 4 * 60_000;
 const RECOMMENDED_HEAD_START_MS = 150_000;
 
 /**
- * Таймаут запросов к Supabase в дропе (вместо дефолтных 5 с). Движок проверяет
- * state прямо перед POST, уже в горячем окне; keep-alive к этому моменту давно
- * закрыт, так что запрос платит DNS+TCP+TLS. Полутора секунд с запасом хватает
- * на холодное соединение, но зависший Supabase больше этого времени в гонке за
- * корт не украдёт: по таймауту стор деградирует на память, и POST уходит.
+ * Таймаут запросов к Supabase В ОКНЕ дропа (вместо дефолтных 5 с). Движок
+ * проверяет state прямо перед POST, уже в горячем окне; keep-alive к этому
+ * моменту давно закрыт, так что запрос платит DNS+TCP+TLS. Полутора секунд с
+ * запасом хватает на холодное соединение, но зависший Supabase больше этого
+ * времени в гонке за корт не украдёт: по таймауту стор деградирует на память,
+ * и POST уходит.
  */
 const DROP_STATE_TIMEOUT_MS = 1_500;
+
+/**
+ * Таймаут запросов к Supabase ДО окна: проба на старте рана (H:57), проверки
+ * идемпотентности на старте движка (H:58:26) и после ожидания окна (H:58:30).
+ * До появления слота (H:59:00) ещё полминуты, и один зависший запрос не должен
+ * отправлять ран на память до конца вечера. Вместе с одним повтором худший
+ * случай — 2 × 4 с = 8 с, то есть поллинг начнётся не позже H:58:38.
+ */
+const PATIENT_STATE_TIMEOUT_MS = 4_000;
+
+/**
+ * Через сколько после открытия окна стор становится горячим. Окно открывается
+ * в H:58:30, слот появляется в H:59:00 ± 2 с. Проверка «после ожидания окна»
+ * делается ровно в момент открытия и обязана остаться терпеливой; проверки
+ * перед POST (не раньше H:58:59 на практике) идут уже в горячем режиме.
+ */
+const HOT_STATE_FROM_WINDOW_START_MS = 15_000;
+
+/**
+ * Досохранение броней после дропа: гонка позади, у рана ещё минуты бюджета
+ * maxDuration, так что ждать и повторять можно щедро.
+ */
+const FLUSH_STATE_TIMEOUT_MS = 5_000;
+const FLUSH_ATTEMPTS = 3;
+const FLUSH_PAUSE_MS = 2_000;
 
 /**
  * Таймаут проверки скипа. Она делается ДО окна дропа, спешить некуда, но и
@@ -185,34 +218,120 @@ function escapeHtml(s: string): string {
 }
 
 /**
- * Supabase с посадкой на память. Любой отказ хранилища (нет таблицы, не тот
- * ключ, сеть) переводит стор в память НАВСЕГДА в рамках рана и запоминает
- * причину — дроп при этом продолжается. Обратно не поднимаемся: поведение
- * должно быть предсказуемым, а не «то в базу, то мимо».
+ * Два экземпляра одного Supabase-стора с разными таймаутами. Один класс с
+ * «таймаутом на вызов» был бы проще, но StateStore — общий контракт с SQLite и
+ * памятью, и параметр «сколько ждать» в нём чужой.
+ */
+export interface ResilientPrimary {
+  /** До горячего окна: щедрый таймаут, один повтор на сеть/таймаут. */
+  patient: StateStore;
+  /** В окне дропа: короткий таймаут, без повторов — секунда дороже записи. */
+  hot: StateStore;
+}
+
+export interface ResilientStateStoreOptions {
+  /** С этого момента (мс epoch) стор горячий. Не задан — горячий с первого вызова. */
+  hotFromMs?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  /** Длительности обращений, повторы и досохранение — в логи рана (без token). */
+  log?: (msg: string) => void;
+}
+
+export interface FlushResult {
+  saved: number;
+  failed: number;
+  /** Корты броней, оставшихся в очереди: их token — только в письме-подтверждении. */
+  unsaved: string[];
+  /** Последняя ошибка досохранения — что именно не пустило. */
+  lastError?: string;
+}
+
+/**
+ * Supabase с посадкой на память. Отказ хранилища (нет таблицы, не тот ключ,
+ * сеть, таймаут) переводит ЧТЕНИЯ и ЗАПИСИ в память до конца рана и запоминает
+ * причину — дроп при этом продолжается. Обратно посреди дропа не поднимаемся:
+ * поведение должно быть предсказуемым, а не «то в базу, то мимо».
+ *
+ * Две поправки к «навсегда»:
+ *   — ДО горячего окна (hotFromMs) транзиентный отказ повторяется один раз: там
+ *     спешить некуда, а один зависший запрос за две минуты до дропа не должен
+ *     стоить вечеру персистентности (так терялись token'ы в сентябре 2026);
+ *   — записи, ушедшие в память после деградации, копятся в очереди и
+ *     досохраняются flush()'ем ПОСЛЕ дропа: гонка позади, ждать можно долго.
  */
 export class ResilientStateStore implements StateStore {
   private readonly memory = new MemoryStateStore();
+  private readonly primary: ResilientPrimary;
+  private readonly hotFromMs: number | undefined;
+  private readonly now: () => number;
+  private readonly sleepFn: (ms: number) => Promise<void>;
+  private readonly log: (msg: string) => void;
   private reason: string | null = null;
+  private cause: string | null = null;
+  /** Брони, записанные в память после деградации, — кандидаты на досохранение. */
+  private readonly pending: StoredBooking[] = [];
 
   constructor(
-    private readonly primary: StateStore,
+    primary: StateStore | ResilientPrimary,
     private readonly onDegrade: (reason: string) => void,
-  ) {}
+    opts: ResilientStateStoreOptions = {},
+  ) {
+    this.primary = 'patient' in primary && 'hot' in primary ? primary : { patient: primary, hot: primary };
+    this.hotFromMs = opts.hotFromMs;
+    this.now = opts.now ?? ((): number => Date.now());
+    this.sleepFn = opts.sleep ?? sleep;
+    this.log = opts.log ?? ((): void => {});
+  }
 
   /** null — Supabase жив; строка — причина, по которой ран доживает на памяти. */
   get warning(): string | null {
     return this.reason;
   }
 
+  /** Короткая причина деградации («операция: ошибка») — для отчёта после досохранения. */
+  get degradeCause(): string | null {
+    return this.cause;
+  }
+
+  /** Сколько броней ждут досохранения в Supabase. */
+  get pendingCount(): number {
+    return this.pending.length;
+  }
+
+  /** Эта бронь ещё в очереди — то есть живёт только в памяти рана. */
+  hasPendingBooking(bookingId: string): boolean {
+    return this.pending.some((b) => b.bookingId === bookingId);
+  }
+
+  private get isHot(): boolean {
+    return this.hotFromMs === undefined || this.now() >= this.hotFromMs;
+  }
+
   private async call<T>(op: string, fn: (store: StateStore) => Promise<T>): Promise<T> {
     if (this.reason === null) {
-      try {
-        return await fn(this.primary);
-      } catch (err) {
-        this.reason =
-          `Supabase-state недоступен (${op}: ${redactSecrets(describeError(err))}) — ран доработал на памяти, ` +
-          'идемпотентность между ранами НЕ гарантирована';
-        this.onDegrade(this.reason);
+      const hot = this.isHot;
+      const store = hot ? this.primary.hot : this.primary.patient;
+      const attempts = hot ? 1 : 2;
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        const started = this.now();
+        try {
+          const result = await fn(store);
+          this.log(`state ${op}: ${this.now() - started} мс${hot ? '' : ' (до окна)'}`);
+          return result;
+        } catch (err) {
+          const detail = redactSecrets(describeError(err));
+          if (attempt < attempts && isTransientStateError(err)) {
+            this.log(`state ${op}: отказ за ${this.now() - started} мс (${detail}) — окно ещё не открыто, повторяем`);
+            continue;
+          }
+          this.cause = `${op}: ${detail}`;
+          this.reason =
+            `Supabase-state недоступен (${this.cause}) — ран доработал на памяти, ` +
+            'идемпотентность между ранами НЕ гарантирована';
+          this.onDegrade(this.reason);
+          break;
+        }
       }
     }
     return fn(this.memory);
@@ -226,8 +345,42 @@ export class ResilientStateStore implements StateStore {
     return this.call('listBookingsForSlot', (s) => s.listBookingsForSlot(profileId, date, time));
   }
 
-  saveBooking(b: StoredBooking): Promise<void> {
-    return this.call('saveBooking', (s) => s.saveBooking(b));
+  async saveBooking(b: StoredBooking): Promise<void> {
+    await this.call('saveBooking', (s) => s.saveBooking(b));
+    // Запись ушла в память — стор уже был на памяти или упал на этой самой
+    // записи (тогда строка на сервере могла и появиться: upsert идемпотентен,
+    // повтор при досохранении безопасен).
+    if (this.reason !== null) this.pending.push({ ...b });
+  }
+
+  /**
+   * Досохраняет очередь в `target` — свежий стор с щедрым таймаутом, не тот,
+   * что деградировал. Удачные записи покидают очередь, неудачные остаются в
+   * ней до следующей попытки; между попытками пауза. Никогда не бросает.
+   */
+  async flush(target: StateStore, opts: { attempts: number; pauseMs: number }): Promise<FlushResult> {
+    let saved = 0;
+    let lastError: string | undefined;
+    for (let attempt = 1; attempt <= opts.attempts && this.pending.length > 0; attempt += 1) {
+      if (attempt > 1) await this.sleepFn(opts.pauseMs);
+      for (const b of [...this.pending]) {
+        const started = this.now();
+        try {
+          await target.saveBooking(b);
+          this.pending.splice(this.pending.indexOf(b), 1);
+          saved += 1;
+          this.log(
+            `state flush: бронь ${b.bookingId} (${b.court}) досохранена за ${this.now() - started} мс (попытка ${attempt}/${opts.attempts})`,
+          );
+        } catch (err) {
+          lastError = redactSecrets(describeError(err));
+          this.log(
+            `state flush: бронь ${b.bookingId} (${b.court}) НЕ досохранена (попытка ${attempt}/${opts.attempts}): ${lastError}`,
+          );
+        }
+      }
+    }
+    return { saved, failed: this.pending.length, unsaved: this.pending.map((b) => b.court), lastError };
   }
 
   listBookings(profileId?: string): Promise<StoredBooking[]> {
@@ -715,10 +868,16 @@ export const bookSlotDropTask = task({
       let memoryWarning: string | undefined;
       let resilient: ResilientStateStore | null = null;
       let state: StateStore;
+      const supabaseStore = (timeoutMs: number): SupabaseStateStore =>
+        new SupabaseStateStore({ url: supabaseUrl, serviceKey: supabaseKey, timeoutMs });
       if (supabaseUrl !== '' && supabaseKey !== '') {
         resilient = new ResilientStateStore(
-          new SupabaseStateStore({ url: supabaseUrl, serviceKey: supabaseKey, timeoutMs: DROP_STATE_TIMEOUT_MS }),
+          { patient: supabaseStore(PATIENT_STATE_TIMEOUT_MS), hot: supabaseStore(DROP_STATE_TIMEOUT_MS) },
           (reason) => logger.error(reason),
+          {
+            hotFromMs: watch.start.getTime() + HOT_STATE_FROM_WINDOW_START_MS,
+            log: (msg) => logger.info(msg),
+          },
         );
         state = resilient;
         // Первое обращение делаем сами и заранее: «нет таблицы» или «не тот
@@ -789,16 +948,47 @@ export const bookSlotDropTask = task({
 
       // Предупреждение о state актуально уже после дропа: деградация могла
       // случиться и в середине polling.
-      const stateWarning = resilient?.warning ?? memoryWarning;
+      let stateWarning = resilient?.warning ?? memoryWarning;
+
+      // Досохранение: гонка за корт позади, у рана минуты бюджета — брони из
+      // памяти едут в Supabase свежим стором с щедрым таймаутом и повторами.
+      // Удалось всё — token в state, предупреждение остаётся, но уже как
+      // история («был недоступен»); не удалось — в сообщении корты, чьи брони
+      // остались только в памяти (их token — в письме-подтверждении).
+      if (resilient !== null && resilient.warning !== null && resilient.pendingCount > 0) {
+        const pending = resilient.pendingCount;
+        const flush = await resilient.flush(supabaseStore(FLUSH_STATE_TIMEOUT_MS), {
+          attempts: FLUSH_ATTEMPTS,
+          pauseMs: FLUSH_PAUSE_MS,
+        });
+        if (flush.failed === 0) {
+          stateWarning =
+            `Supabase-state был недоступен во время дропа (${resilient.degradeCause ?? '?'}) — ран доработал на памяти, ` +
+            `после дропа досохранено броней в Supabase: ${flush.saved}; token в state`;
+        } else {
+          stateWarning =
+            `${resilient.warning} · досохранить после дропа не удалось (${flush.failed} из ${pending}: ${flush.unsaved.join(', ')}): ` +
+            (flush.lastError ?? 'причина неизвестна');
+        }
+      }
       if (stateWarning !== undefined) logger.warn(`state: ${stateWarning}`);
 
-      // Бронь есть, а state деградировал → saveBooking ушёл в память, которая
-      // умрёт вместе с раном: token не сохранён НИГДЕ. Без него бронь не
-      // прочитать и не отменить (PROTOCOL.md), поэтому в этом — и только в
-      // этом — случае он остаётся в output рана. В Telegram его по-прежнему
-      // нет, но там появляется строка о том, где искать управление бронью.
+      // Бронь есть, а её запись живёт только в памяти, которая умрёт вместе с
+      // раном: token не сохранён НИГДЕ. Без него бронь не прочитать и не
+      // отменить (PROTOCOL.md), поэтому в этом — и только в этом — случае он
+      // остаётся в output рана. В Telegram его по-прежнему нет, но там
+      // появляется строка о том, где искать управление бронью.
+      // «Только в памяти» — это про КОРНЕВУЮ бронь отчёта (её token и есть
+      // report.token): state без Supabase вовсе, или именно она осталась в
+      // очереди недосохранённых. Деградация ПОСЛЕ её записи (например, на
+      // проверке перед POST соседнего корта) token не теряет — он давно в
+      // Supabase, и выпускать его в output незачем.
       // Только для LIVE: в DRY token синтетический, спасать нечего.
-      const tokenLost = live && report.ok && stateWarning !== undefined && (report.token ?? '') !== '';
+      const rootInMemoryOnly =
+        resilient === null
+          ? memoryWarning !== undefined
+          : report.bookingId !== undefined && resilient.hasPendingBooking(report.bookingId);
+      const tokenLost = live && report.ok && rootInMemoryOnly && (report.token ?? '') !== '';
       if (report.ok && live) {
         logger.warn(
           tokenLost

@@ -169,7 +169,7 @@ revoke all on table public.settings       from anon, authenticated;
 -- одно сообщение о дропе, молчаливый провал — худший баг проекта. Изнутри рана
 -- «сообщение ушло» не проверить: если ран не стартовал вовсе (умер воркер, не
 -- сработал планировщик), рассказать об этом некому. Поэтому каждый ран
--- book-slot-drop оставляет здесь квитанцию, а таск heartbeat в 22:12 Тбилиси
+-- book-slot-drop оставляет здесь квитанцию, а таск heartbeat в 23:12 Тбилиси
 -- сверяет квитанции с планом вечера и будит админов, если чего-то нет.
 create table if not exists public.drop_reports (
   id          uuid primary key default gen_random_uuid(),

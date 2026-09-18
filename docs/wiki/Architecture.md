@@ -28,7 +28,7 @@ src/
   trigger/book-drop.ts     # trigger.dev task: one drop + Telegram report
   trigger/remind.ts        # trigger.dev task: the T-2h reminder
   trigger/drop-observe.ts  # trigger.dev task: passive drop observation (measurement, no booking)
-  trigger/heartbeat.ts     # trigger.dev cron 22:12 Tbilisi: nightly watchdog + admin alert
+  trigger/heartbeat.ts     # trigger.dev cron 23:12 Tbilisi: nightly watchdog + admin alert
   bot/                     # grammY: commands, buttons, wizard, reminders, free queries
   bot/index.ts             # bot entry point (long-polling)
 trigger.config.ts          # trigger.dev config (project proj_your_project_ref) + syncEnvVars
@@ -227,7 +227,7 @@ fired.) When enabled, each run:
    stored value that cannot be parsed is never overwritten, and a plan that lags
    behind the previous enabled run's mark is flagged `incomplete` —
    `planLagsBehindRun`) and, on a successful run, stamps
-   `settings.planner_last_run` — the two markers the 22:12 heartbeat reconciles
+   `settings.planner_last_run` — the two markers the 23:12 heartbeat reconciles
    against. Runs are serialized (`queue.concurrencyLimit = 1`) so the
    read-merge-write of the plan cannot race a manual Replay.
 
@@ -245,21 +245,38 @@ triggered by hand from the dashboard / CLI / `mcp__trigger__trigger_task`, inclu
 a deferred run via `options.delay`). What the task adds on top of the engine:
 
 - **state selection**: given `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` →
-  `SupabaseStateStore`, otherwise `MemoryStateStore` with a "state is NOT
-  persistent (Memory)" warning. The first Supabase call is made **before** the
-  drop window so that "no such table"/"wrong key" surface early. Any store failure
-  moves the run onto memory PERMANENTLY (for that run) and adds a warning, but does
-  **not** abort the booking: the booking matters more than persistence, and
-  duplicate protection at that moment rests on `concurrencyLimit: 1` and the
-  disabled retries. The Supabase request timeout here is shortened to 1.5 s
-  (instead of the default 5 s): the engine reads state right before the `POST`,
-  already inside the hot window, and a hung store must not eat seconds in the race
-  for a court.
-- **token on degradation**: if the booking succeeds but state falls over,
-  `saveBooking` went to memory and dies with the run — the token is saved nowhere.
-  In that (and only that) case it stays in the run output and a line "cancel only
-  via the link in the email" is added to the message. Without this the only key to
-  the booking would be lost entirely.
+  `SupabaseStateStore` wrapped in `ResilientStateStore`, otherwise
+  `MemoryStateStore` with a "state is NOT persistent (Memory)" warning. The first
+  Supabase call is made **before** the drop window so that "no such
+  table"/"wrong key" surface early. A store failure moves the run onto memory for
+  the rest of the drop and adds a warning, but does **not** abort the booking: the
+  booking matters more than persistence, and duplicate protection at that moment
+  rests on `concurrencyLimit: 1` and the disabled retries.
+  The store has two modes. Until 15 s after the window opens (H:58:45) it is
+  **patient**: 4 s timeout and one retry on a network error/timeout — the probe at
+  run start and the idempotency checks at engine start and right after the wait
+  for the window all happen here, 30 s – 2 min before the slot appears, where a
+  single hung request must not cost the evening its persistence (September 2026:
+  4 of 34 runs lost their tokens exactly this way, never in the hot second before
+  the `POST`). From H:58:45 it is **hot**: 1.5 s timeout, no retries — the engine
+  reads state right before the `POST`, and a hung store must not eat seconds in
+  the race for a court. Schema/key errors never retry.
+- **post-drop flush**: bookings written to memory after the degradation are
+  queued and, once the drop is over (the run still has minutes of `maxDuration`),
+  re-written into Supabase with a fresh store (5 s timeout, 3 attempts, 2 s
+  pause). If everything lands, the warning turns into a history line ("was
+  unavailable during the drop … persisted after the drop: N") and the token stays
+  in state as usual.
+- **token on degradation**: only if the booking succeeds, state fell over AND the
+  flush failed too, `saveBooking` data dies with the run — the token is saved
+  nowhere. In that (and only that) case it stays in the run output and a line
+  "cancel only via the link in the email" is added to the message. Without this
+  the only key to the booking would be lost entirely.
+- **state timings in the timeline**: every state call the engine makes (slot
+  check at start / after the wait / before `POST`, and `saveBooking`) is a
+  timeline event with its duration in ms, and `ResilientStateStore` logs the
+  probe, retries and the flush — a slow store is visible in the run output
+  instead of being inferred from a late "window open" event.
 - **DRY vs LIVE separation**: with `live: false` the engine gets a profile with id
   `<profile>:dry`, so a fake `dry-…` booking does not occupy the live key
   `(profileId, date, time)` — otherwise the next real run of the same slot would
@@ -293,8 +310,8 @@ ones.
 and a passive drop-observation task (measurement only, never books). `drop-observe`
 is how the drop model's live journal was collected (`docs/PROTOCOL.md`).
 
-**`trigger/heartbeat.ts`** — the watchdog task, cron `12 18 * * *` (UTC) =
-**22:12 Asia/Tbilisi**, after both evening drops (20:59 and 21:59) and their
+**`trigger/heartbeat.ts`** — the watchdog task, cron `12 19 * * *` (UTC) =
+**23:12 Asia/Tbilisi**, after all evening drops (19:59 … 22:59) and their
 reports. It is the guard for the observability invariant ("every evening exactly
 one message"): the evening run holds that invariant only while it is alive, so if
 the planner cron did not tick, a worker died, Supabase was down, or Telegram

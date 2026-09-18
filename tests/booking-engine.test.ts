@@ -593,6 +593,21 @@ describe('bookSlotDrop', () => {
     expect(report.timeline.some((e) => e.event.includes('saveBooking'))).toBe(true);
   });
 
+  it('каждое обращение к state — событие таймлайна с длительностью', async () => {
+    // Сентябрь 2026: где именно ран потерял 1,5 с на зависшем Supabase,
+    // вычисляли по сдвигу события «окно открыто». Теперь это видно прямо.
+    const clock = makeClock(IN_WINDOW);
+    const { client } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(profile, target({ mode: 'all' }), deps(clock, client, state));
+
+    const stateEvents = report.timeline.filter((e) => e.event.startsWith('state: ')).map((e) => e.event);
+    expect(stateEvents.some((e) => /^state: брони часа \(старт\) — \d+ мс$/.test(e))).toBe(true);
+    expect(stateEvents.some((e) => /^state: бронь Padel Court 3 \(перед POST\) — \d+ мс$/.test(e))).toBe(true);
+    expect(stateEvents.some((e) => /^state: бронь Padel Court 3 сохранена — \d+ мс$/.test(e))).toBe(true);
+  });
+
   it('end берётся из ответа availability, если он отличается от расчётного', async () => {
     const clock = makeClock(IN_WINDOW);
     const apiEnd = '2026-08-06T20:58:00+04:00';

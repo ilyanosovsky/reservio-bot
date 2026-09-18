@@ -47,6 +47,17 @@ export class SupabaseStateError extends Error {
   }
 }
 
+/**
+ * Транзиентный отказ стора: сеть или таймаут — то, что имеет смысл повторить,
+ * потому что следующий запрос с большой вероятностью пройдёт (замеры сентября
+ * 2026: обычный ответ PostgREST 150–650 мс, зависания единичные). Схемные и
+ * ключевые ошибки (нет таблицы, не тот ключ, 42P10) повторять бессмысленно.
+ */
+export function isTransientStateError(err: unknown): boolean {
+  if (!(err instanceof SupabaseStateError)) return false;
+  return err.code === 'timeout' || err.code === 'networkError';
+}
+
 /** Строка таблицы: snake_case, как в PostgREST. */
 interface BookingRow {
   profile_id: string;
