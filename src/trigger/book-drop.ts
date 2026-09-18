@@ -241,6 +241,8 @@ export interface ResilientStateStoreOptions {
 export interface FlushResult {
   saved: number;
   failed: number;
+  /** Корты броней, оставшихся в очереди: их token — только в письме-подтверждении. */
+  unsaved: string[];
   /** Последняя ошибка досохранения — что именно не пустило. */
   lastError?: string;
 }
@@ -295,6 +297,11 @@ export class ResilientStateStore implements StateStore {
   /** Сколько броней ждут досохранения в Supabase. */
   get pendingCount(): number {
     return this.pending.length;
+  }
+
+  /** Эта бронь ещё в очереди — то есть живёт только в памяти рана. */
+  hasPendingBooking(bookingId: string): boolean {
+    return this.pending.some((b) => b.bookingId === bookingId);
   }
 
   private get isHot(): boolean {
@@ -373,7 +380,7 @@ export class ResilientStateStore implements StateStore {
         }
       }
     }
-    return { saved, failed: this.pending.length, lastError };
+    return { saved, failed: this.pending.length, unsaved: this.pending.map((b) => b.court), lastError };
   }
 
   listBookings(profileId?: string): Promise<StoredBooking[]> {
@@ -943,18 +950,11 @@ export const bookSlotDropTask = task({
       // случиться и в середине polling.
       let stateWarning = resilient?.warning ?? memoryWarning;
 
-      // Бронь есть, а state деградировал → saveBooking ушёл в память, которая
-      // умрёт вместе с раном: token не сохранён НИГДЕ. Без него бронь не
-      // прочитать и не отменить (PROTOCOL.md), поэтому в этом — и только в
-      // этом — случае он остаётся в output рана. В Telegram его по-прежнему
-      // нет, но там появляется строка о том, где искать управление бронью.
-      // Только для LIVE: в DRY token синтетический, спасать нечего.
-      let tokenLost = live && report.ok && stateWarning !== undefined && (report.token ?? '') !== '';
-
       // Досохранение: гонка за корт позади, у рана минуты бюджета — брони из
       // памяти едут в Supabase свежим стором с щедрым таймаутом и повторами.
       // Удалось всё — token в state, предупреждение остаётся, но уже как
-      // история («был недоступен»); не удалось — прежний путь с token в output.
+      // история («был недоступен»); не удалось — в сообщении корты, чьи брони
+      // остались только в памяти (их token — в письме-подтверждении).
       if (resilient !== null && resilient.warning !== null && resilient.pendingCount > 0) {
         const pending = resilient.pendingCount;
         const flush = await resilient.flush(supabaseStore(FLUSH_STATE_TIMEOUT_MS), {
@@ -965,14 +965,30 @@ export const bookSlotDropTask = task({
           stateWarning =
             `Supabase-state был недоступен во время дропа (${resilient.degradeCause ?? '?'}) — ран доработал на памяти, ` +
             `после дропа досохранено броней в Supabase: ${flush.saved}; token в state`;
-          tokenLost = false;
         } else {
           stateWarning =
-            `${resilient.warning} · досохранить после дропа не удалось (${flush.failed} из ${pending}): ` +
+            `${resilient.warning} · досохранить после дропа не удалось (${flush.failed} из ${pending}: ${flush.unsaved.join(', ')}): ` +
             (flush.lastError ?? 'причина неизвестна');
         }
       }
       if (stateWarning !== undefined) logger.warn(`state: ${stateWarning}`);
+
+      // Бронь есть, а её запись живёт только в памяти, которая умрёт вместе с
+      // раном: token не сохранён НИГДЕ. Без него бронь не прочитать и не
+      // отменить (PROTOCOL.md), поэтому в этом — и только в этом — случае он
+      // остаётся в output рана. В Telegram его по-прежнему нет, но там
+      // появляется строка о том, где искать управление бронью.
+      // «Только в памяти» — это про КОРНЕВУЮ бронь отчёта (её token и есть
+      // report.token): state без Supabase вовсе, или именно она осталась в
+      // очереди недосохранённых. Деградация ПОСЛЕ её записи (например, на
+      // проверке перед POST соседнего корта) token не теряет — он давно в
+      // Supabase, и выпускать его в output незачем.
+      // Только для LIVE: в DRY token синтетический, спасать нечего.
+      const rootInMemoryOnly =
+        resilient === null
+          ? memoryWarning !== undefined
+          : report.bookingId !== undefined && resilient.hasPendingBooking(report.bookingId);
+      const tokenLost = live && report.ok && rootInMemoryOnly && (report.token ?? '') !== '';
       if (report.ok && live) {
         logger.warn(
           tokenLost

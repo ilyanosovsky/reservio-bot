@@ -446,7 +446,7 @@ describe('ResilientStateStore', () => {
     const target = new MemoryStateStore();
     const result = await store.flush(target, { attempts: 3, pauseMs: 0 });
 
-    expect(result).toEqual({ saved: 2, failed: 0, lastError: undefined });
+    expect(result).toEqual({ saved: 2, failed: 0, unsaved: [], lastError: undefined });
     expect(store.pendingCount).toBe(0);
     await expect(target.listBookings('ilya')).resolves.toHaveLength(2);
     // token доехал: без него бронь нечем отменить
@@ -463,6 +463,8 @@ describe('ResilientStateStore', () => {
 
     expect(store.warning).toContain('saveBooking');
     expect(store.pendingCount).toBe(1);
+    expect(store.hasPendingBooking(booking.bookingId)).toBe(true);
+    expect(store.hasPendingBooking('someone-else')).toBe(false);
   });
 
   it('flush повторяет неудачные записи и отдаёт остаток с последней ошибкой', async () => {
@@ -479,9 +481,10 @@ describe('ResilientStateStore', () => {
     await store.saveBooking({ ...booking, court: 'Padel Court 2', bookingId: 'booking-3' });
     const dead = flakyStub(99);
     const bad = await store.flush(dead.store, { attempts: 2, pauseMs: 1 });
-    expect(bad).toMatchObject({ saved: 0, failed: 1 });
+    expect(bad).toMatchObject({ saved: 0, failed: 1, unsaved: ['Padel Court 2'] });
     expect(bad.lastError).toContain('таймаут');
     expect(store.pendingCount).toBe(1);
+    expect(store.hasPendingBooking('booking-3')).toBe(true);
   });
 
   it('живой стор: очередь пуста, flush ничего не делает', async () => {
@@ -493,6 +496,7 @@ describe('ResilientStateStore', () => {
     await expect(store.flush(target.store, { attempts: 3, pauseMs: 0 })).resolves.toEqual({
       saved: 0,
       failed: 0,
+      unsaved: [],
       lastError: undefined,
     });
     expect(target.calls).toBe(0);
@@ -570,10 +574,36 @@ describe('book-slot-drop: ровно одно сообщение за ран', (
   });
 });
 
+/** Бронь так, как её записывает движок после POST (createdAt — момент брони). */
+const SAVED_BOOKING: StoredBooking = {
+  profileId: 'ilya',
+  date: DATE,
+  time: TIME,
+  court: 'Padel Court 3',
+  bookingId: 'booking-1',
+  token: TOKEN,
+  state: 'confirmed',
+  createdAt: '2026-07-09T20:59:02.000+04:00',
+};
+
+/**
+ * Движок, который реально пишет бронь в state рана — как настоящий после POST.
+ * Без этого «state упал» неотличим от «броней не было»: очередь досохранения
+ * пуста, и task решает, что token давно в Supabase.
+ */
+function engineSaves(): void {
+  bookSlotDropMock.mockImplementation(async (...args: unknown[]) => {
+    const deps = args[2] as { state: StateStore };
+    await deps.state.saveBooking(SAVED_BOOKING);
+    return okReport();
+  });
+}
+
 describe('book-slot-drop: state деградировал', () => {
   beforeEach(() => {
     useSupabaseEnv();
     supabaseDown();
+    engineSaves();
   });
 
   it('бронь удалась, а state упал — token остаётся в output рана', async () => {
@@ -613,25 +643,7 @@ describe('book-slot-drop: state деградировал', () => {
 });
 
 describe('book-slot-drop: досохранение после дропа', () => {
-  const saved: StoredBooking = {
-    profileId: 'ilya',
-    date: DATE,
-    time: TIME,
-    court: 'Padel Court 3',
-    bookingId: 'booking-1',
-    token: TOKEN,
-    state: 'confirmed',
-    createdAt: '2026-07-09T20:59:02.000+04:00',
-  };
-
-  /** Движок, который реально пишет бронь в state рана — как настоящий после POST. */
-  function engineSaves(): void {
-    bookSlotDropMock.mockImplementation(async (...args: unknown[]) => {
-      const deps = args[2] as { state: StateStore };
-      await deps.state.saveBooking(saved);
-      return okReport();
-    });
-  }
+  const saved = SAVED_BOOKING;
 
   /**
    * PostgREST, у которого зависают ЧТЕНИЯ броней (так деградирует стор), а
@@ -697,8 +709,46 @@ describe('book-slot-drop: досохранение после дропа', () =>
     expect(report.ok).toBe(true);
     expect(report.token).toBe(TOKEN);
     const text = sentText();
-    expect(text).toContain('досохранить после дропа не удалось (1 из 1)');
+    expect(text).toContain('досохранить после дропа не удалось (1 из 1: Padel Court 3)');
     expect(text).toContain('token брони НЕ сохранён');
+    expect(text).not.toContain(TOKEN);
+  });
+
+  it('деградация ПОСЛЕ записи брони: token давно в Supabase — в output его нет, «НЕ сохранён» не пишем', async () => {
+    // Режим 'all': первая бронь записана, потом проверка перед POST соседнего
+    // корта зависла и стор ушёл на память, а вторая бронь не состоялась.
+    // Очередь пуста, отчёт ✅ с token первой брони — раньше этот token попадал
+    // в output как «потерянный», хотя он в state.
+    let down = false;
+    const fetchMock = vi.fn<(input: unknown, init?: unknown) => Promise<Response>>(async (input: unknown, init?: unknown) => {
+      const url = String(input);
+      const method = String((init as { method?: string } | undefined)?.method ?? 'GET');
+      if (url.includes('/rest/v1/bookings')) {
+        if (down) throw new Error('network down');
+        if (method === 'POST') {
+          return jsonResponse([{ ...saved, profile_id: 'ilya', booking_id: saved.bookingId, created_at: saved.createdAt }]);
+        }
+        return jsonResponse([]);
+      }
+      if (url.includes('/rest/v1/drop_reports')) return jsonResponse([{ id: 'receipt-1' }]);
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    bookSlotDropMock.mockImplementation(async (...args: unknown[]) => {
+      const deps = args[2] as { state: StateStore };
+      await deps.state.saveBooking(saved); // ушла в Supabase
+      down = true;
+      await deps.state.getBooking('ilya', DATE, TIME, 'Padel Court 4'); // проверка перед POST — деградация
+      return okReport();
+    });
+
+    const report = await run(payload({ mode: 'all' }));
+
+    expect(report.ok).toBe(true);
+    expect(report.token).not.toBe(TOKEN);
+    const text = sentText();
+    expect(text).toContain('Supabase-state недоступен');
+    expect(text).not.toContain('token брони НЕ сохранён');
     expect(text).not.toContain(TOKEN);
   });
 });

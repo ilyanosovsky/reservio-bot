@@ -411,9 +411,12 @@ Gotchas:
   storage is alive.
 - The booking's `token` is **absent from the logs and the run output by
   construction** — it sits in Supabase and in the confirmation email. The only
-  exception: if the report has a `⚠️` about state, it means it is not in
-  Supabase, and the token stayed in the run output — save it from there, there
-  won't be a second chance.
+  exception: a report whose `⚠️` line explicitly says **"the booking token was
+  NOT saved"** — state degraded and the post-drop flush failed too, so the token
+  of the reported booking stayed in the run output; save it from there, there
+  won't be a second chance. Any other state warning (including "persisted after
+  the drop") means the token did reach Supabase and the output is redacted as
+  usual.
 
 ### 5. What the Telegram report looks like
 
