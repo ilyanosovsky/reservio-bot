@@ -100,3 +100,14 @@ Railpack picks Node 22 LTS, `better-sqlite3` installs from a prebuilt binary,
 and node-gyp is never needed. Do not lower it. If the Railway service ever needs
 a different version, set `RAILPACK_NODE_VERSION` in the service variables — it
 takes precedence over `engines` — rather than editing `package.json`.
+
+### Node version on trigger.dev
+
+`engines.node` does not reach trigger.dev: the workers' Node version comes from
+`runtime` in `trigger.config.ts`, and the plain `'node'` value means **Node.js
+21.7.3** there (trigger.dev's default), which the platform is retiring — from
+2026-10-05 such deployments fail. The config therefore sets `runtime: 'node-22'`
+(Node 22.16.0), matching Railway and CI; `node-24`/`node-26` are the other
+options. Deploys happen automatically on every merge to `main` through the
+trigger.dev GitHub integration (the "Trigger.dev deployment" check on the PR), so
+a runtime change takes effect with the next merge.
