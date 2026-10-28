@@ -370,7 +370,69 @@ describe('ретраи и таймаут', () => {
     expect(aborted).toBe(true);
     expect(err).toBeInstanceOf(ReservioApiError);
     expect((err as ReservioApiError).code).toBe('networkError');
-    expect((err as ReservioApiError).message).toMatch(/таймаут/);
+    expect((err as ReservioApiError).message).toMatch(/таймаут 5000 мс/);
+  });
+
+  it('POST /bookings ждёт ответа дольше GET: свой таймаут 20s по умолчанию', async () => {
+    // Октябрь 2026: POST дважды не уложился в общие 5 с, а брони на сервере
+    // создались — обрыв на 5 с только терял id/token.
+    vi.useFakeTimers();
+    let aborted = false;
+    const fn = vi.fn(
+      (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            aborted = true;
+            reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+          });
+        }),
+    ) as unknown as typeof fetch;
+
+    const client = new ReservioClient({ fetchFn: fn });
+    const p = client
+      .createBooking({ serviceId: COURT3.serviceId, start: START, end: END, contact: CONTACT })
+      .catch((e: unknown) => e);
+
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(2);
+    const err = await p;
+    expect(aborted).toBe(true);
+    expect((err as ReservioApiError).code).toBe('networkError');
+    expect((err as ReservioApiError).message).toMatch(/таймаут 20000 мс/);
+    expect(fn).toHaveBeenCalledTimes(1); // POST по-прежнему без ретраев
+  });
+
+  it('postTimeoutMs настраивается и не влияет на таймаут GET', async () => {
+    vi.useFakeTimers();
+    const hang = vi.fn(
+      (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })),
+          );
+        }),
+    ) as unknown as typeof fetch;
+    const client = new ReservioClient({ fetchFn: hang, maxRetries: 1, timeoutMs: 1_000, postTimeoutMs: 3_000 });
+
+    const get = client.getAvailability(COURT3.serviceId, DATE).catch((e: unknown) => e);
+    const post = client
+      .createBooking({ serviceId: COURT3.serviceId, start: START, end: END, contact: CONTACT })
+      .catch((e: unknown) => e);
+
+    await vi.advanceTimersByTimeAsync(1_001);
+    expect(((await get) as ReservioApiError).message).toMatch(/таймаут 1000 мс/);
+
+    let postSettled = false;
+    void post.then(() => {
+      postSettled = true;
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(postSettled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(((await post) as ReservioApiError).message).toMatch(/таймаут 3000 мс/);
   });
 
   it('Retry-After с сервера уважается вместо базового backoff', async () => {

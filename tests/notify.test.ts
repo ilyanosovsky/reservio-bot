@@ -228,6 +228,19 @@ describe('formatDropReport', () => {
     expect(msg).toContain('дедлайна');
   });
 
+  it('AmbiguousPost — причина говорит, что слот БЫЛ, а не «не дождались слота»', () => {
+    // Октябрь 2026: зависший POST шёл под Timeout, и в Telegram писалось
+    // «не дождались слота до дедлайна» — при том что бронь, скорее всего, создалась.
+    const msg = formatDropReport(
+      baseReport({ ok: false, error: { kind: 'AmbiguousPost', detail: 'POST Padel Court 1 завершился неоднозначно' } }),
+      {},
+    );
+    expect(msg).toContain('❌');
+    expect(msg).toContain('Причина: слот был');
+    expect(msg).toContain('могла создаться');
+    expect(msg).not.toContain('не дождались слота');
+  });
+
   it('AlreadyBooked — ℹ️, а не ❌: показывает существующую бронь, но без token', () => {
     // Идемпотентность сработала — слот забронирован. ❌ в 21:59 читается как
     // «вечер провален» и толкает оператора бронировать вручную → дубль.

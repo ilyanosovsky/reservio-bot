@@ -13,7 +13,13 @@ export interface EngineDeps {
   log?: (msg: string) => void;
 }
 
-export type DropErrorKind = 'SlotTaken' | 'ApiChanged' | 'Timeout' | 'AlreadyBooked';
+/**
+ * `Timeout` — слот так и не появился до дедлайна. `AmbiguousPost` — слот был,
+ * POST ушёл, но ответа нет (таймаут, обрыв, 5xx): бронь могла быть создана, а
+ * id/token потеряны. Раньше второе шло под `Timeout`, и в Telegram писалось
+ * «не дождались слота» — при том что слот был и, скорее всего, уже наш.
+ */
+export type DropErrorKind = 'SlotTaken' | 'ApiChanged' | 'Timeout' | 'AmbiguousPost' | 'AlreadyBooked';
 
 /**
  * Что делать с набором кортов.
@@ -88,6 +94,14 @@ const BACKOFF_MAX_MS = 30_000;
  * датой: молча спать больше суток — это не работа, а тихий провал.
  */
 const MAX_WAIT_TO_WINDOW_MS = 24 * 60 * 60 * 1000;
+/**
+ * Минимальный интервал между стартами POST за ран. В режиме 'all' POST не ждёт
+ * ответа предыдущего, и без паузы брони одного email уходили бы с разницей
+ * ~0,7 с (availability + проверка state). В проде проверен только интервал
+ * 1,5–3 с (PROTOCOL.md → «Лимиты»); 1 с держит нас рядом с ним и почти ничего
+ * не стоит: раньше следующий корт ждал ответа POST целиком (~1–2 с).
+ */
+const MIN_POST_GAP_MS = 1_000;
 
 function describeError(err: unknown): string {
   if (err instanceof Error) {
@@ -133,6 +147,20 @@ export function isAmbiguousPostFailure(err: unknown): boolean {
   return e.status >= 500;
 }
 
+/** Бронь, созданная за ран: первая из них — корневые поля отчёта. */
+interface BookedCourt {
+  court: string;
+  bookingId: string;
+  token: string;
+  msFromSeenToBooked: number;
+}
+
+/** Итог единственного POST по корту. */
+type PostOutcome =
+  | { kind: 'booked'; booked: BookedCourt }
+  | { kind: 'ambiguous'; errorKind: DropErrorKind; detail: string }
+  | { kind: 'rejected' };
+
 /** Прогресс по одному корту набора: у каждого ровно одна попытка POST и ровно одна строка в отчёте. */
 interface CourtProgress {
   info: CourtInfo;
@@ -152,6 +180,12 @@ interface CourtProgress {
  *
  * POST не ретраится НИКОГДА: на каждый корт приходится ровно одна попытка за
  * запуск. Наружу исключения не летят — только DropReport.
+ *
+ * В режиме 'all' ответа POST вахта не ждёт: пока Reservio создаёт бронь на
+ * одном корте, остальные корты набора опрашиваются и бронируются дальше.
+ * Отчёт строится только после ответов на все отправленные POST — даже если
+ * для этого приходится ждать после дедлайна окна (ожидание ограничено
+ * таймаутом POST в клиенте).
  */
 export async function bookSlotDrop(
   profile: Profile,
@@ -175,6 +209,9 @@ export async function bookSlotDrop(
 
   /** Корты набора в порядке, заданном вызывающим. Заполняется после разбора конфига. */
   const courts: CourtProgress[] = [];
+
+  /** POST режима 'all', отправленные без ожидания ответа. Не реджектятся никогда. */
+  const inflight: Array<Promise<void>> = [];
 
   /** Что писать в отчёт про корт, оставшийся без явного итога. */
   const unfinishedReason = (c: CourtProgress): string => {
@@ -358,12 +395,133 @@ export async function bookSlotDrop(
     let polls = 0;
     let slotSeen = false;
     let lastApiError: string | null = null;
-    let lastPostError: string | null = null;
     let formatIssue: string | null = null;
-    /** Первая успешная бронь рана — корневые поля отчёта. */
-    let firstOk: { court: string; bookingId: string; token: string; msFromSeenToBooked: number } | null = null;
-    /** Первый неоднозначный отказ POST: о нём человек обязан узнать, даже если остальное сложилось. */
-    let ambiguous: { court: string; kind: DropErrorKind; detail: string } | null = null;
+    /**
+     * Итоги POST по рану. Объект, а не let-переменные: в режиме 'all' их пишут
+     * обработчики POST в полёте, а присваиваний внутри замыканий TS в потоке
+     * управления не видит (сузил бы `let x = null` до null навсегда).
+     */
+    const posts: {
+      /** Первая успешная бронь рана — корневые поля отчёта. */
+      firstOk: BookedCourt | null;
+      /** Первый неоднозначный отказ POST: о нём человек обязан узнать, даже если остальное сложилось. */
+      ambiguous: { court: string; kind: DropErrorKind; detail: string } | null;
+      lastError: string | null;
+    } = { firstOk: null, ambiguous: null, lastError: null };
+    let postsInFlight = 0;
+    /** Очередь стартов POST режима 'all': каждый ждёт, пока СТАРТУЕТ предыдущий (не ответит). */
+    let postGate: Promise<void> = Promise.resolve();
+    let lastPostStartMs = Number.NEGATIVE_INFINITY;
+
+    /**
+     * POST режима 'all' в порядке очереди и не чаще MIN_POST_GAP_MS. Интервал
+     * считается от ФАКТИЧЕСКОГО старта предыдущего POST: отметка времени и сам
+     * вызов клиента идут подряд, без await между ними.
+     */
+    const postInTurn = (courtName: string, args: Parameters<ReservioClient['createBooking']>[0]): Promise<BookingCreated> => {
+      const started = postGate.then(async () => {
+        const gapMs = lastPostStartMs + MIN_POST_GAP_MS - nowMs();
+        if (gapMs > 0) {
+          push(`пауза ${gapMs} мс перед POST ${courtName}: между POST не меньше ${MIN_POST_GAP_MS} мс`);
+          await sleep(gapMs);
+        }
+        lastPostStartMs = nowMs();
+        // В обёртке: иначе .then дождался бы ОТВЕТА, и очередь снова ждала бы Reservio.
+        return { request: client.createBooking(args) };
+      });
+      postGate = started.then(
+        () => undefined,
+        () => undefined,
+      );
+      return started.then(({ request }) => request);
+    };
+
+    /**
+     * Единственный POST по корту и всё, что из него следует: c.result, итоги
+     * рана в `posts`, сохранение брони в state. Не бросает: в режиме 'all' его
+     * никто не ждёт до конца рана, и исключение стало бы молчаливым провалом.
+     */
+    const bookCourt = async (c: CourtProgress, found: Slot, seenAtMs: number): Promise<PostOutcome> => {
+      const court = c.info;
+      const args = {
+        serviceId: court.serviceId,
+        start: wantStart,
+        // end берём из ответа API, если он есть: он авторитетнее нашей арифметики.
+        end: typeof found.end === 'string' && found.end.length > 0 ? found.end : wantEnd,
+        contact: profile.contact,
+      };
+
+      let created: BookingCreated;
+      try {
+        // Очередь с паузой нужна только в 'all': в 'priority' следующий POST
+        // и так уходит лишь после ответа на предыдущий.
+        created = await (mode === 'all' ? postInTurn(court.name, args) : client.createBooking(args));
+      } catch (err) {
+        if (isAmbiguousPostFailure(err)) {
+          // Бронь МОГЛА быть создана, а id/token до нас не добрались.
+          // Ответ пришёл, но в неизвестной форме — это смена API, а не обрыв связи.
+          const errorKind: DropErrorKind = isFormatError(err) ? 'ApiChanged' : 'AmbiguousPost';
+          const detail =
+            `POST ${court.name} завершился неоднозначно (${describeError(err)}): бронь могла быть создана на сервере, ` +
+            'id/token потеряны — проверь почту профиля и клуб вручную' +
+            (mode === 'priority'
+              ? '. Другие корты не пробуем: вторая бронь на этот час была бы лишней, а первую нечем отменить'
+              : '. Остальные корты набора продолжаем: это другие ресурсы, дубля на них не будет');
+          push(detail);
+          c.result = { court: court.name, ok: false, ambiguous: true, error: detail };
+          if (posts.ambiguous === null) posts.ambiguous = { court: court.name, kind: errorKind, detail };
+          return { kind: 'ambiguous', errorKind, detail };
+        }
+        // Детерминированный отказ (4xx): брони точно нет — работаем дальше.
+        posts.lastError = `${court.name}: ${describeError(err)}`;
+        c.result = { court: court.name, ok: false, error: `POST отклонён: ${describeError(err)}` };
+        push(
+          `POST ${court.name} отклонён: ${describeError(err)} → ` +
+            (mode === 'priority' ? 'следующий корт по приоритету' : 'следующий корт набора'),
+        );
+        return { kind: 'rejected' };
+      }
+
+      if (typeof created?.bookingId !== 'string' || created.bookingId.length === 0) {
+        const detail =
+          `POST ${court.name}: в ответе нет bookingId — бронь могла быть создана, но её id потерян. ` +
+          'Проверь почту профиля и клуб вручную' +
+          (mode === 'priority' ? '. Другие корты не пробуем' : '');
+        push(detail);
+        c.result = { court: court.name, ok: false, ambiguous: true, error: detail };
+        if (posts.ambiguous === null) posts.ambiguous = { court: court.name, kind: 'ApiChanged', detail };
+        return { kind: 'ambiguous', errorKind: 'ApiChanged', detail };
+      }
+
+      const msFromSeenToBooked = nowMs() - seenAtMs;
+      const bookingState = typeof created.state === 'string' && created.state.length > 0 ? created.state : 'confirmed';
+      const token = typeof created.token === 'string' ? created.token : '';
+      if (token.length === 0) push(`ВНИМАНИЕ: в ответе нет token (${court.name}) — отменить бронь через API будет нельзя`);
+      push(`бронь ${created.bookingId} (${bookingState}) на ${court.name}, ${msFromSeenToBooked} мс от появления слота`);
+
+      const saveStartedMs = nowMs();
+      try {
+        await state.saveBooking({
+          profileId: profile.id,
+          date,
+          time,
+          court: court.name,
+          bookingId: created.bookingId,
+          token,
+          state: bookingState,
+          createdAt: tbilisiStamp(now()),
+        });
+        push(`state: бронь ${court.name} сохранена — ${nowMs() - saveStartedMs} мс`);
+      } catch (err) {
+        // Бронь в API уже есть — отчёт с token остаётся единственным её следом.
+        push(`ВНИМАНИЕ: state.saveBooking упал (${court.name}): ${describeError(err)}`);
+      }
+
+      const booked: BookedCourt = { court: court.name, bookingId: created.bookingId, token, msFromSeenToBooked };
+      c.result = { court: court.name, ok: true, bookingId: created.bookingId, msFromSeenToBooked };
+      if (posts.firstOk === null) posts.firstOk = booked;
+      return { kind: 'booked', booked };
+    };
 
     for (;;) {
       polls += 1;
@@ -431,86 +589,36 @@ export async function bookSlotDrop(
         c.finished = true; // единственная попытка POST на корт — израсходована
         push(`слот виден на ${court.name} (опрос #${polls}) → POST немедленно`);
 
-        let created: BookingCreated;
-        try {
-          created = await client.createBooking({
-            serviceId: court.serviceId,
-            start: wantStart,
-            // end берём из ответа API, если он есть: он авторитетнее нашей арифметики.
-            end: typeof found.end === 'string' && found.end.length > 0 ? found.end : wantEnd,
-            contact: profile.contact,
-          });
-        } catch (err) {
-          if (isAmbiguousPostFailure(err)) {
-            // Бронь МОГЛА быть создана, а id/token до нас не добрались.
-            // Ответ пришёл, но в неизвестной форме — это смена API, а не обрыв связи.
-            const kind: DropErrorKind = isFormatError(err) ? 'ApiChanged' : 'Timeout';
-            const detail =
-              `POST ${court.name} завершился неоднозначно (${describeError(err)}): бронь могла быть создана на сервере, ` +
-              'id/token потеряны — проверь почту профиля и клуб вручную' +
-              (mode === 'priority'
-                ? '. Другие корты не пробуем: вторая бронь на этот час была бы лишней, а первую нечем отменить'
-                : '. Остальные корты набора продолжаем: это другие ресурсы, дубля на них не будет');
-            push(detail);
-            c.result = { court: court.name, ok: false, ambiguous: true, error: detail };
-            if (ambiguous === null) ambiguous = { court: court.name, kind, detail };
-            if (mode === 'priority') return report({ ok: false, court: court.name, error: { kind, detail } });
-            continue;
-          }
-          // Детерминированный отказ (4xx): брони точно нет — работаем дальше.
-          lastPostError = `${court.name}: ${describeError(err)}`;
-          c.result = { court: court.name, ok: false, error: `POST отклонён: ${describeError(err)}` };
-          push(
-            `POST ${court.name} отклонён: ${describeError(err)} → ` +
-              (mode === 'priority' ? 'следующий корт по приоритету' : 'следующий корт набора'),
+        if (mode === 'all') {
+          // Ответа POST не ждём: пока Reservio создаёт бронь этого корта, вахта
+          // по остальным кортам набора идёт дальше. Октябрь 2026: POST висел до
+          // 5 с, и всё это время соседние корты не опрашивались и не бронировались.
+          postsInFlight += 1;
+          inflight.push(
+            bookCourt(c, found, seenAtMs)
+              .then(() => undefined)
+              .catch((err: unknown) => {
+                // bookCourt не бросает; это страховка от будущих правок.
+                const detail =
+                  `внутренний сбой при POST ${court.name}: ${describeError(err)} — бронь могла быть создана, ` +
+                  'проверь почту профиля и клуб вручную';
+                push(detail);
+                if (c.result === undefined) c.result = { court: court.name, ok: false, ambiguous: true, error: detail };
+                if (posts.ambiguous === null) posts.ambiguous = { court: court.name, kind: 'AmbiguousPost', detail };
+              })
+              .finally(() => {
+                postsInFlight -= 1;
+              }),
           );
           continue;
         }
 
-        if (typeof created?.bookingId !== 'string' || created.bookingId.length === 0) {
-          const detail =
-            `POST ${court.name}: в ответе нет bookingId — бронь могла быть создана, но её id потерян. ` +
-            'Проверь почту профиля и клуб вручную' +
-            (mode === 'priority' ? '. Другие корты не пробуем' : '');
-          push(detail);
-          c.result = { court: court.name, ok: false, ambiguous: true, error: detail };
-          if (ambiguous === null) ambiguous = { court: court.name, kind: 'ApiChanged', detail };
-          if (mode === 'priority') return report({ ok: false, court: court.name, error: { kind: 'ApiChanged', detail } });
-          continue;
-        }
-
-        const msFromSeenToBooked = nowMs() - seenAtMs;
-        const bookingState = typeof created.state === 'string' && created.state.length > 0 ? created.state : 'confirmed';
-        const token = typeof created.token === 'string' ? created.token : '';
-        if (token.length === 0) push(`ВНИМАНИЕ: в ответе нет token (${court.name}) — отменить бронь через API будет нельзя`);
-        push(`бронь ${created.bookingId} (${bookingState}) на ${court.name}, ${msFromSeenToBooked} мс от появления слота`);
-
-        const saveStartedMs = nowMs();
-        try {
-          await state.saveBooking({
-            profileId: profile.id,
-            date,
-            time,
-            court: court.name,
-            bookingId: created.bookingId,
-            token,
-            state: bookingState,
-            createdAt: tbilisiStamp(now()),
-          });
-          push(`state: бронь ${court.name} сохранена — ${nowMs() - saveStartedMs} мс`);
-        } catch (err) {
-          // Бронь в API уже есть — отчёт с token остаётся единственным её следом.
-          push(`ВНИМАНИЕ: state.saveBooking упал (${court.name}): ${describeError(err)}`);
-        }
-
-        c.result = { court: court.name, ok: true, bookingId: created.bookingId, msFromSeenToBooked };
-        if (firstOk === null) {
-          firstOk = { court: court.name, bookingId: created.bookingId, token, msFromSeenToBooked };
-        }
-        // 'priority': цель достигнута, остальные корты не нужны.
-        // 'all': продолжаем вахту по оставшимся кортам набора до дедлайна.
-        if (mode === 'priority') {
-          return report({ ok: true, court: court.name, bookingId: created.bookingId, token, msFromSeenToBooked });
+        // 'priority': одна бронь на час — следующий корт пробуем, только если
+        // POST по этому окончательно отклонён.
+        const outcome = await bookCourt(c, found, seenAtMs);
+        if (outcome.kind === 'booked') return report({ ok: true, ...outcome.booked });
+        if (outcome.kind === 'ambiguous') {
+          return report({ ok: false, court: court.name, error: { kind: outcome.errorKind, detail: outcome.detail } });
         }
       }
 
@@ -531,6 +639,14 @@ export async function bookSlotDrop(
       await sleep(delay);
       if (nowMs() >= deadlineMs) break;
     }
+
+    // 'all': POST в полёте — тоже итог рана. Ждём их и после дедлайна: ожидание
+    // ограничено таймаутом POST в клиенте, а бронь без строки в отчёте — это
+    // молчаливо потерянный token.
+    if (postsInFlight > 0) push(`ждём ответ Reservio по ${postsInFlight} POST в полёте`);
+    await Promise.all(inflight);
+
+    const { firstOk, ambiguous } = posts;
 
     // Хотя бы одна бронь = успех рана. В 'priority' сюда доходят только неудачи:
     // успех там возвращается сразу из цикла.
@@ -582,8 +698,8 @@ export async function bookSlotDrop(
         ok: false,
         error: {
           kind: 'SlotTaken',
-          detail: lastPostError
-            ? `слот появлялся, но POST отклонён на всех кортах (${polls} опросов); последний отказ — ${lastPostError}`
+          detail: posts.lastError
+            ? `слот появлялся, но POST отклонён на всех кортах (${polls} опросов); последний отказ — ${posts.lastError}`
             : `слот появлялся, но все POST провалились (${polls} опросов)`,
         },
       });
@@ -607,6 +723,9 @@ export async function bookSlotDrop(
     // равно уходит отчёт: без него в Telegram не уйдёт ни одного сообщения.
     const detail = `внутренний сбой движка: ${describeError(err)}`;
     push(detail);
+    // POST в полёте всё равно дожидаемся: их брони реальные, и без строки в
+    // results отчёт о них промолчал бы.
+    await Promise.all(inflight);
     return report({ ok: false, error: { kind: 'ApiChanged', detail } });
   }
 }

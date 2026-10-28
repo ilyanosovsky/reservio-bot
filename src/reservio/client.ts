@@ -15,6 +15,14 @@ import type { BookingCreated, ClientContact, Slot } from './types.js';
 const JSON_API_MEDIA_TYPE = 'application/vnd.api+json';
 
 const DEFAULT_TIMEOUT_MS = 5_000;
+/**
+ * POST /bookings ждём дольше чтения. Обрыв POST по таймауту ничего не спасает:
+ * POST не ретраится, а сервер, получив запрос, бронь всё равно создаёт — мы
+ * лишь теряем её id/token. Октябрь 2026: POST в дроп замедлился с ~0,9 до
+ * ~1,3 с (p50), и два ответа не уложились в общие 5 с, хотя оба слота после
+ * этого оказались заняты — брони создались без нас.
+ */
+const DEFAULT_POST_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_RETRIES = 3;
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
@@ -24,7 +32,10 @@ const AVAILABILITY_PAGE_LIMIT = 50;
 
 export interface ReservioClientOptions {
   fetchFn?: typeof fetch;
+  /** Таймаут чтения (GET) и отмены (PATCH). */
   timeoutMs?: number;
+  /** Таймаут POST /bookings — см. DEFAULT_POST_TIMEOUT_MS. */
+  postTimeoutMs?: number;
   maxRetries?: number;
   log?: (msg: string) => void;
 }
@@ -74,6 +85,8 @@ interface RequestSpec {
   /** false — только для POST /bookings: повтор создал бы дубль брони. */
   retry: boolean;
   label: string;
+  /** Свой таймаут запроса; по умолчанию — общий timeoutMs клиента. */
+  timeoutMs?: number;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -106,12 +119,14 @@ function assertExplicitOffset(field: string, value: string): void {
 export class ReservioClient {
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly postTimeoutMs: number;
   private readonly maxRetries: number;
   private readonly log: (msg: string) => void;
 
   constructor(opts: ReservioClientOptions = {}) {
     this.fetchFn = opts.fetchFn ?? globalThis.fetch;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.postTimeoutMs = opts.postTimeoutMs ?? DEFAULT_POST_TIMEOUT_MS;
     this.maxRetries = Math.max(1, opts.maxRetries ?? DEFAULT_MAX_RETRIES);
     this.log = opts.log ?? (() => {});
   }
@@ -198,6 +213,7 @@ export class ReservioClient {
       body: payload,
       retry: false,
       label: 'createBooking',
+      timeoutMs: this.postTimeoutMs,
     });
 
     const resource = Array.isArray(doc.data) ? doc.data[0] : doc.data;
@@ -264,20 +280,21 @@ export class ReservioClient {
 
   private async request(spec: RequestSpec): Promise<JsonApiDoc> {
     const maxAttempts = spec.retry ? this.maxRetries : 1;
+    const timeoutMs = spec.timeoutMs ?? this.timeoutMs;
 
     for (let attempt = 1; ; attempt++) {
       let raw: RawResponse;
       try {
-        raw = await this.fetchOnce(spec);
+        raw = await this.fetchOnce(spec, timeoutMs);
       } catch (err) {
         // сеть/таймаут
         if (attempt < maxAttempts) {
           const delay = this.backoffMs(attempt, null);
-          this.log(`${spec.label}: сетевая ошибка (${errMessage(err)}), повтор через ${delay}ms`);
+          this.log(`${spec.label}: сетевая ошибка (${errMessage(err, timeoutMs)}), повтор через ${delay}ms`);
           await sleep(delay);
           continue;
         }
-        throw new ReservioApiError(`${spec.label}: запрос не выполнен — ${errMessage(err)}`, {
+        throw new ReservioApiError(`${spec.label}: запрос не выполнен — ${errMessage(err, timeoutMs)}`, {
           code: 'networkError',
           cause: err,
         });
@@ -302,9 +319,9 @@ export class ReservioClient {
     }
   }
 
-  private async fetchOnce(spec: RequestSpec): Promise<RawResponse> {
+  private async fetchOnce(spec: RequestSpec, timeoutMs: number): Promise<RawResponse> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const headers: Record<string, string> = { Accept: JSON_API_MEDIA_TYPE };
     if (spec.body !== undefined) headers['Content-Type'] = JSON_API_MEDIA_TYPE;
 
@@ -346,7 +363,8 @@ function parseBody(text: string, label: string): JsonApiDoc {
   }
 }
 
-function errMessage(err: unknown): string {
-  if (err instanceof Error) return err.name === 'AbortError' ? 'таймаут' : err.message;
+/** Длительность таймаута — в тексте: по отчёту видно, какой лимит сработал (GET 5 с или POST 20 с). */
+function errMessage(err: unknown, timeoutMs: number): string {
+  if (err instanceof Error) return err.name === 'AbortError' ? `таймаут ${timeoutMs} мс` : err.message;
   return String(err);
 }

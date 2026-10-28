@@ -48,7 +48,11 @@ Reconcile with `git log`/the open PR if you see a material discrepancy.
 **`reservio/client.ts`** (`ReservioClient`) — the single point of HTTP contact
 with Reservio. Methods: `getAvailability(serviceId, date)`,
 `createBooking({serviceId, start, end, contact})`, `cancelBooking(bookingId, token)`,
-`getBooking(bookingId, token)`. The default request timeout is 5 s, with up to 3
+`getBooking(bookingId, token)`. The default request timeout is 5 s
+(`timeoutMs`); `createBooking` has its own, longer one — 20 s (`postTimeoutMs`):
+aborting a POST saves nothing (it is never retried, and the server finishes the
+booking anyway), it only loses the `id`/`token` (October 2026: two POSTs missed
+the shared 5 s while both bookings were created). Up to 3
 attempts and exponential backoff (1 s → 2 s → 4 s…, capped at 30 s, honouring
 `Retry-After`) on `429`/`5xx` for GET/PATCH. **`createBooking` is never
 retried** — a repeated POST risks creating a duplicate booking. A booking counts
@@ -129,15 +133,27 @@ the window is already closed or opens more than a day out, the engine returns
 `Timeout` with an explanation right away rather than sleeping unbounded. Then
 comes the polling: each round checks **all** of the profile's courts in a row (no
 pause between courts — the pause is only between rounds), and on the first `start`
-match it fires the `POST` immediately. The `POST` is not retried: **one attempt
+match it fires the `POST` immediately. In `priority` the engine waits for the
+`POST` response before moving on. In `all` it does **not**: the `POST` goes out
+and the watch over the rest of the set continues while Reservio is still
+answering (October 2026: one hung `POST` held the neighbouring courts for 5 s).
+`POST`s of one `all` run go out in order and no more often than once per second
+(`MIN_POST_GAP_MS`, measured from the actual start of the previous one): without
+it the bookings of one email would leave ~0.7 s apart, while production has only
+ever seen 1.5–3 s. The report is built only after every sent `POST` has
+answered — even past the window deadline (bounded by the client's 20 s POST
+timeout), otherwise a booking would end up without a line in the report and its
+`token` would be lost. The `POST` is not retried: **one attempt
 per court per run**, and once the attempts are spent, polling stops early. A
 deterministic failure (`4xx`) → move to the next court; an ambiguous one
 (timeout/reset/`5xx`/`2xx` without `data.id`) → in `priority` the whole drop
 stops, because the booking may have been created on the server (a second attempt
 would mean two real bookings), while in `all` only that court is closed (the
 others are different resources, so no duplicate there) and it is flagged
-`ambiguous` to warn the owner. Client errors with `code=unexpectedResponse` are
-classified as `ApiChanged`, not `Timeout`. The polling rounds have their own
+`ambiguous` to warn the owner. Such a failure has its own kind `AmbiguousPost`
+(until October 2026 it went under `Timeout`, and Telegram said "didn't wait for
+the slot" although the slot was there); client errors with
+`code=unexpectedResponse` are classified as `ApiChanged`. The polling rounds have their own
 backoff on 429/5xx/network errors: 2 s → 4 s → 8 s → 16 s → 30 s (a layer on top
 of the retry inside `reservio/client.ts` itself). `DropReport`:
 `{ok, profileId, date, time, court?, bookingId?, token?, msFromSeenToBooked?,
@@ -147,7 +163,7 @@ timeline: {at, event}[], error?: {kind, detail?}}` (the root
 for the set is always in `results`; `ambiguous` flags a court whose `POST` may
 still have created a booking — the task sends a separate `⚠️` for it even in a
 green report), `DropErrorKind = 'SlotTaken' | 'ApiChanged' | 'Timeout' |
-'AlreadyBooked'`. No exception escapes: a malformed `date`/`time` and any `state`
+'AmbiguousPost' | 'AlreadyBooked'`. No exception escapes: a malformed `date`/`time` and any `state`
 failure are turned into a `DropReport` (otherwise not a single message would reach
 Telegram — the silent failure the project forbids).
 
