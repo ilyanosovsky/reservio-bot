@@ -109,5 +109,7 @@ takes precedence over `engines` — rather than editing `package.json`.
 2026-10-05 such deployments fail. The config therefore sets `runtime: 'node-22'`
 (Node 22.16.0), matching Railway and CI; `node-24`/`node-26` are the other
 options. Deploys happen automatically on every merge to `main` through the
-trigger.dev GitHub integration (the "Trigger.dev deployment" check on the PR), so
-a runtime change takes effect with the next merge.
+trigger.dev GitHub integration (the "Trigger.dev deployment" check appears on the
+merge commit in `main`, not on the PR), so a runtime change takes effect with the
+next merge. Environment variables are not part of that build — see `Runbook.md`
+→ "Deploy".
