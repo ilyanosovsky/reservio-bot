@@ -257,7 +257,8 @@ describe('bookSlotDrop', () => {
     const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
-    expect(report.error?.kind).toBe('Timeout');
+    // Не Timeout: слот был, и в Telegram нельзя писать «не дождались слота».
+    expect(report.error?.kind).toBe('AmbiguousPost');
     expect(report.error?.detail).toContain('могла быть создана');
     expect(report.court).toBe('Padel Court 3');
     expect(createBooking).toHaveBeenCalledTimes(1);
@@ -275,7 +276,7 @@ describe('bookSlotDrop', () => {
     const report = await bookSlotDrop(profile, target(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
-    expect(report.error?.kind).toBe('Timeout');
+    expect(report.error?.kind).toBe('AmbiguousPost');
     expect(createBooking).toHaveBeenCalledTimes(1);
   });
 
@@ -701,7 +702,9 @@ describe('bookSlotDrop: режим all', () => {
       ['Padel Court 4', true],
     ]);
     expect(new Set(report.results.map((r) => r.bookingId)).size).toBe(2);
-    expect(report.results.every((r) => r.msFromSeenToBooked === LATENCY_POST)).toBe(true);
+    // Не меньше задержки POST; больше — за счёт паузы между POST и опроса соседа,
+    // которые идут, пока ответ ещё в пути.
+    expect(report.results.every((r) => (r.msFromSeenToBooked ?? 0) >= LATENCY_POST)).toBe(true);
     // Корневые поля — первая бронь (совместимость с фазой 2).
     expect(report.court).toBe('Padel Court 3');
     expect(report.bookingId).toBe(`bk-${C3.serviceId.slice(0, 4)}`);
@@ -831,7 +834,7 @@ describe('bookSlotDrop: режим all', () => {
     expect(saveBooking).toHaveBeenCalledTimes(1);
   });
 
-  it('неоднозначный отказ единственного появившегося корта → Timeout с предупреждением', async () => {
+  it('неоднозначный отказ единственного появившегося корта → AmbiguousPost с предупреждением', async () => {
     const clock = makeClock(IN_WINDOW);
     const timeoutErr = Object.assign(new Error('createBooking: запрос не выполнен — таймаут'), {
       code: 'networkError',
@@ -845,7 +848,7 @@ describe('bookSlotDrop: режим all', () => {
     const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
 
     expect(report.ok).toBe(false);
-    expect(report.error?.kind).toBe('Timeout');
+    expect(report.error?.kind).toBe('AmbiguousPost');
     expect(report.error?.detail).toContain('могла быть создана');
     expect(report.court).toBe('Padel Court 3');
   });
@@ -886,7 +889,8 @@ describe('bookSlotDrop: режим all', () => {
 
     expect(report.ok).toBe(true);
     expect(report.bookingId).toBe('bk-c4');
-    expect(clock.sleeps).toEqual([]); // оба корта в одном цикле, без пауз
+    // Оба корта в одном цикле: паузы опроса нет, только интервал между POST.
+    expect(clock.sleeps.every((ms) => ms < 1_000)).toBe(true);
   });
 
   it('бронь корта, появившаяся между availability и POST, закрывает только свой корт', async () => {
@@ -920,6 +924,115 @@ describe('bookSlotDrop: режим all', () => {
 
     expect(createBooking).toHaveBeenCalledTimes(1);
     expect(report.results).toHaveLength(1);
+  });
+
+  // Ответ POST «висит» до первого макротаска: виртуальные часы и моки движка
+  // живут на микротасках, так что ответ придёт, только когда движок сам
+  // перестанет работать и будет чего-то ждать по-настоящему.
+  const answerLater = <T,>(value: T): Promise<T> => new Promise((resolve) => setTimeout(() => resolve(value), 0));
+
+  it('висящий POST на C3 не держит C4: сосед опрашивается и бронируется, пока ответа нет', async () => {
+    // Октябрь 2026: POST на один корт висел до 5 с, и всё это время соседние
+    // корты набора не опрашивались — в одном из дропов брони на них ушли на
+    // 8 и 12 с позже обычного.
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
+    let c3Answered = false;
+    const postedWhileC3Pending: string[] = [];
+    createBooking.mockImplementation(async (args: { serviceId: string }) => {
+      if (args.serviceId === C3.serviceId) {
+        const res = await answerLater({ bookingId: 'bk-c3', token: 'tok-c3', state: 'confirmed' });
+        c3Answered = true;
+        return res;
+      }
+      if (!c3Answered) postedWhileC3Pending.push(args.serviceId);
+      return { bookingId: 'bk-c4', token: 'tok-c4', state: 'confirmed' };
+    });
+    const { state, saveBooking } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(postedWhileC3Pending).toEqual([C4.serviceId]);
+    expect(report.ok).toBe(true);
+    expect(report.results.map((r) => [r.court, r.ok, r.bookingId])).toEqual([
+      ['Padel Court 3', true, 'bk-c3'],
+      ['Padel Court 4', true, 'bk-c4'],
+    ]);
+    // Корневые поля — первая ПОДТВЕРЖДЁННАЯ бронь: C4 ответил раньше C3.
+    expect(report.bookingId).toBe('bk-c4');
+    expect(saveBooking.mock.calls.map((c) => c[0].court)).toEqual(['Padel Court 4', 'Padel Court 3']);
+    expect(report.timeline.some((e) => /^ждём ответ Reservio по \d+ POST в полёте$/.test(e.event))).toBe(true);
+  });
+
+  it('ответ POST, пришедший после дедлайна окна, всё равно попадает в отчёт', async () => {
+    // Бронь, о которой отчёт промолчал, — потерянный token: отменить её потом нечем.
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, {
+      availability: (serviceId) => (serviceId === C3.serviceId ? [slot(WANT_START, WANT_END)] : []),
+    });
+    createBooking.mockImplementation(async () => answerLater({ bookingId: 'bk-c3', token: 'tok-c3', state: 'confirmed' }));
+    const { state, saveBooking } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(clock.ms()).toBeGreaterThanOrEqual(DEADLINE_MS); // вахту по C4 вели до конца окна
+    expect(report.ok).toBe(true);
+    expect(report.bookingId).toBe('bk-c3');
+    expect(report.token).toBe('tok-c3');
+    expect(report.results[0]).toMatchObject({ court: 'Padel Court 3', ok: true, bookingId: 'bk-c3' });
+    expect(report.results[1]!.error).toContain('не появился');
+    expect(saveBooking).toHaveBeenCalledTimes(1);
+    const events = report.timeline.map((e) => e.event);
+    expect(events.indexOf('ждём ответ Reservio по 1 POST в полёте')).toBeLessThan(
+      events.findIndex((e) => e.startsWith('бронь bk-c3')),
+    );
+  });
+
+  it('неоднозначный отказ висящего POST помечается так же, как мгновенный', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const timeoutErr = Object.assign(new Error('createBooking: запрос не выполнен — таймаут 20000 мс'), {
+      code: 'networkError',
+    });
+    const { client, createBooking } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
+    createBooking.mockImplementation(async (args: { serviceId: string }) => {
+      if (args.serviceId === C3.serviceId) {
+        await answerLater(null);
+        throw timeoutErr;
+      }
+      return { bookingId: 'bk-c4', token: 'tok-c4', state: 'confirmed' };
+    });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(report.ok).toBe(true);
+    expect(report.results[0]).toMatchObject({ court: 'Padel Court 3', ok: false, ambiguous: true });
+    expect(report.results[1]).toMatchObject({ court: 'Padel Court 4', ok: true, bookingId: 'bk-c4' });
+  });
+
+  it('POST разных кортов стартуют не чаще раза в секунду', async () => {
+    // Без ожидания ответа брони одного email ушли бы с разницей ~0,7 с, а в
+    // проде проверен только интервал 1,5–3 с.
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
+    const postedAt: number[] = [];
+    createBooking.mockImplementation(async (args: { serviceId: string }) => {
+      postedAt.push(clock.ms());
+      return { bookingId: `bk-${args.serviceId.slice(0, 4)}`, token: 'tok', state: 'confirmed' };
+    });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(
+      profile,
+      allTarget({ courts: ['Padel Court 3', 'Padel Court 4', 'Padel Court 2'] }),
+      deps(clock, client, state),
+    );
+
+    expect(report.results.every((r) => r.ok)).toBe(true);
+    expect(postedAt).toHaveLength(3);
+    expect(postedAt[1]! - postedAt[0]!).toBeGreaterThanOrEqual(1_000);
+    expect(postedAt[2]! - postedAt[1]!).toBeGreaterThanOrEqual(1_000);
+    expect(report.timeline.some((e) => e.event.startsWith('пауза ') && e.event.includes('перед POST'))).toBe(true);
   });
 
   it('ни один корт не появился → Timeout и оба корта помечены', async () => {

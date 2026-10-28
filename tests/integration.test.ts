@@ -439,7 +439,7 @@ describe('сквозной стык profiles → scheduler → engine → client
   });
 
   it('таймаут POST у настоящего клиента → второй корт не бронируется', async () => {
-    // AbortController рвёт запрос на 5 секунде: бронь могла уже создаться.
+    // AbortController рвёт запрос по таймауту POST: бронь могла уже создаться.
     const [profile] = loadProfiles(ENV);
     const calls: string[] = [];
     const fetchFn = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -462,7 +462,7 @@ describe('сквозной стык profiles → scheduler → engine → client
     );
 
     expect(report.ok).toBe(false);
-    expect(report.error?.kind).toBe('Timeout');
+    expect(report.error?.kind).toBe('AmbiguousPost');
     expect(report.error?.detail).toContain('могла быть создана');
     expect(calls.filter((c) => c.startsWith('POST'))).toHaveLength(1);
   });
