@@ -325,18 +325,37 @@ the machine.
   `telegramFromEnv` returns `null` and the evening passes in silence. The
   easiest way to find your own chat_id is to message the bot and open
   `https://api.telegram.org/bot<TOKEN>/getUpdates`.
-- `npx trigger.dev@latest login` (once per machine).
+- `npx trigger.dev@latest login` (once per machine) — needed only for the manual
+  deploy below.
 
 ### 2. Deploy
+
+**Code deploys itself.** Every merge into `main` is built and rolled out to
+`prod` by the trigger.dev GitHub integration: the merge commit gets the
+`Trigger.dev deployment (proj_…:prod)` check, and about a minute after the merge
+the new version is live (every `main` merge since at least 2026-09-10 went this
+way, e.g. PR #19 → version `20261028.1`). There is nothing to run by hand after
+a merge. To check what is live: the deployment list in the dashboard, or
+`GET https://api.trigger.dev/api/v1/deployments?page[size]=5` with
+`TRIGGER_SECRET_KEY_PROD` (each entry carries `version`, `status` and
+`git.sha`/`git.source = "trigger_github_app"`); the `version` of a run in the
+runs list tells which code it ran on.
+
+**Environment variables do not come with it.** The GitHub build has no local
+`.env`, so a change in `.env` never reaches the cloud through a merge. To push
+variables, deploy manually from a machine with a filled-in `.env`:
 
 ```bash
 npx trigger.dev@latest deploy          # environment prod by default
 ```
 
 (from the agent — `mcp__trigger__deploy` with `environment: "prod"`; there is
-also `skipSyncEnvVars` there if the variables need to be left as they are.)
+also `skipSyncEnvVars` there if the variables need to be left as they are.) A
+manual deploy also ships whatever is checked out locally — run it from an
+up-to-date `main`, otherwise it replaces the merged code in `prod`. Editing a
+variable directly in the dashboard works too.
 
-During the build `syncEnvVars` from `trigger.config.ts` runs: it reads the local
+During a manual build `syncEnvVars` from `trigger.config.ts` runs: it reads the local
 `.env` and uploads to the trigger.dev environment **exactly seven** variables —
 `CLIENT_NAME`, `CLIENT_EMAIL`, `CLIENT_PHONE`, `SUPABASE_URL`,
 `SUPABASE_SERVICE_ROLE_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
@@ -346,12 +365,12 @@ only its name goes into the build log:
 `syncEnvVars: TELEGRAM_CHAT_ID is not set — these variables won't go to the
 cloud`. All of them except `SUPABASE_URL` are marked as **secret** — in the
 dashboard their value is not shown after being written (this is normal, they are
-overwritten on every deploy).
+overwritten on every manual deploy).
 
-After the deploy, open the **Environment Variables** of the `prod` environment
-in the dashboard and visually confirm that the seven variables are in place.
-Variables are changed in `.env` → a new `deploy` is needed; they won't pull
-through on their own.
+After a manual deploy, open the **Environment Variables** of the `prod`
+environment in the dashboard and visually confirm that the seven variables are
+in place. Variables are changed in `.env` → a manual `deploy` (or an edit in the
+dashboard) is needed; a merge won't pull them through.
 
 ### 3. Deferred launch (`delay`)
 
@@ -448,7 +467,7 @@ The profile's contacts and `token` are not in the message and must not be.
 
 | In the message | What happened | What to do |
 |---|---|---|
-| `⚠️ state is NOT persistent (Memory)` | There is no `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` in the cloud — the task worked without shared storage | Check the Environment Variables in the dashboard and redeploy. Until then **do not run the task again on the same slot**: there is no protection against a duplicate |
+| `⚠️ state is NOT persistent (Memory)` | There is no `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` in the cloud — the task worked without shared storage | Check the Environment Variables in the dashboard and fix them there or with a manual deploy from a machine with `.env` ("Deploy" above — a merge does not carry variables). Until then **do not run the task again on the same slot**: there is no protection against a duplicate |
 | `⚠️ Supabase state unavailable (…) — the run finished on memory` | Storage was configured but a request failed and the run switched to memory for the rest of the drop. Before the window the store is "patient" (4 s timeout, one retry on network/timeout), inside it "hot" (1.5 s, no retries) — so this now means either a schema/key error (no table: `run the DDL from docs/supabase-schema.sql`; wrong key) or two hung requests in a row | Run the DDL / check the service key. The booking might have gone through successfully — see the first line of the report. If the line ends with "persisted after the drop", nothing is lost: the bookings and their tokens reached Supabase after the window |
 | `⚠️ Supabase state was unavailable during the drop (…) — … bookings persisted in Supabase after the drop: N; token in state` | State fell over during the run, but the post-drop flush (5 s timeout, 3 attempts) wrote every booking from memory into Supabase | Nothing: idempotency and `/cancel` work as usual. Worth a look at the run logs (`state …: N ms` lines) if it repeats |
 | `⚠️ … the booking token was NOT saved` | The booking was created, state degraded AND the post-drop flush failed (`could not persist after the drop (k of n)`): the token is in the run output only | Take the `token` from the run output in the dashboard and save it by hand — otherwise the booking can only be canceled via the link in the email to `CLIENT_EMAIL` |
@@ -805,12 +824,15 @@ message text.
 1. 30–40 minutes before the drop: `.env` is filled in and current
    (`CLIENT_*`/profiles, `SUPABASE_*`, `TELEGRAM_*`), the `bookings` AND
    `drop_reports` tables exist in Supabase. No `drop_reports` — apply
-   `supabase/migrations/20260804140000_heartbeat.sql` BEFORE the deploy
+   `supabase/migrations/20260804140000_heartbeat.sql` BEFORE the deploy (= the merge into `main`)
    (otherwise the evening passes without receipts, and the heartbeat will alert
    every night; see "Heartbeat" → "Before the first run: migration").
 2. Check `docs/PROTOCOL.md`/`PLAN.md` for open blockers for today's run.
-3. `pnpm test && pnpm typecheck` → `npx trigger.dev@latest deploy`, then verify
-   the Environment Variables in the dashboard (seven variables).
+3. The code for today is merged into `main` and deployed (the
+   `Trigger.dev deployment` check on the merge commit is green — see "Deploy").
+   If `.env` changed since the last manual deploy — `npx trigger.dev@latest deploy`
+   from an up-to-date `main`, then verify the Environment Variables in the
+   dashboard (seven variables).
 4. Rehearsal: the same `trigger_task` with `"live": false` on the nearest drop —
    it checks the availability of Supabase, the report format and delivery to
    Telegram, without creating a booking and without taking the live key
