@@ -435,6 +435,46 @@ describe('ретраи и таймаут', () => {
     expect(((await post) as ReservioApiError).message).toMatch(/таймаут 3000 мс/);
   });
 
+  // HTML-страница ошибки от балансировщика вместо JSON:API.
+  const htmlRes = (status: number): Response =>
+    new Response('<html><body>502 Bad Gateway</body></html>', { status, headers: { 'Content-Type': 'text/html' } });
+
+  it('5xx с не-JSON телом на POST: статус сохраняется, это не «смена формата API»', async () => {
+    // Иначе движок принял бы отказ за ApiChanged и не смог бы проверить
+    // слот для повтора после 5xx.
+    const { fn } = fetchStub(htmlRes(502));
+    const client = new ReservioClient({ fetchFn: fn });
+
+    const err = await client
+      .createBooking({ serviceId: COURT3.serviceId, start: START, end: END, contact: CONTACT })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ReservioApiError);
+    expect((err as ReservioApiError).status).toBe(502);
+    expect((err as ReservioApiError).code).not.toBe('unexpectedResponse');
+    expect(fn).toHaveBeenCalledTimes(1); // POST без ретраев
+  });
+
+  it('5xx с не-JSON телом на GET ретраится, как любой 5xx', async () => {
+    const { fn, calls } = fetchStub(htmlRes(502), jsonRes(slotsDoc([START])));
+    const client = new ReservioClient({ fetchFn: fn });
+
+    vi.useFakeTimers();
+    const p = client.getAvailability(COURT3.serviceId, DATE);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await expect(p).resolves.toHaveLength(1);
+    expect(calls).toHaveLength(2);
+  });
+
+  it('не-JSON при 2xx — по-прежнему unexpectedResponse', async () => {
+    const { fn } = fetchStub(new Response('<html>ok</html>', { status: 200 }));
+    const client = new ReservioClient({ fetchFn: fn });
+
+    const err = await client.getAvailability(COURT3.serviceId, DATE).catch((e: unknown) => e);
+
+    expect((err as ReservioApiError).code).toBe('unexpectedResponse');
+  });
+
   it('Retry-After с сервера уважается вместо базового backoff', async () => {
     const { fn, calls } = fetchStub(
       () => jsonRes({ errors: [{ code: 'tooManyRequests' }] }, 429, { 'Retry-After': '3' }),

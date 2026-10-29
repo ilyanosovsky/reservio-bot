@@ -6,7 +6,8 @@
  *  - успех POST /bookings = наличие data.id (и только оно);
  *  - успех отмены = data.attributes.state === "canceled" в ответе (HTTP 200 ничего не значит:
  *    неверный state API молча игнорирует и возвращает 200-эхо со старым состоянием);
- *  - POST не ретраится никогда (риск дубля брони).
+ *  - POST не ретраится никогда (риск дубля брони). Повтор после 5xx решает
+ *    движок, сверившись с availability (src/core/booking-engine.ts).
  */
 
 import { API_BASE, BUSINESS_ID } from './types.js';
@@ -300,7 +301,10 @@ export class ReservioClient {
         });
       }
 
-      const doc = parseBody(raw.text, spec.label);
+      // Не-JSON при 2xx — смена формата API (unexpectedResponse). Не-JSON при
+      // ошибке (HTML-страница 502 от балансировщика) — обычный HTTP-отказ: статус
+      // важнее тела, по нему решаются ретраи GET и повтор POST в движке.
+      const doc = raw.ok ? parseBody(raw.text, spec.label) : parseErrorBody(raw.text);
 
       if (raw.ok) return doc;
 
@@ -364,6 +368,15 @@ function parseBody(text: string, label: string): JsonApiDoc {
 }
 
 /** Длительность таймаута — в тексте: по отчёту видно, какой лимит сработал (GET 5 с или POST 20 с). */
+/** Тело ответа-ошибки: JSON:API, если получится, иначе пусто — статус всё равно есть. */
+function parseErrorBody(text: string): JsonApiDoc {
+  try {
+    return text.trim() === '' ? {} : (JSON.parse(text) as JsonApiDoc);
+  } catch {
+    return {};
+  }
+}
+
 function errMessage(err: unknown, timeoutMs: number): string {
   if (err instanceof Error) return err.name === 'AbortError' ? `таймаут ${timeoutMs} мс` : err.message;
   return String(err);

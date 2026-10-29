@@ -82,10 +82,12 @@ Pay attention to:
   retries `GET`/`PATCH` up to 3 times on `429`/`5xx` (the line `retry in Nms
   (attempt X/3)`, 1 s→2 s→4 s, capped at 30 s, respects `Retry-After`);
   (2) between polling rounds, `booking-engine` keeps its own backoff
-  2 s→4 s→8 s→16 s→30 s if a whole poll round failed with an error. On
-  `createBooking` (POST) there are no retries at all on either level: each court
-  gets **exactly one** `POST` attempt per run, and when the attempts are
-  exhausted, the engine stops polling early.
+  2 s→4 s→8 s→16 s→30 s if a whole poll round failed with an error. The client
+  never retries `createBooking` (POST). The engine re-sends it only in `all`
+  mode, only after a `5xx` and only if the next poll still lists that court's
+  slot as free (the timeline line `слот на … всё ещё свободен → … повтор`), at
+  most 3 attempts per court; in `priority` each court gets **exactly one**
+  attempt. When the attempts are exhausted, the engine stops polling early.
 - **Ambiguous `POST` failure** (20 s POST timeout, dropped connection, `5xx`,
   `2xx` without `data.id`) — the booking MIGHT have been created on the server,
   so in `priority` the engine does NOT move on to the next court but ends the
@@ -472,7 +474,7 @@ The profile's contacts and `token` are not in the message and must not be.
 | `⚠️ Supabase state was unavailable during the drop (…) — … bookings persisted in Supabase after the drop: N; token in state` | State fell over during the run, but the post-drop flush (5 s timeout, 3 attempts) wrote every booking from memory into Supabase | Nothing: idempotency and `/cancel` work as usual. Worth a look at the run logs (`state …: N ms` lines) if it repeats |
 | `⚠️ … the booking token was NOT saved` | The booking was created, state degraded AND the post-drop flush failed (`could not persist after the drop (k of n)`): the token is in the run output only | Take the `token` from the run output in the dashboard and save it by hand — otherwise the booking can only be canceled via the link in the email to `CLIENT_EMAIL` |
 | `Reason: the slot appeared, but we didn't manage to book it` (`SlotTaken`) | We reached the `POST`, but the slot was snatched | Nothing is technically broken — this is a lost race. Verify the timings in the logs |
-| `Reason: the slot was there, but Reservio didn't answer the booking — it may have been created without us` (`AmbiguousPost`) | The `POST` went out, but no response came within 20 s (or the connection dropped / `5xx`). In October 2026 both such bookings turned out to be created | Check the profile's email: the booking has no `token` in state and can only be canceled via the email link (no later than 1 hour before the slot). If it repeats, compare the `POST` latency in the run timeline (`слот виден` → `бронь …`) with the usual ~1–2 s |
+| `Reason: the slot was there, but Reservio didn't answer the booking — it may have been created without us` (`AmbiguousPost`) | The `POST` went out, but no response came within 20 s (or the connection dropped / `5xx`). In `all` mode a `5xx` has already been retried while the slot stayed free — so here either the slot disappeared after the `5xx`, the retry was rejected as taken, or 3 attempts ran out. In October 2026 the two timed-out bookings turned out to be created, while the two `500`s did not create one | Check the profile's email: the booking has no `token` in state and can only be canceled via the email link (no later than 1 hour before the slot). If it repeats, compare the `POST` latency in the run timeline (`слот виден` → `бронь …`) with the usual ~1–2 s |
 | `Reason: didn't wait for the slot before the deadline` (`Timeout`) | The slot didn't appear during the 5-minute window — either a date miss or the drop model shifted | Check the `date`/`time` payload; if it diverges from the model, record the fact in `docs/PROTOCOL.md` |
 | `Reason: looks like the API format changed` (`ApiChanged`) | Reservio replied with something other than what the client expects | Investigate immediately: the phase 1 spike scripts, `docs/PROTOCOL.md` |
 | `ℹ️ … Status: a booking for this slot was already created earlier` (`AlreadyBooked`) | Idempotency kicked in: state already has an unresolved record, the slot is booked, the `POST` was deliberately not made | This is normal on a repeat run, no manual booking needed. If the run was the first — check where the record came from |
@@ -528,12 +530,19 @@ profileId`, `concurrencyLimit = 1`) and arrive at an already-closed window.
   immediate `POST` for that court, the run continues until the deadline as long
   as at least one un-booked court remains in the set.
 
-As before — **exactly one `POST` attempt per court per run**. An ambiguous
-`POST` failure of one court (timeout/drop/`5xx`/`2xx` without `data.id`) in `all`
-mode does NOT block the rest of the watch set (unlike `priority`, where it stops
-the whole drop) — it is simply flagged separately in the report for that court,
-because a booking on it might have been created on the server. Success of an
-`all`-mode run is at least one booking out of the set.
+`POST`s of one `all` run go strictly one at a time (the next leaves after the
+previous one answered); a `POST` that the queue held past the window deadline is
+not sent at all. In `priority` each court gets **exactly one `POST` attempt per
+run**. In `all` a court gets up to **three**, and the extra ones only after a
+`5xx`: if the next poll still lists the slot as free, no booking exists and the
+`POST` is re-sent. A timeout/drop/`2xx` without `data.id` is never retried. An
+ambiguous failure of one court in `all` mode — a timeout/drop/`2xx` without
+`data.id`, or a `5xx` after which the slot disappeared, the retry was rejected as
+taken, the attempts ran out or the deadline came — does NOT block the rest of the
+watch set (unlike `priority`, where any ambiguous failure, `5xx` included, stops
+the whole drop); it is flagged separately in the report for that court, because a
+booking on it might have been created on the server. Success of an `all`-mode
+run is at least one booking out of the set.
 
 ### Idempotency and legitimate duplicates
 

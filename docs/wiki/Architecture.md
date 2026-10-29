@@ -134,18 +134,26 @@ the window is already closed or opens more than a day out, the engine returns
 comes the polling: each round checks **all** of the profile's courts in a row (no
 pause between courts — the pause is only between rounds), and on the first `start`
 match it fires the `POST` immediately. In `priority` the engine waits for the
-`POST` response before moving on. In `all` it does **not**: the `POST` goes out
-and the watch over the rest of the set continues while Reservio is still
-answering (October 2026: one hung `POST` held the neighbouring courts for 5 s).
-`POST`s of one `all` run go out in order and no more often than once per second
-(`MIN_POST_GAP_MS`, measured from the actual start of the previous one): without
-it the bookings of one email would leave ~0.7 s apart, while production has only
-ever seen 1.5–3 s. The report is built only after every sent `POST` has
-answered — even past the window deadline (bounded by the client's 20 s POST
+`POST` response before moving on. In `all` the **polling** does not wait: while
+Reservio is answering one court's `POST`, the rest of the set keeps being polled
+(October 2026: one hung `POST` held the neighbouring courts for 5 s). The
+`POST`s themselves go **strictly one at a time**: the next one leaves only after
+the previous one has answered, and no sooner than 1 s after its start
+(`MIN_POST_GAP_MS`). On 28.10.2026 two overlapping `POST`s hit a slow Reservio
+(~5.6 s) and both got `500` without creating a booking, while single `POST`s of
+the same speed went through. The report is built only after every sent `POST`
+has answered — even past the window deadline (bounded by the client's 20 s POST
 timeout), otherwise a booking would end up without a line in the report and its
-`token` would be lost. The `POST` is not retried: **one attempt
-per court per run**, and once the attempts are spent, polling stops early. A
-deterministic failure (`4xx`) → move to the next court; an ambiguous one
+`token` would be lost. A blind `POST` retry never happens: in `priority` it is
+**one attempt per court per run**. In `all` a court may get up to **three**
+(`MAX_POST_ATTEMPTS_PER_COURT`), and only after a `5xx`: the server answered, so
+it has finished processing, and if the next poll still lists the slot as free,
+no booking exists and a new `POST` cannot create a second one (Reservio rejects
+a taken slot with `400 timeNotAvailable`). If the slot is gone after a `5xx`, or
+the retry is rejected as taken, the court stays `ambiguous` — the first `POST`
+may have booked it. A timeout or a dropped connection is never retried: the
+server may still be creating the booking. Once all attempts are spent, polling
+stops early. A deterministic failure (`4xx`) → move to the next court; an ambiguous one
 (timeout/reset/`5xx`/`2xx` without `data.id`) → in `priority` the whole drop
 stops, because the booking may have been created on the server (a second attempt
 would mean two real bookings), while in `all` only that court is closed (the
