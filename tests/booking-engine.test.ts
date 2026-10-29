@@ -1093,9 +1093,13 @@ describe('bookSlotDrop: режим all', () => {
 
   it('500 на каждом POST → не больше трёх попыток на корт, затем корт неоднозначный', async () => {
     const clock = makeClock(IN_WINDOW);
+    const postedAt: number[] = [];
     const { client, createBooking } = makeClient(clock, {
       availability: (serviceId) => (serviceId === C3.serviceId ? [slot(WANT_START, WANT_END)] : []),
-      booking: () => ({ error: serverError() }),
+      booking: () => {
+        postedAt.push(clock.ms());
+        return { error: serverError() };
+      },
     });
     const { state } = makeState();
 
@@ -1105,8 +1109,63 @@ describe('bookSlotDrop: режим all', () => {
     expect(report.ok).toBe(false);
     expect(report.error?.kind).toBe('AmbiguousPost');
     expect(report.results[0]).toMatchObject({ court: 'Padel Court 3', ok: false, ambiguous: true });
-    // Между попытками — обычный интервал опроса, без долбёжки.
-    expect(Math.min(...clock.sleeps.filter((ms) => ms >= 1_000))).toBeGreaterThanOrEqual(2_000);
+    // Между попытками — не меньше обычного интервала опроса, без долбёжки.
+    expect(postedAt).toHaveLength(3);
+    for (let i = 1; i < postedAt.length; i++) {
+      expect(postedAt[i]! - postedAt[i - 1]!).toBeGreaterThanOrEqual(2_000);
+    }
+  });
+
+  it('повтор после 500, задержанный очередью до дедлайна, не уходит — корт неоднозначный', async () => {
+    // Повтор C3 встал в очередь за POST C4, а тот ответил уже после дедлайна.
+    // Отправить повтор после дедлайна — значит съесть запас maxDuration рана.
+    // C2 так и не появляется: вахта идёт до дедлайна, пока POST C4 висит.
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, {
+      availability: (serviceId) => (serviceId === C2.serviceId ? [] : [slot(WANT_START, WANT_END)]),
+    });
+    let c3Posts = 0;
+    createBooking.mockImplementation(async (args: { serviceId: string }) => {
+      if (args.serviceId === C3.serviceId) {
+        c3Posts += 1;
+        throw serverError();
+      }
+      return answerLater(booked(args.serviceId));
+    });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(
+      profile,
+      allTarget({ courts: ['Padel Court 3', 'Padel Court 4', 'Padel Court 2'] }),
+      deps(clock, client, state),
+    );
+
+    expect(clock.ms()).toBeGreaterThanOrEqual(DEADLINE_MS);
+    expect(c3Posts).toBe(1);
+    expect(createBooking.mock.calls.map((c) => c[0].serviceId)).toEqual([C3.serviceId, C4.serviceId]);
+    expect(report.timeline.some((e) => e.event === 'POST Padel Court 3 в очереди: ждём ответа на предыдущий POST')).toBe(true);
+    expect(report.results[0]).toMatchObject({ court: 'Padel Court 3', ok: false, ambiguous: true });
+    expect(report.results[0]!.error).toContain('повтор не успел уйти до дедлайна');
+    expect(report.results[1]).toMatchObject({ court: 'Padel Court 4', ok: true });
+  });
+
+  it('первый POST, задержанный очередью до дедлайна, не уходит — корт не неоднозначный', async () => {
+    const clock = makeClock(IN_WINDOW);
+    const { client, createBooking } = makeClient(clock, { availability: () => [slot(WANT_START, WANT_END)] });
+    createBooking.mockImplementation(async (args: { serviceId: string }) => {
+      await answerLater(null);
+      clock.tick(DEADLINE_MS - clock.ms() + 1_000);
+      return booked(args.serviceId);
+    });
+    const { state } = makeState();
+
+    const report = await bookSlotDrop(profile, allTarget(), deps(clock, client, state));
+
+    expect(createBooking.mock.calls.map((c) => c[0].serviceId)).toEqual([C3.serviceId]);
+    expect(report.ok).toBe(true);
+    expect(report.results[1]).toMatchObject({ court: 'Padel Court 4', ok: false });
+    expect(report.results[1]!.ambiguous).toBeUndefined();
+    expect(report.results[1]!.error).toContain('до дедлайна окна');
   });
 
   it('повтор после 500 отклонён как «занято» → корт остаётся неоднозначным', async () => {

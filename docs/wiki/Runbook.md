@@ -530,12 +530,19 @@ profileId`, `concurrencyLimit = 1`) and arrive at an already-closed window.
   immediate `POST` for that court, the run continues until the deadline as long
   as at least one un-booked court remains in the set.
 
-As before — **exactly one `POST` attempt per court per run**. An ambiguous
-`POST` failure of one court (timeout/drop/`5xx`/`2xx` without `data.id`) in `all`
-mode does NOT block the rest of the watch set (unlike `priority`, where it stops
-the whole drop) — it is simply flagged separately in the report for that court,
-because a booking on it might have been created on the server. Success of an
-`all`-mode run is at least one booking out of the set.
+`POST`s of one `all` run go strictly one at a time (the next leaves after the
+previous one answered); a `POST` that the queue held past the window deadline is
+not sent at all. In `priority` each court gets **exactly one `POST` attempt per
+run**. In `all` a court gets up to **three**, and the extra ones only after a
+`5xx`: if the next poll still lists the slot as free, no booking exists and the
+`POST` is re-sent. A timeout/drop/`2xx` without `data.id` is never retried. An
+ambiguous failure of one court in `all` mode — a timeout/drop/`2xx` without
+`data.id`, or a `5xx` after which the slot disappeared, the retry was rejected as
+taken, the attempts ran out or the deadline came — does NOT block the rest of the
+watch set (unlike `priority`, where any ambiguous failure, `5xx` included, stops
+the whole drop); it is flagged separately in the report for that court, because a
+booking on it might have been created on the server. Success of an `all`-mode
+run is at least one booking out of the set.
 
 ### Idempotency and legitimate duplicates
 

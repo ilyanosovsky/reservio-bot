@@ -169,6 +169,12 @@ function isServerError(err: unknown): boolean {
   return status !== undefined && status >= 500;
 }
 
+/**
+ * POST не отправлен: очередь продержала его до дедлайна окна. Запрос в Reservio
+ * не уходил — это не отказ сервера и не неоднозначность.
+ */
+class PostSkippedError extends Error {}
+
 /** Бронь, созданная за ран: первая из них — корневые поля отчёта. */
 interface BookedCourt {
   court: string;
@@ -487,6 +493,10 @@ export async function bookSlotDrop(
           push(`пауза ${gapMs} мс перед POST ${courtName}: между POST не меньше ${MIN_POST_GAP_MS} мс`);
           await sleep(gapMs);
         }
+        // Очередь могла продержать POST за дедлайн окна. Такой не отправляем:
+        // цепочка медленных POST после дедлайна съела бы запас maxDuration, а
+        // ран, убитый до отчёта, хуже упущенного корта.
+        if (nowMs() >= deadlineMs) throw new PostSkippedError(`POST ${courtName} не ушёл до дедлайна окна`);
         lastPostStartMs = nowMs();
         return client.createBooking(args);
       });
@@ -522,6 +532,22 @@ export async function bookSlotDrop(
         // и так уходит лишь после ответа на предыдущий.
         created = await (mode === 'all' ? postInTurn(court.name, args) : client.createBooking(args));
       } catch (err) {
+        if (err instanceof PostSkippedError) {
+          if (c.serverErrorDetail !== undefined) {
+            // Это был повтор после 5xx: первый POST мог провести бронь.
+            const detail =
+              `POST ${court.name}: после ответа ${c.serverErrorDetail} повтор не успел уйти до дедлайна окна — ` +
+              'бронь могла быть создана первым POST, id/token потеряны — проверь почту профиля и клуб вручную';
+            push(detail);
+            c.result = { court: court.name, ok: false, ambiguous: true, error: detail };
+            if (posts.ambiguous === null) posts.ambiguous = { court: court.name, kind: 'AmbiguousPost', detail };
+            return { kind: 'ambiguous', errorKind: 'AmbiguousPost', detail };
+          }
+          const detail = 'слот появлялся, но POST не ушёл: ждал ответа на предыдущий POST до дедлайна окна';
+          push(`${court.name}: ${detail}`);
+          c.result = { court: court.name, ok: false, error: detail };
+          return { kind: 'rejected' };
+        }
         if (mode === 'all' && isServerError(err)) c.serverErrorDetail = describeError(err);
         if (mode === 'all' && isServerError(err) && c.attempts < MAX_POST_ATTEMPTS_PER_COURT) {
           // Сервер ответил 5xx: обработку он закончил. Корт возвращается в
