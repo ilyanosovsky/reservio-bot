@@ -6,7 +6,8 @@
  *  - успех POST /bookings = наличие data.id (и только оно);
  *  - успех отмены = data.attributes.state === "canceled" в ответе (HTTP 200 ничего не значит:
  *    неверный state API молча игнорирует и возвращает 200-эхо со старым состоянием);
- *  - POST не ретраится никогда (риск дубля брони).
+ *  - POST не ретраится никогда (риск дубля брони). Повтор после 5xx решает
+ *    движок, сверившись с availability (src/core/booking-engine.ts).
  */
 
 import { API_BASE, BUSINESS_ID } from './types.js';

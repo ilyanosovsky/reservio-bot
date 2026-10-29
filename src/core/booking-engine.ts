@@ -95,13 +95,17 @@ const BACKOFF_MAX_MS = 30_000;
  */
 const MAX_WAIT_TO_WINDOW_MS = 24 * 60 * 60 * 1000;
 /**
- * Минимальный интервал между стартами POST за ран. В режиме 'all' POST не ждёт
- * ответа предыдущего, и без паузы брони одного email уходили бы с разницей
- * ~0,7 с (availability + проверка state). В проде проверен только интервал
- * 1,5–3 с (PROTOCOL.md → «Лимиты»); 1 с держит нас рядом с ним и почти ничего
- * не стоит: раньше следующий корт ждал ответа POST целиком (~1–2 с).
+ * Минимальный интервал между стартами POST за ран (режим 'all'). Следующий POST
+ * и так ждёт ответа предыдущего, но быстрый ответ (~0,8 с) без паузы дал бы
+ * интервал меньше проверенных в проде 1,5–3 с (PROTOCOL.md → «Лимиты»).
  */
 const MIN_POST_GAP_MS = 1_000;
+/**
+ * Сколько POST максимум на корт за ран в режиме 'all': первый и до двух
+ * повторов. Повтор — только после ответа 5xx И только если слот этого корта
+ * на следующем опросе всё ещё свободен (см. isServerError).
+ */
+const MAX_POST_ATTEMPTS_PER_COURT = 3;
 
 function describeError(err: unknown): string {
   if (err instanceof Error) {
@@ -147,6 +151,24 @@ export function isAmbiguousPostFailure(err: unknown): boolean {
   return e.status >= 500;
 }
 
+/**
+ * Неоднозначный отказ, после которого корт в режиме 'all' можно попробовать
+ * ещё раз: сервер ОТВЕТИЛ 5xx (а не промолчал), значит обработку запроса он
+ * закончил и availability уже показывает итог. Если слот после этого всё ещё
+ * в списке свободных — брони нет, и повторный POST дубля не создаст: занятый
+ * слот Reservio отклоняет детерминированно (400 timeNotAvailable).
+ *
+ * Таймаут и обрыв связи сюда не входят: сервер мог ещё создавать бронь, и
+ * availability в этот момент ничего не доказывает.
+ *
+ * Октябрь 2026: два наложившихся POST в 19:59 получили 500 «Something
+ * happened», брони не создались, а слот Court 4 так и остался свободным.
+ */
+function isServerError(err: unknown): boolean {
+  const status = (err as { status?: number } | null)?.status;
+  return status !== undefined && status >= 500;
+}
+
 /** Бронь, созданная за ран: первая из них — корневые поля отчёта. */
 interface BookedCourt {
   court: string;
@@ -155,21 +177,36 @@ interface BookedCourt {
   msFromSeenToBooked: number;
 }
 
-/** Итог единственного POST по корту. */
+/** Итог одного POST по корту. `retry` — только в 'all': 5xx, корт вернулся в вахту. */
 type PostOutcome =
   | { kind: 'booked'; booked: BookedCourt }
   | { kind: 'ambiguous'; errorKind: DropErrorKind; detail: string }
-  | { kind: 'rejected' };
+  | { kind: 'rejected' }
+  | { kind: 'retry' };
 
-/** Прогресс по одному корту набора: у каждого ровно одна попытка POST и ровно одна строка в отчёте. */
+/** Прогресс по одному корту набора: ровно одна строка в отчёте на корт. */
 interface CourtProgress {
   info: CourtInfo;
-  /** Корт выбыл из работы: POST израсходован, бронь уже была или отказ окончателен. */
+  /** Корт выбыл из работы: POST израсходованы, бронь уже была или отказ окончателен. */
   finished: boolean;
   /** availability по корту хоть раз спрашивали. */
   polled: boolean;
   /** Слот на корте хоть раз был виден. */
   seen: boolean;
+  /** Когда слот впервые увидели: от этого момента считается скорость брони, в том числе с повтора. */
+  firstSeenAtMs?: number;
+  /** Сколько POST по корту отправлено за ран (в 'priority' — не больше одного). */
+  attempts: number;
+  /**
+   * Последний POST по корту получил 5xx, и корт ждёт следующего опроса: слот
+   * свободен — повторяем, слот пропал — корт закрывается как неоднозначный.
+   */
+  pendingRetry?: { kind: DropErrorKind; detail: string };
+  /**
+   * Хоть один POST по корту получил 5xx. Если повтор потом отклонён как
+   * «занято», корт остаётся неоднозначным: слот мог занять наш же первый POST.
+   */
+  serverErrorDetail?: string;
   /** Итог; пока корт в работе — undefined (в отчёте достраивается по флагам). */
   result?: DropCourtResult;
 }
@@ -178,14 +215,19 @@ interface CourtProgress {
  * Отрабатывает ОДИН дроп: ждёт окно, поллит availability и бронирует слот
  * `target` для профиля по набору `target.courts`.
  *
- * POST не ретраится НИКОГДА: на каждый корт приходится ровно одна попытка за
- * запуск. Наружу исключения не летят — только DropReport.
+ * Вслепую POST не повторяется НИКОГДА. В 'priority' на корт приходится ровно
+ * одна попытка за запуск. В 'all' повтор возможен только после ответа 5xx и
+ * только если следующий опрос показал слот этого корта свободным (не больше
+ * MAX_POST_ATTEMPTS_PER_COURT попыток). Наружу исключения не летят — только
+ * DropReport.
  *
  * В режиме 'all' ответа POST вахта не ждёт: пока Reservio создаёт бронь на
- * одном корте, остальные корты набора опрашиваются и бронируются дальше.
- * Отчёт строится только после ответов на все отправленные POST — даже если
- * для этого приходится ждать после дедлайна окна (ожидание ограничено
- * таймаутом POST в клиенте).
+ * одном корте, остальные корты набора опрашиваются дальше. Сами POST при этом
+ * идут строго по одному — следующий уходит только после ответа на предыдущий
+ * (октябрь 2026: два наложившихся POST при медленном Reservio оба получили
+ * 500, хотя по одному такие POST проходили). Отчёт строится только после
+ * ответов на все отправленные POST — даже если для этого приходится ждать
+ * после дедлайна окна (ожидание ограничено таймаутом POST в клиенте).
  */
 export async function bookSlotDrop(
   profile: Profile,
@@ -270,6 +312,7 @@ export async function bookSlotDrop(
     const c = courts.find((x) => x.info.name.toLowerCase() === needle);
     if (c === undefined || c.finished) return;
     c.finished = true;
+    c.pendingRetry = undefined; // корт уже наш — повторять POST после 5xx незачем
     c.result = {
       court: c.info.name,
       ok: false,
@@ -350,7 +393,7 @@ export async function bookSlotDrop(
         continue;
       }
       takenServiceIds.add(info.serviceId);
-      courts.push({ info, finished: false, polled: false, seen: false });
+      courts.push({ info, finished: false, polled: false, seen: false, attempts: 0 });
     }
 
     // 2. Идемпотентность на старте (первая из трёх проверок: старт, после сна,
@@ -409,31 +452,53 @@ export async function bookSlotDrop(
       lastError: string | null;
     } = { firstOk: null, ambiguous: null, lastError: null };
     let postsInFlight = 0;
-    /** Очередь стартов POST режима 'all': каждый ждёт, пока СТАРТУЕТ предыдущий (не ответит). */
+    /** Очередь POST режима 'all': каждый ждёт ОТВЕТА на предыдущий. */
     let postGate: Promise<void> = Promise.resolve();
+    /** POST, отправленные или стоящие в очереди и ещё без ответа. */
+    let postsUnanswered = 0;
     let lastPostStartMs = Number.NEGATIVE_INFINITY;
 
     /**
-     * POST режима 'all' в порядке очереди и не чаще MIN_POST_GAP_MS. Интервал
-     * считается от ФАКТИЧЕСКОГО старта предыдущего POST: отметка времени и сам
-     * вызов клиента идут подряд, без await между ними.
+     * Закрывает корт, ждавший повтора после 5xx, как неоднозначный: повторить
+     * не вышло, а первый POST мог провести бронь, ответив ошибкой.
+     */
+    const closePendingRetry = (c: CourtProgress, why: string): void => {
+      const pending = c.pendingRetry;
+      if (pending === undefined) return;
+      c.pendingRetry = undefined;
+      c.finished = true;
+      const detail = `${pending.detail}. ${why}`;
+      push(detail);
+      c.result = { court: c.info.name, ok: false, ambiguous: true, error: detail };
+      if (posts.ambiguous === null) posts.ambiguous = { court: c.info.name, kind: pending.kind, detail };
+    };
+
+    /**
+     * POST режима 'all' строго по одному: следующий уходит только после ответа
+     * на предыдущий и не раньше чем через MIN_POST_GAP_MS после его старта.
+     * Опрос остальных кортов при этом не ждёт — ждёт только их POST.
      */
     const postInTurn = (courtName: string, args: Parameters<ReservioClient['createBooking']>[0]): Promise<BookingCreated> => {
-      const started = postGate.then(async () => {
+      if (postsUnanswered > 0) push(`POST ${courtName} в очереди: ждём ответа на предыдущий POST`);
+      postsUnanswered += 1;
+      const request = postGate.then(async () => {
         const gapMs = lastPostStartMs + MIN_POST_GAP_MS - nowMs();
         if (gapMs > 0) {
           push(`пауза ${gapMs} мс перед POST ${courtName}: между POST не меньше ${MIN_POST_GAP_MS} мс`);
           await sleep(gapMs);
         }
         lastPostStartMs = nowMs();
-        // В обёртке: иначе .then дождался бы ОТВЕТА, и очередь снова ждала бы Reservio.
-        return { request: client.createBooking(args) };
+        return client.createBooking(args);
       });
-      postGate = started.then(
-        () => undefined,
-        () => undefined,
+      postGate = request.then(
+        () => {
+          postsUnanswered -= 1;
+        },
+        () => {
+          postsUnanswered -= 1;
+        },
       );
-      return started.then(({ request }) => request);
+      return request;
     };
 
     /**
@@ -457,6 +522,24 @@ export async function bookSlotDrop(
         // и так уходит лишь после ответа на предыдущий.
         created = await (mode === 'all' ? postInTurn(court.name, args) : client.createBooking(args));
       } catch (err) {
+        if (mode === 'all' && isServerError(err)) c.serverErrorDetail = describeError(err);
+        if (mode === 'all' && isServerError(err) && c.attempts < MAX_POST_ATTEMPTS_PER_COURT) {
+          // Сервер ответил 5xx: обработку он закончил. Корт возвращается в
+          // вахту — следующий опрос покажет, свободен ли слот (тогда брони нет
+          // и POST повторяется) или занят (тогда корт неоднозначный).
+          c.finished = false;
+          c.pendingRetry = {
+            kind: 'AmbiguousPost',
+            detail:
+              `POST ${court.name} завершился неоднозначно (${describeError(err)}): бронь могла быть создана на сервере, ` +
+              'id/token потеряны — проверь почту профиля и клуб вручную',
+          };
+          push(
+            `POST ${court.name}: ${describeError(err)} (попытка ${c.attempts} из ${MAX_POST_ATTEMPTS_PER_COURT}) → ` +
+              'повторим, если на следующем опросе слот ещё свободен',
+          );
+          return { kind: 'retry' };
+        }
         if (isAmbiguousPostFailure(err)) {
           // Бронь МОГЛА быть создана, а id/token до нас не добрались.
           // Ответ пришёл, но в неизвестной форме — это смена API, а не обрыв связи.
@@ -471,6 +554,17 @@ export async function bookSlotDrop(
           c.result = { court: court.name, ok: false, ambiguous: true, error: detail };
           if (posts.ambiguous === null) posts.ambiguous = { court: court.name, kind: errorKind, detail };
           return { kind: 'ambiguous', errorKind, detail };
+        }
+        if (c.serverErrorDetail !== undefined) {
+          // Повтор после 5xx отклонён: слот уже занят — возможно, нашим же
+          // первым POST, который сервер провёл, но ответил ошибкой.
+          const detail =
+            `POST ${court.name}: после ответа ${c.serverErrorDetail} повтор отклонён (${describeError(err)}) — ` +
+            'слот мог занять наш же первый POST, id/token потеряны — проверь почту профиля и клуб вручную';
+          push(detail);
+          c.result = { court: court.name, ok: false, ambiguous: true, error: detail };
+          if (posts.ambiguous === null) posts.ambiguous = { court: court.name, kind: 'AmbiguousPost', detail };
+          return { kind: 'ambiguous', errorKind: 'AmbiguousPost', detail };
         }
         // Детерминированный отказ (4xx): брони точно нет — работаем дальше.
         posts.lastError = `${court.name}: ${describeError(err)}`;
@@ -497,7 +591,10 @@ export async function bookSlotDrop(
       const bookingState = typeof created.state === 'string' && created.state.length > 0 ? created.state : 'confirmed';
       const token = typeof created.token === 'string' ? created.token : '';
       if (token.length === 0) push(`ВНИМАНИЕ: в ответе нет token (${court.name}) — отменить бронь через API будет нельзя`);
-      push(`бронь ${created.bookingId} (${bookingState}) на ${court.name}, ${msFromSeenToBooked} мс от появления слота`);
+      push(
+        `бронь ${created.bookingId} (${bookingState}) на ${court.name}, ${msFromSeenToBooked} мс от появления слота` +
+          (c.attempts > 1 ? ` (с попытки ${c.attempts})` : ''),
+      );
 
       const saveStartedMs = nowMs();
       try {
@@ -559,6 +656,9 @@ export async function bookSlotDrop(
             formatIssue = `availability ${court.name}: в слотах нет строкового start`;
             push(formatIssue);
           }
+          // После 5xx слот пропал: занял его либо наш же POST (сервер провёл
+          // бронь, но ответил ошибкой), либо кто-то другой. Повторять нечего.
+          closePendingRetry(c, 'После ответа 5xx слот пропал из свободных — возможно, это наша же бронь');
           continue;
         }
 
@@ -583,11 +683,22 @@ export async function bookSlotDrop(
           }
         }
 
-        const seenAtMs = nowMs();
+        const seenAtMs = c.firstSeenAtMs ?? nowMs();
+        c.firstSeenAtMs = seenAtMs;
         c.seen = true;
         slotSeen = true;
-        c.finished = true; // единственная попытка POST на корт — израсходована
-        push(`слот виден на ${court.name} (опрос #${polls}) → POST немедленно`);
+        c.finished = true; // попытка POST израсходована; 5xx в 'all' может вернуть корт в вахту
+        c.attempts += 1;
+        if (c.pendingRetry !== undefined) {
+          // Сервер ответил 5xx, а слот всё ещё в списке свободных: брони нет.
+          c.pendingRetry = undefined;
+          push(
+            `слот на ${court.name} всё ещё свободен (опрос #${polls}) → прошлый POST брони не создал, ` +
+              `повтор (попытка ${c.attempts} из ${MAX_POST_ATTEMPTS_PER_COURT})`,
+          );
+        } else {
+          push(`слот виден на ${court.name} (опрос #${polls}) → POST немедленно`);
+        }
 
         if (mode === 'all') {
           // Ответа POST не ждём: пока Reservio создаёт бронь этого корта, вахта
@@ -625,10 +736,14 @@ export async function bookSlotDrop(
       if (roundOk) backoffStep = 0;
       else if (roundBackoff) backoffStep += 1;
 
-      // Все корты набора отработали свою единственную попытку: дальше polling
-      // бессмыслен, а повторный POST запрещён (риск дубля).
+      // Все корты набора отработали свои попытки. Если POST ещё без ответа —
+      // ждём их: ответ 5xx вернёт корт в вахту, и опрос продолжится.
+      if (allFinished() && postsInFlight > 0) {
+        push(`ждём ответ Reservio по ${postsInFlight} POST в полёте`);
+        await Promise.all(inflight);
+      }
       if (allFinished()) {
-        push(`по всем ${courts.length} кортам набора работа закончена — повторный POST запрещён, прекращаем`);
+        push(`по всем ${courts.length} кортам набора работа закончена — прекращаем`);
         break;
       }
 
@@ -645,6 +760,8 @@ export async function bookSlotDrop(
     // молчаливо потерянный token.
     if (postsInFlight > 0) push(`ждём ответ Reservio по ${postsInFlight} POST в полёте`);
     await Promise.all(inflight);
+    // 5xx пришёл, а повторить до дедлайна не успели — корт неоднозначный.
+    for (const c of courts) closePendingRetry(c, 'Повторить до дедлайна окна не успели');
 
     const { firstOk, ambiguous } = posts;
 
